@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import logging
 import os
 import uuid
 from collections import defaultdict
@@ -64,6 +65,8 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+logger = logging.getLogger(__file__)
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -810,6 +813,36 @@ class RayPPOTrainer:
                 assert str(Role.ActorRolloutRef) in all_wg, f"{all_wg.keys()=}"
                 self.ref_policy_wg = all_wg[str(Role.ActorRolloutRef)]
 
+        # Create teacher workers for MOPD
+        if self.config.algorithm.get("mopd", {}).get("enabled", False):
+            self.teacher_wgs = {}
+            for teacher_cfg in self.config.algorithm.mopd.teachers:
+                teacher_worker_config = deepcopy(self.config.actor_rollout_ref)
+                teacher_worker_config.model.path = teacher_cfg.model_path
+
+                teacher_cls = RayClassWithInitArgs(
+                    self.role_worker_mapping[Role.RefPolicy],
+                    config=teacher_worker_config,
+                    role=f"Teacher_{teacher_cfg.name}",
+                )
+
+                # Use the configured resource pool, or fall back to the first available pool
+                resource_pool = self.resource_pool_manager.resource_pool_dict.get(
+                    teacher_cfg.resource_pool,
+                    list(self.resource_pool_manager.resource_pool_dict.values())[0],
+                )
+                teacher_wg = self.ray_worker_group_cls(
+                    resource_pool=resource_pool,
+                    ray_cls_with_init=teacher_cls,
+                    **wg_kwargs,
+                )
+                teacher_wg.spawn()
+                teacher_wg.init_model()
+                self.teacher_wgs[teacher_cfg.name] = teacher_wg
+                logger.info(
+                    "Initialized teacher worker group: %s (model: %s)", teacher_cfg.name, teacher_cfg.model_path
+                )
+
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         self.actor_rollout_wg = all_wg[str(actor_role)]
         self.actor_rollout_wg.init_model()
@@ -1257,9 +1290,10 @@ class RayPPOTrainer:
 
         # Validate MOPD + ppo_epochs constraint: teacher advantages are computed
         # once per rollout and become stale across PPO epochs
-        if self.config.algorithm.get("mopd", {}).get("enabled", False) and getattr(
-            self.config.algorithm, "ppo_epochs", 1
-        ) > 1:
+        if (
+            self.config.algorithm.get("mopd", {}).get("enabled", False)
+            and getattr(self.config.algorithm, "ppo_epochs", 1) > 1
+        ):
             raise ValueError(
                 "MOPD requires ppo_epochs=1 because teacher advantages are "
                 "computed once per rollout and become stale across PPO epochs. "

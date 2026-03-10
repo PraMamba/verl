@@ -81,7 +81,7 @@ class MOPDConfig(BaseConfig):
         # Validate non-empty teachers when enabled
         if self.enabled and len(self.teachers) == 0:
             raise ValueError(
-                "MOPD enabled=True requires at least one teacher. " "Add teachers to algorithm.mopd.teachers."
+                "MOPD enabled=True requires at least one teacher. Add teachers to algorithm.mopd.teachers."
             )
 
         # Validate unique teacher names
@@ -97,7 +97,7 @@ class MOPDConfig(BaseConfig):
         # Validate IS epsilon bounds
         if self.is_epsilon_low >= self.is_epsilon_high:
             raise ValueError(
-                f"is_epsilon_low ({self.is_epsilon_low}) must be < " f"is_epsilon_high ({self.is_epsilon_high})"
+                f"is_epsilon_low ({self.is_epsilon_low}) must be < is_epsilon_high ({self.is_epsilon_high})"
             )
 
         # Validate base normalization config
