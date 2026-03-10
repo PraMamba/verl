@@ -77,6 +77,11 @@ def test_mopd_config_validates_lambda():
 def test_mopd_config_validates_epsilon_bounds():
     with pytest.raises(ValueError, match="is_epsilon_low must be < is_epsilon_high"):
         MOPDConfig(enabled=True, is_epsilon_low=10.0, is_epsilon_high=1.0)
+
+
+def test_mopd_config_rejects_empty_teachers_when_enabled():
+    with pytest.raises(ValueError, match="requires at least one teacher"):
+        MOPDConfig(enabled=True, teachers=[])
 ```
 
 **Step 2: Run test to verify it fails**
@@ -93,7 +98,7 @@ Expected: FAIL with "ModuleNotFoundError: No module named 'verl.workers.config.t
 Create `verl/workers/config/teacher.py`:
 
 ```python
-# Copyright 2024 Bytedance Ltd. and/or its affiliates
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License")
 
@@ -159,6 +164,13 @@ class MOPDConfig(BaseConfig):
     base_model_path: Optional[str] = None
 
     def __post_init__(self):
+        # Validate non-empty teachers when enabled
+        if self.enabled and len(self.teachers) == 0:
+            raise ValueError(
+                "MOPD enabled=True requires at least one teacher. "
+                "Add teachers to algorithm.mopd.teachers."
+            )
+
         # Validate unique teacher names
         names = [t.name for t in self.teachers]
         if len(names) != len(set(names)):
@@ -189,7 +201,7 @@ class MOPDConfig(BaseConfig):
 pytest tests/unit/test_teacher_config.py -v
 ```
 
-Expected: All 5 tests PASS
+Expected: All 6 tests PASS
 
 **Step 5: Commit**
 
@@ -199,8 +211,8 @@ git commit -m "feat(mopd): add TeacherConfig and MOPDConfig with validation
 
 - TeacherConfig: per-teacher model path, resource pool, base model
 - MOPDConfig: MOPD algorithm parameters (lambda, IS bounds, ORM weight)
-- Validation: unique names, positive lambda, valid epsilon bounds
-- Tests: 5 unit tests for config validation
+- Validation: unique names, positive lambda, valid epsilon bounds, non-empty teachers
+- Tests: 6 unit tests for config validation
 
 Implements Fix 8: Config validation in __post_init__"
 ```
@@ -315,6 +327,11 @@ Expected: FAIL with "Unknown advantage estimator: mopd"
 Add to `verl/trainer/ppo/core_algos.py` (after existing advantage estimators, around line 900):
 
 ```python
+import logging
+
+logger = logging.getLogger(__file__)
+
+
 @register_adv_est("mopd")
 def compute_mopd_advantage(
     token_level_rewards: torch.Tensor,
@@ -370,12 +387,10 @@ def compute_mopd_advantage(
         valid_tokens = (weights > 0) & (response_mask > 0)
         all_masked = ~valid_tokens.any(dim=-1)  # [batch]
         if all_masked.any():
-            import logging
-            logger = logging.getLogger(__file__)
             logger.warning(
-                "IS correction masked all tokens for %d samples. "
+                "IS correction masked all tokens for %s samples. "
                 "Using unweighted advantages as fallback.",
-                all_masked.sum().item()
+                str(all_masked.sum()),
             )
             weights[all_masked] = 1.0
     else:
@@ -433,11 +448,17 @@ Implements Fixes 5, 9, 10"
 
 ---
 
-### Task 2.5: Wire MOPD Kwargs into compute_advantage Dispatch
+### Task 2.5: Wire MOPD Kwargs into compute_advantage Dispatch + Fix Execution Gate
 
 **Files:**
-- Modify: `verl/trainer/ppo/ray_trainer.py:190-217`
+- Modify: `verl/trainer/ppo/ray_trainer.py:190-217` (dispatch)
+- Modify: `verl/trainer/ppo/utils.py:72-76` (need_reference_policy gate)
 - Test: `tests/unit/test_mopd_advantage.py` (extend)
+
+**CRITICAL FIX (Issue A):** `need_reference_policy()` returns `False` for MOPD
+because MOPD doesn't use KL penalty/loss. This means the teacher log prob
+computation block inside `if self.use_reference_policy:` is dead code that
+NEVER executes. We must modify `need_reference_policy()` to include MOPD.
 
 **Step 1: Write failing test for dispatch wiring**
 
@@ -468,17 +489,82 @@ def test_mopd_kwargs_received_via_dispatch():
     )
     assert "advantages" in result.batch
     assert "returns" in result.batch
+
+
+def test_need_reference_policy_with_mopd():
+    """Test that need_reference_policy returns True when MOPD is enabled."""
+    from omegaconf import OmegaConf
+    from verl.trainer.ppo.utils import need_reference_policy
+
+    config = OmegaConf.create({
+        "algorithm": {
+            "use_kl_in_reward": False,
+            "mopd": {"enabled": True},
+        },
+        "actor_rollout_ref": {"actor": {"use_kl_loss": False}},
+    })
+    assert need_reference_policy(config) is True
 ```
 
 **Step 2: Run test to verify it fails**
 
 ```bash
-pytest tests/unit/test_mopd_advantage.py::test_mopd_kwargs_received_via_dispatch -v
+pytest tests/unit/test_mopd_advantage.py::test_need_reference_policy_with_mopd -v
 ```
 
-Expected: FAIL (teacher_log_prob/old_log_probs not passed to estimator)
+Expected: FAIL (need_reference_policy returns False for MOPD)
 
-**Step 3: Add MOPD kwargs to compute_advantage dispatch**
+**Step 3a: Fix need_reference_policy gate**
+
+Modify `verl/trainer/ppo/utils.py` line 72-76:
+
+```python
+def need_reference_policy(
+    config: DictConfig,
+) -> bool:
+    """Given the config, do we need ref policy."""
+    return (
+        config.algorithm.use_kl_in_reward
+        or config.actor_rollout_ref.actor.use_kl_loss
+        or config.algorithm.get("mopd", {}).get("enabled", False)
+    )
+```
+
+**Step 3b: Extract MOPD teacher computation into separate block**
+
+In `verl/trainer/ppo/ray_trainer.py` `fit()` method, move the teacher
+computation OUTSIDE the `if self.use_reference_policy:` guard. The
+`need_reference_policy()` fix above ensures `use_reference_policy=True`
+when MOPD is enabled, so both paths are now reachable:
+
+```python
+# Validate MOPD + ppo_epochs constraint (Issue B: stale advantages)
+if (self.config.algorithm.get("mopd", {}).get("enabled", False)
+        and getattr(self.config.algorithm, "ppo_epochs", 1) > 1):
+    raise ValueError(
+        "MOPD requires ppo_epochs=1 because teacher advantages are "
+        "computed once per rollout and become stale across PPO epochs. "
+        "Set algorithm.ppo_epochs=1."
+    )
+
+if self.use_reference_policy:
+    # compute reference log_prob
+    with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+        if hasattr(self, "teacher_wgs"):
+            # MOPD: compute teacher log probs via sub-batch routing
+            teacher_log_prob = self._compute_teacher_log_probs(batch)
+            batch.batch["teacher_log_prob"] = teacher_log_prob
+            # Also compute ref_log_prob if KL loss is used alongside MOPD
+            if self.config.actor_rollout_ref.actor.use_kl_loss:
+                ref_log_prob = self._compute_ref_log_prob(batch)
+                batch = batch.union(ref_log_prob)
+        else:
+            # Standard: compute ref log prob
+            ref_log_prob = self._compute_ref_log_prob(batch)
+            batch = batch.union(ref_log_prob)
+```
+
+**Step 3c: Add MOPD kwargs to compute_advantage dispatch**
 
 Modify `verl/trainer/ppo/ray_trainer.py` in `compute_advantage()` function,
 in the `else` branch (around line 192-215), add MOPD-specific kwargs:
@@ -790,7 +876,7 @@ Create `tests/unit/test_dataset_teacher_id.py`:
 
 ```python
 from unittest.mock import MagicMock
-from verl.utils.dataset.rl_dataset import RLDataset
+from verl.utils.dataset.rl_dataset import RLHFDataset
 
 
 def test_dataset_includes_teacher_id():
@@ -798,7 +884,7 @@ def test_dataset_includes_teacher_id():
     mock_tokenizer = MagicMock()
     mock_tokenizer.encode.return_value = [1, 2, 3]
 
-    dataset = RLDataset(
+    dataset = RLHFDataset(
         data_files=["test_data.jsonl"],
         tokenizer=mock_tokenizer,
         config={"teacher_id_field": "domain"}
@@ -876,28 +962,27 @@ Supports Fix 3: Sub-batch routing by teacher_id"
 Create `verl/trainer/config/algorithm/mopd.yaml`:
 
 ```yaml
-# @package _global_
+# MOPD algorithm sub-config
+# Composed via sub-key pattern: algorithm@algorithm.mopd
+# Does NOT use @package _global_ to avoid overriding other algorithm settings
 
-algorithm:
-  adv_estimator: mopd
+mopd:
+  enabled: false
+  lambda_val: 1.0
+  orm_weight: 0.0
+  is_correction: true
+  is_epsilon_low: 0.1
+  is_epsilon_high: 10.0
+  use_base_normalization: false
+  base_model_path: null
 
-  mopd:
-    enabled: false
-    lambda_val: 1.0
-    orm_weight: 0.0
-    is_correction: true
-    is_epsilon_low: 0.1
-    is_epsilon_high: 10.0
-    use_base_normalization: false
-    base_model_path: null
-
-    teachers: []
-    # Example:
-    # - name: math
-    #   model_path: /models/math-teacher
-    #   weight: 1.0
-    #   resource_pool: global_pool
-    #   log_prob_micro_batch_size: 8
+  teachers: []
+  # Example:
+  # - name: math
+  #   model_path: /models/math-teacher
+  #   weight: 1.0
+  #   resource_pool: global_pool
+  #   log_prob_micro_batch_size: 8
 ```
 
 **Step 2: Add MOPD to trainer defaults**
@@ -911,7 +996,7 @@ defaults:
   - rollout: vllm_rollout
   - reward: default_reward
   - algorithm: ppo
-  - algorithm/mopd: mopd  # Add MOPD config
+  - algorithm@algorithm.mopd: mopd  # Sub-key composition (matches rollout_correction pattern)
 ```
 
 **Step 3: Validate config loading**
@@ -1006,7 +1091,7 @@ git commit -m "test(mopd): add E2E integration test
 
 ## Implementation Complete
 
-**Total LOC estimate:** ~550 production + ~180 tests
+**Total LOC estimate:** ~580 production + ~200 tests
 
 **All 10 fixes incorporated:**
 1. ✅ Teachers in RefPolicy workers (Task 3)
@@ -1020,12 +1105,22 @@ git commit -m "test(mopd): add E2E integration test
 9. ✅ Optional rollout_log_probs (Task 2)
 10. ✅ Advantage normalization (Task 2)
 
-**Additional fixes from review:**
+**Round 3 review fixes:**
 - ✅ compute_advantage dispatch wiring (Task 2.5)
 - ✅ Resource pool API corrected (Task 3)
 - ✅ GRPO index validation (Task 2)
 - ✅ IS correction test uses non-zero values (Task 2)
 - ✅ Mock objects defined in test files (Tasks 4, 5)
+
+**Round 4 review fixes:**
+- ✅ Issue A: `need_reference_policy()` gate includes MOPD check (Task 2.5)
+- ✅ Issue B: ppo_epochs=1 validation for MOPD (Task 2.5)
+- ✅ Issue C: Hydra config uses sub-key pattern `algorithm@algorithm.mopd` (Task 6)
+- ✅ Issue F: Empty teachers with enabled=True rejected (Task 1)
+- ✅ Issue G: Dataset class name corrected to `RLHFDataset` (Task 4)
+- ✅ Issue I: Removed `.item()` in degenerate fallback path (Task 2)
+- ✅ Issue J: Logger moved to module-level (Task 2)
+- ✅ Issue K: Copyright year updated to 2025 (Task 1)
 
 **Task execution order:** 1 → 2 → 2.5 → 3 → 4 → 5 → 6 → 7
 
