@@ -199,6 +199,23 @@ def compute_advantage(
             adv_kwargs["index"] = data.non_tensor_batch["uid"]
         if "reward_baselines" in data.batch:  # optional
             adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
+        # MOPD-specific kwargs (pass from batch if available)
+        if "teacher_log_prob" in data.batch:
+            adv_kwargs["teacher_log_prob"] = data.batch["teacher_log_prob"]
+        if "old_log_probs" in data.batch:
+            adv_kwargs["old_log_probs"] = data.batch["old_log_probs"]
+        if "rollout_log_probs" in data.batch:
+            adv_kwargs["rollout_log_probs"] = data.batch["rollout_log_probs"]
+        if "base_log_prob" in data.batch:
+            adv_kwargs["base_log_prob"] = data.batch["base_log_prob"]
+        # Pass MOPD config values if available
+        mopd_cfg = getattr(config, "mopd", None) if config else None
+        if mopd_cfg is not None:
+            adv_kwargs["lambda_val"] = getattr(mopd_cfg, "lambda_val", 1.0)
+            adv_kwargs["orm_weight"] = getattr(mopd_cfg, "orm_weight", 0.0)
+            adv_kwargs["is_correction"] = getattr(mopd_cfg, "is_correction", True)
+            adv_kwargs["is_epsilon_low"] = getattr(mopd_cfg, "is_epsilon_low", 0.1)
+            adv_kwargs["is_epsilon_high"] = getattr(mopd_cfg, "is_epsilon_high", 10.0)
         # Add sum_pi_squared for Optimal Token Baseline
         if adv_estimator in (AdvantageEstimator.OPTIMAL_TOKEN_BASELINE, AdvantageEstimator.TIR_OPTIMAL_TOKEN_BASELINE):
             # Check if sum_pi_squared is available

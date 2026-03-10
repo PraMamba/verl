@@ -96,3 +96,49 @@ def test_mopd_advantage_exopd_mode():
     # = -[0.5 - 1.875] = 1.375
     expected = torch.ones(B, T) * 1.375
     torch.testing.assert_close(advantages, expected, rtol=1e-4, atol=1e-4)
+
+
+def test_mopd_kwargs_received_via_dispatch():
+    """Test that compute_mopd_advantage receives correct kwargs from dispatch."""
+    import numpy as np
+
+    from verl import DataProto
+    from verl.trainer.ppo.ray_trainer import compute_advantage
+
+    B, T = 4, 10
+    data = DataProto.from_single_dict(
+        {
+            "token_level_rewards": torch.randn(B, T),
+            "response_mask": torch.ones(B, T),
+            "old_log_probs": torch.randn(B, T),
+            "teacher_log_prob": torch.randn(B, T),
+        }
+    )
+    data.non_tensor_batch["uid"] = np.array(["a", "a", "b", "b"])
+
+    # Should not crash — verifies kwargs are passed through
+    result = compute_advantage(
+        data,
+        adv_estimator="mopd",
+        config=None,
+    )
+    assert "advantages" in result.batch
+    assert "returns" in result.batch
+
+
+def test_need_reference_policy_with_mopd():
+    """Test that need_reference_policy returns True when MOPD is enabled."""
+    from omegaconf import OmegaConf
+
+    from verl.trainer.ppo.utils import need_reference_policy
+
+    config = OmegaConf.create(
+        {
+            "algorithm": {
+                "use_kl_in_reward": False,
+                "mopd": {"enabled": True},
+            },
+            "actor_rollout_ref": {"actor": {"use_kl_loss": False}},
+        }
+    )
+    assert need_reference_policy(config) is True
