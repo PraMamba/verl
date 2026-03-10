@@ -136,6 +136,7 @@ class RLHFDataset(Dataset):
         self.chat_template_func = config.get("chat_template_func", None)
         self.need_tools_kwargs = config.get("need_tools_kwargs", False)
         self.filter_prompts = config.get("filter_prompts", True)
+        self.teacher_id_field = config.get("teacher_id_field", None)
         self.serialize_dataset = False
         self.return_multi_modal_inputs = config.get("return_multi_modal_inputs", True)
         self.shuffle = config.get("shuffle", False)
@@ -366,6 +367,12 @@ class RLHFDataset(Dataset):
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs
+
+        # Extract teacher_id for MOPD routing if configured
+        if self.teacher_id_field:
+            teacher_id = row_dict.get(self.teacher_id_field)
+            row_dict["teacher_id"] = teacher_id if teacher_id is not None else "default"
+
         return row_dict
 
     @classmethod
