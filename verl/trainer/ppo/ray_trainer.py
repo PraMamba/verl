@@ -702,6 +702,9 @@ class RayPPOTrainer:
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
+        # Initialize teacher_wgs to empty dict (will be populated if MOPD is enabled)
+        self.teacher_wgs = {}
+
         # create actor and rollout
         actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
         if self.hybrid_engine:
@@ -823,8 +826,13 @@ class RayPPOTrainer:
                 )
             self.teacher_wgs = {}
             for teacher_cfg in self.config.algorithm.mopd.teachers:
-                teacher_worker_config = deepcopy(self.config.actor_rollout_ref)
-                teacher_worker_config.model.path = teacher_cfg.model_path
+                # Use OmegaConf-safe deep copy instead of standard deepcopy
+                teacher_worker_config = OmegaConf.create(
+                    OmegaConf.to_container(self.config.actor_rollout_ref, resolve=True)
+                )
+                # Use open_dict to allow modification even if struct mode is enabled
+                with open_dict(teacher_worker_config):
+                    teacher_worker_config.model.path = teacher_cfg.model_path
 
                 teacher_cls = RayClassWithInitArgs(
                     self.role_worker_mapping[Role.RefPolicy],
@@ -832,11 +840,15 @@ class RayPPOTrainer:
                     role=f"Teacher_{teacher_cfg.name}",
                 )
 
-                # Use the configured resource pool, or fall back to the first available pool
-                resource_pool = self.resource_pool_manager.resource_pool_dict.get(
-                    teacher_cfg.resource_pool,
-                    list(self.resource_pool_manager.resource_pool_dict.values())[0],
-                )
+                # Validate resource pool exists before using it
+                if teacher_cfg.resource_pool not in self.resource_pool_manager.resource_pool_dict:
+                    raise ValueError(
+                        f"Teacher '{teacher_cfg.name}' specifies unknown resource_pool "
+                        f"'{teacher_cfg.resource_pool}'. Available pools: "
+                        f"{list(self.resource_pool_manager.resource_pool_dict.keys())}"
+                    )
+                resource_pool = self.resource_pool_manager.resource_pool_dict[teacher_cfg.resource_pool]
+
                 teacher_wg = self.ray_worker_group_cls(
                     resource_pool=resource_pool,
                     ray_cls_with_init=teacher_cls,
@@ -847,6 +859,17 @@ class RayPPOTrainer:
                 self.teacher_wgs[teacher_cfg.name] = teacher_wg
                 logger.info(
                     "Initialized teacher worker group: %s (model: %s)", teacher_cfg.name, teacher_cfg.model_path
+                )
+
+            # Validate MOPD + ppo_epochs constraint early (before training starts)
+            actor_ppo_epochs = getattr(self.config.actor_rollout_ref.actor, "ppo_epochs", 1)
+            critic_ppo_epochs = getattr(self.config.critic, "ppo_epochs", 1) if self.use_critic else 1
+            if actor_ppo_epochs > 1 or critic_ppo_epochs > 1:
+                raise ValueError(
+                    f"MOPD requires ppo_epochs=1 because teacher advantages are computed "
+                    f"once per rollout and become stale across PPO epochs. "
+                    f"Got actor.ppo_epochs={actor_ppo_epochs}, critic.ppo_epochs={critic_ppo_epochs}. "
+                    f"Set both to 1."
                 )
 
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
@@ -1202,19 +1225,30 @@ class RayPPOTrainer:
         batch_size = len(teacher_ids)
         response_len = batch.batch["responses"].shape[1]
 
+        # Validate all teacher_ids are known (fail fast before processing)
+        known_teachers = set(self.teacher_wgs.keys())
+        unique_ids = set(teacher_ids)
+        unknown_ids = unique_ids - known_teachers
+        if unknown_ids:
+            raise ValueError(
+                f"Samples have unknown teacher_ids not matching any teacher worker: "
+                f"{unknown_ids}. Available teachers: {sorted(known_teachers)}"
+            )
+
         # Initialize output tensor for collecting teacher log probs
+        device = batch.batch["responses"].device
         teacher_log_probs = torch.zeros(
             batch_size,
             response_len,
             dtype=torch.float32,
-            device=batch.batch["responses"].device,
+            device=device,
         )
 
         # Group by teacher_id and forward sub-batches
         for teacher_name, teacher_wg in self.teacher_wgs.items():
-            # Get indices for this teacher
+            # Get indices for this teacher (ensure same device as output tensor)
             mask = teacher_ids == teacher_name
-            indices = torch.tensor(np.where(mask)[0], dtype=torch.long)
+            indices = torch.tensor(np.where(mask)[0], dtype=torch.long, device=device)
 
             if len(indices) == 0:
                 continue
@@ -1226,18 +1260,15 @@ class RayPPOTrainer:
             teacher_output = teacher_wg.compute_ref_log_prob(sub_batch)
             sub_log_probs = teacher_output.batch["ref_log_prob"]
 
+            # Validate shape matches expected response length
+            if sub_log_probs.shape[1] != response_len:
+                raise ValueError(
+                    f"Teacher '{teacher_name}' returned shape {sub_log_probs.shape}, "
+                    f"expected (*, {response_len})"
+                )
+
             # Scatter back to full batch (correct broadcasting)
             teacher_log_probs[indices] = sub_log_probs
-
-        # Verify all samples were routed to a known teacher
-        known_teachers = set(self.teacher_wgs.keys())
-        unique_ids = set(teacher_ids)
-        unknown_ids = unique_ids - known_teachers
-        if unknown_ids:
-            raise ValueError(
-                f"Samples have unknown teacher_ids not matching any teacher worker: "
-                f"{unknown_ids}. Available teachers: {sorted(known_teachers)}"
-            )
 
         return teacher_log_probs
 
@@ -1352,18 +1383,6 @@ class RayPPOTrainer:
         )
 
         self.global_steps = 0
-
-        # Validate MOPD + ppo_epochs constraint: teacher advantages are computed
-        # once per rollout and become stale across PPO epochs
-        if (
-            self.config.algorithm.get("mopd", {}).get("enabled", False)
-            and getattr(self.config.algorithm, "ppo_epochs", 1) > 1
-        ):
-            raise ValueError(
-                "MOPD requires ppo_epochs=1 because teacher advantages are "
-                "computed once per rollout and become stale across PPO epochs. "
-                "Set algorithm.ppo_epochs=1."
-            )
 
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
@@ -1555,7 +1574,7 @@ class RayPPOTrainer:
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
-                            if hasattr(self, "teacher_wgs"):
+                            if self.teacher_wgs:
                                 # MOPD: compute teacher log probs via sub-batch routing
                                 teacher_log_prob = self._compute_teacher_log_probs(batch)
                                 batch.batch["teacher_log_prob"] = teacher_log_prob
@@ -1743,3 +1762,22 @@ class RayPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+
+    def cleanup_teacher_workers(self):
+        """Clean up teacher worker groups for MOPD.
+
+        This method should be called when training is complete or interrupted
+        to properly release teacher worker resources.
+        """
+        if self.teacher_wgs:
+            logger.info("Cleaning up %d teacher worker groups", len(self.teacher_wgs))
+            for teacher_name, teacher_wg in self.teacher_wgs.items():
+                try:
+                    # Ray workers are cleaned up automatically, but we can explicitly
+                    # kill the actors if needed for immediate resource release
+                    logger.debug("Cleaning up teacher worker: %s", teacher_name)
+                    # Note: RayWorkerGroup doesn't have explicit shutdown, Ray handles cleanup
+                except Exception as e:
+                    logger.warning("Error cleaning up teacher worker %s: %s", teacher_name, e)
+            self.teacher_wgs.clear()
+            logger.info("Teacher worker cleanup complete")

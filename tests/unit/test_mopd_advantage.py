@@ -142,3 +142,73 @@ def test_need_reference_policy_with_mopd():
         }
     )
     assert need_reference_policy(config) is True
+
+
+def test_mopd_is_correction_overflow_protection():
+    """Test that IS correction handles extreme log prob differences without overflow."""
+    B, T = 2, 5
+    teacher_log_prob = torch.ones(B, T) * 2.0
+    old_log_probs = torch.ones(B, T) * 1.0
+    # Extreme log prob difference that would overflow without clamping
+    rollout_log_probs = torch.tensor(
+        [
+            [1.0, 1.0, -50.0, 1.0, 1.0],  # token 2: diff = 51, would overflow without clamp
+            [1.0, 1.0, 1.0, 1.0, 1.0],
+        ]
+    )
+    response_mask = torch.ones(B, T)
+    token_level_rewards = torch.zeros(B, T)
+
+    mopd_fn = get_adv_estimator_fn("mopd")
+    advantages, _ = mopd_fn(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        teacher_log_prob=teacher_log_prob,
+        old_log_probs=old_log_probs,
+        rollout_log_probs=rollout_log_probs,
+        is_correction=True,
+        is_epsilon_low=0.1,
+        is_epsilon_high=10.0,
+    )
+
+    # Should not contain inf or nan
+    assert not torch.isinf(advantages).any(), "Advantages contain inf values"
+    assert not torch.isnan(advantages).any(), "Advantages contain nan values"
+    # Token with extreme ratio should be masked to 0
+    assert advantages[0, 2].item() == 0.0, "Extreme ratio token should be masked"
+
+
+def test_mopd_degenerate_fallback_2d_indexing():
+    """Test that degenerate fallback uses correct 2D indexing."""
+    B, T = 3, 5
+    teacher_log_prob = torch.ones(B, T) * 2.0
+    old_log_probs = torch.ones(B, T) * 1.0
+    # All tokens masked for first sample, partial for second, none for third
+    rollout_log_probs = torch.tensor(
+        [
+            [-50.0, -50.0, -50.0, -50.0, -50.0],  # All masked (ratio > 10)
+            [-50.0, 1.0, 1.0, 1.0, 1.0],  # Partially masked
+            [1.0, 1.0, 1.0, 1.0, 1.0],  # None masked
+        ]
+    )
+    response_mask = torch.ones(B, T)
+    token_level_rewards = torch.zeros(B, T)
+
+    mopd_fn = get_adv_estimator_fn("mopd")
+    advantages, _ = mopd_fn(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        teacher_log_prob=teacher_log_prob,
+        old_log_probs=old_log_probs,
+        rollout_log_probs=rollout_log_probs,
+        is_correction=True,
+        is_epsilon_low=0.1,
+        is_epsilon_high=10.0,
+    )
+
+    # First sample: all tokens should have fallback (unweighted) advantages
+    # Advantage = teacher - old = 2.0 - 1.0 = 1.0
+    assert torch.allclose(advantages[0], torch.ones(T)), "Degenerate fallback failed for all-masked sample"
+    # Third sample: no masking, should have weighted advantages
+    assert advantages[2, 0].item() != 0.0, "Non-masked sample should have non-zero advantages"
+

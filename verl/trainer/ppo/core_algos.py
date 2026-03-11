@@ -1055,7 +1055,9 @@ def compute_mopd_advantage(
 
     # IS correction (training/inference engine mismatch)
     if is_correction and rollout_log_probs is not None:
-        ratio = (old_log_probs - rollout_log_probs).exp()
+        # Clamp log difference to prevent exp() overflow (exp(20) ≈ 5e8, exp(88) overflows fp32)
+        log_ratio = (old_log_probs - rollout_log_probs).clamp(-20, 20)
+        ratio = log_ratio.exp()
         valid = (ratio >= is_epsilon_low) & (ratio <= is_epsilon_high)
         weights = torch.where(valid, ratio.detach(), torch.zeros_like(ratio))
 
@@ -1066,7 +1068,8 @@ def compute_mopd_advantage(
             logger.warning(
                 "IS correction masked all tokens for some samples. Using unweighted advantages as fallback."
             )
-            weights[all_masked] = 1.0
+            # Use 2D indexing to set all tokens for masked samples
+            weights[all_masked, :] = 1.0
     else:
         weights = torch.ones_like(old_log_probs)
 
