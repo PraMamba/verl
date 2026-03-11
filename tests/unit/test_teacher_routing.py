@@ -63,24 +63,36 @@ def compute_teacher_log_probs_standalone(
 
     This replicates the logic of RayPPOTrainer._compute_teacher_log_probs
     without requiring a trainer instance, for unit testing purposes.
+    Kept in sync with the production implementation.
     """
     teacher_ids = batch.non_tensor_batch["teacher_id"]
     batch_size = len(teacher_ids)
     response_len = batch.batch["responses"].shape[1]
 
+    # Validate all teacher_ids are known (fail fast before processing)
+    known_teachers = set(teacher_wgs.keys())
+    unique_ids = set(teacher_ids)
+    unknown_ids = unique_ids - known_teachers
+    if unknown_ids:
+        raise ValueError(
+            f"Samples have unknown teacher_ids not matching any teacher worker: "
+            f"{unknown_ids}. Available teachers: {sorted(known_teachers)}"
+        )
+
     # Initialize output tensor for collecting teacher log probs
+    device = batch.batch["responses"].device
     teacher_log_probs = torch.zeros(
         batch_size,
         response_len,
         dtype=torch.float32,
-        device=batch.batch["responses"].device,
+        device=device,
     )
 
     # Group by teacher_id and forward sub-batches
     for teacher_name, teacher_wg in teacher_wgs.items():
-        # Get indices for this teacher
+        # Get indices for this teacher (ensure same device as output tensor)
         mask = teacher_ids == teacher_name
-        indices = torch.tensor(np.where(mask)[0], dtype=torch.long)
+        indices = torch.tensor(np.where(mask)[0], dtype=torch.long, device=device)
 
         if len(indices) == 0:
             continue
@@ -92,18 +104,15 @@ def compute_teacher_log_probs_standalone(
         teacher_output = teacher_wg.compute_ref_log_prob(sub_batch)
         sub_log_probs = teacher_output.batch["ref_log_prob"]
 
-        # Scatter back to full batch (correct broadcasting)
-        teacher_log_probs[indices] = sub_log_probs
+        # Validate shape matches expected response length
+        if sub_log_probs.shape[1] != response_len:
+            raise ValueError(
+                f"Teacher '{teacher_name}' returned shape {sub_log_probs.shape}, "
+                f"expected (*, {response_len})"
+            )
 
-    # Verify all samples were routed to a known teacher
-    known_teachers = set(teacher_wgs.keys())
-    unique_ids = set(teacher_ids)
-    unknown_ids = unique_ids - known_teachers
-    if unknown_ids:
-        raise ValueError(
-            f"Samples have unknown teacher_ids not matching any teacher worker: "
-            f"{unknown_ids}. Available teachers: {sorted(known_teachers)}"
-        )
+        # Scatter back to full batch (ensure dtype/device match after Ray serialization)
+        teacher_log_probs[indices] = sub_log_probs.to(dtype=torch.float32, device=device)
 
     return teacher_log_probs
 

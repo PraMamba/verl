@@ -324,6 +324,7 @@ class RayPPOTrainer:
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         self.checkpoint_manager = None
+        self.teacher_wgs: dict[str, RayWorkerGroup] = {}  # MOPD teacher worker groups
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -702,9 +703,6 @@ class RayPPOTrainer:
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
-        # Initialize teacher_wgs to empty dict (will be populated if MOPD is enabled)
-        self.teacher_wgs = {}
-
         # create actor and rollout
         actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
         if self.hybrid_engine:
@@ -824,7 +822,6 @@ class RayPPOTrainer:
                     "MOPD is not compatible with LoRA ref-in-actor mode. "
                     "Please ensure RefPolicy is mapped to a separate worker."
                 )
-            self.teacher_wgs = {}
             for teacher_cfg in self.config.algorithm.mopd.teachers:
                 # Use OmegaConf-safe deep copy instead of standard deepcopy
                 teacher_worker_config = OmegaConf.create(
@@ -1267,8 +1264,8 @@ class RayPPOTrainer:
                     f"expected (*, {response_len})"
                 )
 
-            # Scatter back to full batch (correct broadcasting)
-            teacher_log_probs[indices] = sub_log_probs
+            # Scatter back to full batch (ensure dtype/device match after Ray serialization)
+            teacher_log_probs[indices] = sub_log_probs.to(dtype=torch.float32, device=device)
 
         return teacher_log_probs
 
@@ -1578,8 +1575,11 @@ class RayPPOTrainer:
                                 # MOPD: compute teacher log probs via sub-batch routing
                                 teacher_log_prob = self._compute_teacher_log_probs(batch)
                                 batch.batch["teacher_log_prob"] = teacher_log_prob
-                                # Also compute ref_log_prob if KL loss is used alongside MOPD
-                                if self.config.actor_rollout_ref.actor.use_kl_loss:
+                                # Also compute ref_log_prob if KL loss or KL-in-reward is used alongside MOPD
+                                if (
+                                    self.config.actor_rollout_ref.actor.use_kl_loss
+                                    or self.config.algorithm.use_kl_in_reward
+                                ):
                                     ref_log_prob = self._compute_ref_log_prob(batch)
                                     batch = batch.union(ref_log_prob)
                             else:
@@ -1755,6 +1755,7 @@ class RayPPOTrainer:
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
+                    self.cleanup_teacher_workers()
                     return
 
                 # this is experimental and may be changed/removed in the future
@@ -1763,21 +1764,20 @@ class RayPPOTrainer:
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
 
+        # Clean up teacher workers (MOPD) when training loop exits
+        self.cleanup_teacher_workers()
+
     def cleanup_teacher_workers(self):
         """Clean up teacher worker groups for MOPD.
 
-        This method should be called when training is complete or interrupted
-        to properly release teacher worker resources.
+        Releases references to teacher RayWorkerGroups so Ray can garbage-collect
+        the underlying actors and free GPU memory. Called automatically at the end
+        of fit() on all exit paths, but can also be called manually.
         """
         if self.teacher_wgs:
             logger.info("Cleaning up %d teacher worker groups", len(self.teacher_wgs))
-            for teacher_name, teacher_wg in self.teacher_wgs.items():
-                try:
-                    # Ray workers are cleaned up automatically, but we can explicitly
-                    # kill the actors if needed for immediate resource release
-                    logger.debug("Cleaning up teacher worker: %s", teacher_name)
-                    # Note: RayWorkerGroup doesn't have explicit shutdown, Ray handles cleanup
-                except Exception as e:
-                    logger.warning("Error cleaning up teacher worker %s: %s", teacher_name, e)
+            for teacher_name in list(self.teacher_wgs.keys()):
+                logger.debug("Releasing teacher worker group: %s", teacher_name)
+            # Clear all references; Ray GC will reclaim actor resources
             self.teacher_wgs.clear()
             logger.info("Teacher worker cleanup complete")
