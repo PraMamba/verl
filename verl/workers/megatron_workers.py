@@ -838,10 +838,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         aggressive_empty_cache(force_sync=True)
         return output
 
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
-    @GPUMemoryLogger(role="compute_ref_log_prob", logger=logger)
-    @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
-    def compute_ref_log_prob(self, data: DataProto):
+    def _compute_ref_log_prob_impl(self, data: DataProto):
         if self.peft_cls is not None:
             # if is lora, actor without lora applied is the ref
             data.meta_info["is_lora"] = True
@@ -863,6 +860,18 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             log_gpu_memory_usage("After offload ref params and grad during compute_ref_log_prob", logger=logger)
         aggressive_empty_cache(force_sync=True)
         return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @GPUMemoryLogger(role="compute_ref_log_prob", logger=logger)
+    @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
+    def compute_ref_log_prob(self, data: DataProto):
+        return self._compute_ref_log_prob_impl(data)
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"), blocking=False)
+    @GPUMemoryLogger(role="compute_ref_log_prob", logger=logger)
+    @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
+    def compute_ref_log_prob_async(self, data: DataProto):
+        return self._compute_ref_log_prob_impl(data)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @GPUMemoryLogger(role="compute_log_prob", logger=logger)

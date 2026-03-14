@@ -18,11 +18,12 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import hashlib
 import json
 import logging
 import os
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from copy import deepcopy
 from pprint import pprint
 from typing import Any, Optional
@@ -30,6 +31,7 @@ from typing import Any, Optional
 import numpy as np
 import torch
 from omegaconf import OmegaConf, open_dict
+from tensordict import TensorDict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
@@ -38,6 +40,7 @@ from verl import DataProto
 from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+from verl.single_controller.base.decorator import MAGIC_ATTR
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
@@ -61,12 +64,14 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.tokenizer import hf_tokenizer
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 logger = logging.getLogger(__file__)
+MOPD_MANIFEST_FILENAME = "mopd_manifest.json"
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -211,10 +216,18 @@ def compute_advantage(
             adv_kwargs["rollout_log_probs"] = data.batch["rollout_log_probs"]
         if "base_log_prob" in data.batch:
             adv_kwargs["base_log_prob"] = data.batch["base_log_prob"]
+        if "lambda_val" in data.batch:
+            adv_kwargs["lambda_val"] = data.batch["lambda_val"]
+        if "teacher_seq_reward" in data.batch:
+            adv_kwargs["teacher_seq_reward"] = data.batch["teacher_seq_reward"]
+        if "teacher_seq_weight" in data.batch:
+            adv_kwargs["teacher_seq_weight"] = data.batch["teacher_seq_weight"]
+        if "teacher_token_mask" in data.batch:
+            adv_kwargs["teacher_token_mask"] = data.batch["teacher_token_mask"]
         # Pass MOPD config values if available
         mopd_cfg = getattr(config, "mopd", None) if config else None
         if mopd_cfg is not None:
-            adv_kwargs["lambda_val"] = getattr(mopd_cfg, "lambda_val", 1.0)
+            adv_kwargs.setdefault("lambda_val", getattr(mopd_cfg, "lambda_val", 1.0))
             adv_kwargs["orm_weight"] = getattr(mopd_cfg, "orm_weight", 0.0)
             adv_kwargs["is_correction"] = getattr(mopd_cfg, "is_correction", True)
             adv_kwargs["is_epsilon_low"] = getattr(mopd_cfg, "is_epsilon_low", 0.1)
@@ -232,7 +245,15 @@ def compute_advantage(
             adv_kwargs["rollout_is_weights"] = rollout_is_weights
 
         # calculate advantage estimator
-        advantages, returns = adv_estimator_fn(**adv_kwargs)
+        result = adv_estimator_fn(**adv_kwargs)
+        # MOPD returns (advantages, returns, is_metrics); others return (advantages, returns)
+        if len(result) == 3:
+            advantages, returns, mopd_is_metrics = result
+            # IS metrics are already Python scalars (converted in compute_mopd_advantage)
+            for k, v in mopd_is_metrics.items():
+                data.meta_info.setdefault("metrics", {})[k] = v
+        else:
+            advantages, returns = result
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     return data
@@ -325,6 +346,7 @@ class RayPPOTrainer:
 
         self.checkpoint_manager = None
         self.teacher_wgs: dict[str, RayWorkerGroup] = {}  # MOPD teacher worker groups
+        self.base_policy_wg: Optional[RayWorkerGroup] = None
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -493,10 +515,12 @@ class RayPPOTrainer:
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
-        reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+        reward_keys = (
+            set({"data_source", "reward_model", "extra_info", "uid", "teacher_id"}) & batch.non_tensor_batch.keys()
+        )
 
         # pop those keys for generation
-        batch_keys_to_pop = []
+        batch_keys_to_pop = list(batch.batch.keys())
         non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_keys
         gen_batch = batch.pop(
             batch_keys=batch_keys_to_pop,
@@ -692,6 +716,626 @@ class RayPPOTrainer:
 
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
+    def _build_teacher_worker_config(self, teacher_cfg):
+        """Build a teacher worker config from actor/ref defaults and teacher overrides."""
+        backend = getattr(teacher_cfg, "backend", "legacy_ref")
+        if backend != "legacy_ref":
+            raise ValueError(
+                "Quantized teacher backends must use a dedicated quantized teacher worker instead of "
+                "the legacy ref-worker config builder."
+            )
+        teacher_worker_config = OmegaConf.create(
+            OmegaConf.to_container(self.config.actor_rollout_ref, resolve=True)
+        )
+        with open_dict(teacher_worker_config):
+            teacher_worker_config.model.path = teacher_cfg.model_path
+            teacher_worker_config.model.tokenizer_path = (
+                getattr(teacher_cfg, "tokenizer_path", None) or teacher_cfg.model_path
+            )
+            # Teacher forwards run on routed sub-batches. Use fixed per-teacher
+            # micro batches rather than inheriting the global dynamic ref path.
+            teacher_worker_config.ref.log_prob_use_dynamic_bsz = False
+            teacher_worker_config.ref.log_prob_micro_batch_size = None
+            teacher_worker_config.ref.log_prob_micro_batch_size_per_gpu = teacher_cfg.log_prob_micro_batch_size
+        return teacher_worker_config
+
+    def _build_quantized_teacher_worker_config(self, teacher_cfg):
+        """Build config for the dedicated inference-only quantized teacher worker."""
+        teacher_worker_config = OmegaConf.create(
+            {
+                "model": OmegaConf.to_container(self.config.actor_rollout_ref.model, resolve=True),
+                "teacher": OmegaConf.to_container(teacher_cfg, resolve=True),
+            }
+        )
+        with open_dict(teacher_worker_config):
+            teacher_worker_config.model.path = teacher_cfg.model_path
+            teacher_worker_config.model.tokenizer_path = (
+                getattr(teacher_cfg, "tokenizer_path", None) or teacher_cfg.model_path
+            )
+        return teacher_worker_config
+
+    def _build_base_worker_config(self):
+        """Build a shared base worker config for ExOPD normalization."""
+        base_model_path = OmegaConf.select(self.config, "algorithm.mopd.base_model_path")
+        if not base_model_path:
+            raise ValueError("algorithm.mopd.base_model_path must be set when base normalization is enabled")
+
+        base_worker_config = OmegaConf.create(OmegaConf.to_container(self.config.actor_rollout_ref, resolve=True))
+        with open_dict(base_worker_config):
+            base_worker_config.model.path = base_model_path
+        return base_worker_config
+
+    def _get_batch_device(self, batch: DataProto) -> torch.device:
+        if len(batch.batch.keys()) == 0:
+            raise ValueError("Cannot infer device from an empty batch")
+        first_tensor = next(iter(batch.batch.values()))
+        return first_tensor.device
+
+    def _build_mopd_lambda_tensor(self, batch: DataProto) -> torch.Tensor:
+        """Build a per-sample lambda tensor from teacher routing metadata."""
+        teacher_ids = batch.non_tensor_batch["teacher_id"]
+        teacher_cfg_by_name = self._get_mopd_teacher_config_by_name()
+        unknown_ids = sorted(set(teacher_ids) - set(teacher_cfg_by_name))
+        if unknown_ids:
+            raise ValueError(
+                f"Samples have unknown teacher_ids not matching configured teachers: {unknown_ids}. "
+                f"Configured teachers: {sorted(teacher_cfg_by_name)}"
+            )
+
+        default_lambda = float(getattr(self.config.algorithm.mopd, "lambda_val", 1.0))
+        lambda_values = []
+        for teacher_id in teacher_ids:
+            teacher_cfg = teacher_cfg_by_name[teacher_id]
+            lambda_values.append(
+                float(teacher_cfg.lambda_val)
+                if getattr(teacher_cfg, "lambda_val", None) is not None
+                else default_lambda
+            )
+
+        device = self._get_batch_device(batch)
+        return torch.tensor(lambda_values, dtype=torch.float32, device=device).unsqueeze(-1)
+
+    def _compute_base_log_prob(self, batch: DataProto) -> DataProto:
+        if self.base_policy_wg is None:
+            raise ValueError("Base normalization is enabled but base_policy_wg has not been initialized")
+
+        if self.use_legacy_worker_impl == "disable":
+            batch_td = batch.to_tensordict()
+            batch_td = left_right_2_no_padding(batch_td)
+            tu.assign_non_tensor(batch_td, calculate_entropy=False, compute_loss=False)
+            output = self.base_policy_wg.compute_ref_log_prob(batch_td)
+            log_probs = tu.get(output, "log_probs")
+            log_probs = no_padding_2_padding(log_probs, batch_td)
+            base_log_prob = tu.get_tensordict({"base_log_prob": log_probs.float()})
+            return DataProto.from_tensordict(base_log_prob)
+
+        base_log_prob = self.base_policy_wg.compute_ref_log_prob(batch)
+        base_log_prob.batch["base_log_prob"] = base_log_prob.batch.pop("ref_log_prob")
+        return base_log_prob
+
+    def _get_mopd_teacher_config_by_name(self) -> dict[str, Any]:
+        algorithm_cfg = getattr(getattr(self, "config", None), "algorithm", None)
+        mopd_cfg = getattr(algorithm_cfg, "mopd", None)
+        if mopd_cfg is None:
+            return {}
+        return {teacher.name: teacher for teacher in mopd_cfg.teachers}
+
+    def _get_mopd_teacher_pool_by_name(self) -> dict[str, str]:
+        teacher_cfg_by_name = self._get_mopd_teacher_config_by_name()
+        if not teacher_cfg_by_name:
+            return {teacher_name: "global_pool" for teacher_name in self.teacher_wgs}
+        return {
+            teacher_name: getattr(teacher_cfg, "resource_pool", "global_pool")
+            for teacher_name, teacher_cfg in teacher_cfg_by_name.items()
+        }
+
+    def _get_mopd_teacher_backend_by_name(self) -> dict[str, str]:
+        return {
+            teacher_name: getattr(teacher_cfg, "backend", "legacy_ref")
+            for teacher_name, teacher_cfg in self._get_mopd_teacher_config_by_name().items()
+        }
+
+    def _get_mopd_teacher_tokenizer_policy_by_name(self) -> dict[str, str]:
+        return {
+            teacher_name: getattr(teacher_cfg, "tokenizer_policy", "compatible")
+            for teacher_name, teacher_cfg in self._get_mopd_teacher_config_by_name().items()
+        }
+
+    def _get_mopd_teacher_names_for_policy(self, tokenizer_policy: str) -> set[str]:
+        teacher_cfg_by_name = self._get_mopd_teacher_config_by_name()
+        if not teacher_cfg_by_name:
+            return set(self.teacher_wgs.keys())
+        return {
+            teacher_name
+            for teacher_name, policy in self._get_mopd_teacher_tokenizer_policy_by_name().items()
+            if policy == tokenizer_policy
+        }
+
+    def _submit_teacher_log_prob(self, teacher_wg, sub_batch: DataProto):
+        async_method = getattr(teacher_wg, "compute_ref_log_prob_async", None)
+        if callable(async_method):
+            return async_method(sub_batch)
+        return teacher_wg.compute_ref_log_prob(sub_batch)
+
+    def _submit_teacher_seq_scores(self, teacher_wg, sub_batch: DataProto):
+        async_method = getattr(teacher_wg, "compute_seq_scores_async", None)
+        if callable(async_method):
+            return async_method(sub_batch)
+        return teacher_wg.compute_seq_scores(sub_batch)
+
+    @staticmethod
+    def _get_worker_method_mesh_name(worker_group, method_name: str) -> str | None:
+        ray_cls_with_init = getattr(worker_group, "ray_cls_with_init", None)
+        worker_cls = getattr(ray_cls_with_init, "cls", None)
+        if worker_cls is None:
+            return None
+
+        method = getattr(worker_cls, method_name, None)
+        if method is None:
+            return None
+
+        method_attrs = getattr(method, MAGIC_ATTR, None)
+        if not isinstance(method_attrs, dict):
+            return None
+
+        dispatch_mode = method_attrs.get("dispatch_mode")
+        if isinstance(dispatch_mode, dict):
+            return dispatch_mode.get("mesh_name")
+        return None
+
+    def _get_teacher_dp_mesh_name(self, teacher_wg) -> str:
+        for method_name in (
+            "compute_ref_log_prob_async",
+            "compute_ref_log_prob",
+            "compute_seq_scores_async",
+            "compute_seq_scores",
+        ):
+            mesh_name = self._get_worker_method_mesh_name(teacher_wg, method_name)
+            if mesh_name is not None:
+                return mesh_name
+        return "actor"
+
+    def _get_teacher_job_dp_size(self, teacher_wg) -> int:
+        try:
+            return self._get_dp_size(teacher_wg, self._get_teacher_dp_mesh_name(teacher_wg))
+        except AttributeError:
+            return 1
+
+    @staticmethod
+    def _resolve_teacher_log_prob_output(teacher_output):
+        if isinstance(teacher_output, DataProto | TensorDict):
+            return teacher_output
+        get_fn = getattr(teacher_output, "get", None)
+        if callable(get_fn):
+            return teacher_output.get()
+        return teacher_output
+
+    def _build_mopd_teacher_jobs(
+        self,
+        batch: DataProto,
+        teacher_names: Optional[set[str]] = None,
+    ) -> tuple[list[dict[str, Any]], torch.device, int]:
+        teacher_ids = batch.non_tensor_batch["teacher_id"]
+        response_len = batch.batch["responses"].shape[1]
+
+        known_teachers = set(self.teacher_wgs.keys())
+        unique_ids = set(teacher_ids)
+        unknown_ids = unique_ids - known_teachers
+        if unknown_ids:
+            raise ValueError(
+                f"Samples have unknown teacher_ids not matching any teacher worker: "
+                f"{unknown_ids}. Available teachers: {sorted(known_teachers)}"
+            )
+
+        device = batch.batch["responses"].device
+        teacher_pool_by_name = self._get_mopd_teacher_pool_by_name()
+        selected_teachers = known_teachers if teacher_names is None else known_teachers & set(teacher_names)
+        jobs = []
+        for teacher_name, teacher_wg in self.teacher_wgs.items():
+            if teacher_name not in selected_teachers:
+                continue
+            mask = teacher_ids == teacher_name
+            indices = torch.tensor(np.where(mask)[0], dtype=torch.long, device=device)
+
+            if len(indices) == 0:
+                continue
+
+            sub_batch = batch.select_idxs(indices)
+            sub_batch.non_tensor_batch["_mopd_scatter_index"] = np.asarray(indices.tolist(), dtype=np.int64)
+
+            dp_size = self._get_teacher_job_dp_size(teacher_wg)
+            self._balance_batch(
+                sub_batch,
+                metrics={},
+                logging_prefix=f"teacher/{teacher_name}/seqlen",
+                dp_size=dp_size,
+            )
+            scatter_indices = torch.as_tensor(
+                sub_batch.non_tensor_batch.pop("_mopd_scatter_index"),
+                dtype=torch.long,
+                device=device,
+            )
+            sub_batch_padded, pad_size = pad_dataproto_to_divisor(sub_batch, dp_size)
+
+            jobs.append(
+                {
+                    "teacher_name": teacher_name,
+                    "teacher_wg": teacher_wg,
+                    "pool_name": teacher_pool_by_name.get(teacher_name, "global_pool"),
+                    "teacher_cfg": self._get_mopd_teacher_config_by_name().get(teacher_name),
+                    "sub_batch": sub_batch_padded,
+                    "pad_size": pad_size,
+                    "scatter_indices": scatter_indices,
+                }
+            )
+
+        return jobs, device, response_len
+
+    def _decode_mopd_response_texts(self, batch: DataProto) -> np.ndarray:
+        return np.asarray(
+            self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True),
+            dtype=object,
+        )
+
+    def _build_mopd_sequence_teacher_jobs(self, batch: DataProto) -> tuple[list[dict[str, Any]], torch.device]:
+        if "raw_prompt" not in batch.non_tensor_batch:
+            raise ValueError("Sequence teacher jobs require raw_prompt in batch.non_tensor_batch")
+
+        teacher_ids = batch.non_tensor_batch["teacher_id"]
+        known_teachers = set(self.teacher_wgs.keys())
+        unknown_ids = set(teacher_ids) - known_teachers
+        if unknown_ids:
+            raise ValueError(
+                f"Samples have unknown teacher_ids not matching any teacher worker: "
+                f"{unknown_ids}. Available teachers: {sorted(known_teachers)}"
+            )
+
+        response_texts = self._decode_mopd_response_texts(batch)
+        device = batch.batch["responses"].device
+        teacher_pool_by_name = self._get_mopd_teacher_pool_by_name()
+        sequence_teacher_names = self._get_mopd_teacher_names_for_policy("sequence_reward")
+        jobs = []
+
+        for teacher_name, teacher_wg in self.teacher_wgs.items():
+            if teacher_name not in sequence_teacher_names:
+                continue
+
+            mask = teacher_ids == teacher_name
+            indices = np.where(mask)[0]
+            if len(indices) == 0:
+                continue
+
+            torch_indices = torch.as_tensor(indices, dtype=torch.long, device=device)
+            sub_batch = batch.select_idxs(torch_indices)
+            sub_batch.non_tensor_batch["response_text"] = np.asarray(response_texts[indices], dtype=object)
+            sub_batch.non_tensor_batch["_mopd_scatter_index"] = np.asarray(indices, dtype=np.int64)
+
+            dp_size = self._get_teacher_job_dp_size(teacher_wg)
+            if "attention_mask" in sub_batch.batch:
+                self._balance_batch(
+                    sub_batch,
+                    metrics={},
+                    logging_prefix=f"teacher/{teacher_name}/seqlen",
+                    dp_size=dp_size,
+                )
+            scatter_indices = torch.as_tensor(
+                sub_batch.non_tensor_batch.pop("_mopd_scatter_index"),
+                dtype=torch.long,
+                device=device,
+            )
+            sub_batch_padded, pad_size = pad_dataproto_to_divisor(sub_batch, dp_size)
+
+            jobs.append(
+                {
+                    "teacher_name": teacher_name,
+                    "teacher_wg": teacher_wg,
+                    "pool_name": teacher_pool_by_name.get(teacher_name, "global_pool"),
+                    "teacher_cfg": self._get_mopd_teacher_config_by_name().get(teacher_name),
+                    "sub_batch": sub_batch_padded,
+                    "pad_size": pad_size,
+                    "scatter_indices": scatter_indices,
+                    "response_texts": list(sub_batch.non_tensor_batch["response_text"]),
+                    "raw_prompts": list(sub_batch.non_tensor_batch["raw_prompt"]),
+                }
+            )
+
+        return jobs, device
+
+    def _consume_teacher_job_result(
+        self,
+        job: dict[str, Any],
+        teacher_output,
+        teacher_log_probs: torch.Tensor,
+        response_len: int,
+        device: torch.device,
+    ) -> None:
+        teacher_output = self._resolve_teacher_log_prob_output(teacher_output)
+        teacher_output = unpad_dataproto(teacher_output, pad_size=job["pad_size"])
+        sub_log_probs = teacher_output.batch["ref_log_prob"]
+
+        if sub_log_probs.shape[1] != response_len:
+            raise ValueError(
+                f"Teacher '{job['teacher_name']}' returned shape {sub_log_probs.shape}, expected (*, {response_len})"
+            )
+
+        teacher_log_probs[job["scatter_indices"]] = sub_log_probs.to(dtype=torch.float32, device=device)
+
+    def _compute_mopd_is_valid_mask(self, old_log_probs: torch.Tensor, rollout_log_probs: torch.Tensor) -> torch.Tensor:
+        log_ratio = (old_log_probs - rollout_log_probs).clamp(-20, 20)
+        ratio = torch.exp(log_ratio)
+        is_epsilon_low = float(getattr(self.config.algorithm.mopd, "is_epsilon_low", 0.1))
+        is_epsilon_high = float(getattr(self.config.algorithm.mopd, "is_epsilon_high", 10.0))
+        return (ratio >= is_epsilon_low) & (ratio <= is_epsilon_high)
+
+    def _record_mopd_teacher_metrics(self, batch: DataProto, metrics: dict[str, float]) -> None:
+        if "teacher_id" not in batch.non_tensor_batch:
+            return
+        required_keys = {"response_mask", "advantages", "teacher_log_prob", "old_log_probs"}
+        if not required_keys.issubset(batch.batch.keys()):
+            return
+
+        teacher_ids = np.asarray(batch.non_tensor_batch["teacher_id"])
+        batch_size = len(teacher_ids)
+        if batch_size == 0:
+            return
+
+        response_mask = batch.batch["response_mask"] > 0
+        advantages = batch.batch["advantages"]
+        reverse_kl = batch.batch["teacher_log_prob"] - batch.batch["old_log_probs"]
+        seq_teacher_token_mask = batch.batch.get("teacher_token_mask", None)
+        token_teacher_mask = None
+        if seq_teacher_token_mask is not None:
+            token_teacher_mask = seq_teacher_token_mask <= 0
+        is_valid_mask = None
+        if getattr(self.config.algorithm.mopd, "is_correction", False) and "rollout_log_probs" in batch.batch:
+            is_valid_mask = self._compute_mopd_is_valid_mask(
+                batch.batch["old_log_probs"], batch.batch["rollout_log_probs"]
+            )
+
+        for teacher_name in self._get_mopd_teacher_config_by_name():
+            sample_mask = teacher_ids == teacher_name
+            if not np.any(sample_mask):
+                continue
+
+            sample_indices = torch.as_tensor(np.where(sample_mask)[0], dtype=torch.long, device=advantages.device)
+            teacher_response_mask = response_mask[sample_indices]
+            valid_tokens = teacher_response_mask > 0
+            teacher_advantages = advantages[sample_indices][valid_tokens]
+            token_count = valid_tokens.sum().item()
+
+            token_level_positions = valid_tokens
+            if token_teacher_mask is not None:
+                token_level_positions = valid_tokens & token_teacher_mask[sample_indices]
+            teacher_reverse_kl = reverse_kl[sample_indices][token_level_positions]
+
+            prefix = f"mopd/{teacher_name}"
+            metrics[f"{prefix}/sample_fraction"] = float(sample_mask.sum()) / float(batch_size)
+            metrics[f"{prefix}/adv_mean"] = teacher_advantages.float().mean().item() if token_count > 0 else 0.0
+            metrics[f"{prefix}/adv_std"] = (
+                teacher_advantages.float().std(unbiased=False).item() if token_count > 0 else 0.0
+            )
+            metrics[f"{prefix}/reverse_kl_mean"] = (
+                teacher_reverse_kl.float().mean().item() if teacher_reverse_kl.numel() > 0 else 0.0
+            )
+
+            if "teacher_seq_reward" in batch.batch:
+                teacher_seq_reward = batch.batch["teacher_seq_reward"][sample_indices]
+                metrics[f"{prefix}/seq_reward_mean"] = teacher_seq_reward.float().mean().item()
+
+            if is_valid_mask is not None:
+                teacher_is_valid = is_valid_mask[sample_indices] & token_level_positions
+                denom = token_level_positions.sum().clamp(min=1)
+                metrics[f"{prefix}/is_valid_fraction"] = (teacher_is_valid.sum().float() / denom).item()
+
+    def _get_mopd_teacher_id_counts(self) -> Counter:
+        """Collect routed teacher_id counts from the train dataset."""
+        dataset = self.train_dataset
+        if hasattr(dataset, "teacher_id_field") and dataset.teacher_id_field:
+            teacher_id_field = dataset.teacher_id_field
+            dataframe = getattr(dataset, "dataframe", None)
+            column_names = getattr(dataframe, "column_names", None)
+            if dataframe is not None and column_names and teacher_id_field in column_names:
+                return Counter((teacher_id or "default") for teacher_id in dataframe[teacher_id_field])
+
+        counts = Counter()
+        for idx in range(len(dataset)):
+            sample = dataset[idx]
+            teacher_id = sample.get("teacher_id", "default")
+            counts[teacher_id] += 1
+        return counts
+
+    @staticmethod
+    def _get_tokenizer_signature(tokenizer) -> dict[str, Any]:
+        added_vocab = tokenizer.get_added_vocab() if hasattr(tokenizer, "get_added_vocab") else {}
+        vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else None
+        vocab_hash = None
+        if vocab is not None:
+            vocab_items = sorted(vocab.items())
+            vocab_hash = hashlib.sha256(
+                json.dumps(vocab_items, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+
+        return {
+            "tokenizer_class": tokenizer.__class__.__name__,
+            "vocab_size": getattr(tokenizer, "vocab_size", None),
+            "vocab_hash": vocab_hash,
+            "pad_token_id": getattr(tokenizer, "pad_token_id", None),
+            "eos_token_id": getattr(tokenizer, "eos_token_id", None),
+            "bos_token_id": getattr(tokenizer, "bos_token_id", None),
+            "padding_side": getattr(tokenizer, "padding_side", None),
+            "special_tokens_map": deepcopy(getattr(tokenizer, "special_tokens_map", {})),
+            "added_vocab_keys": sorted(added_vocab.keys()),
+        }
+
+    @staticmethod
+    def _load_tokenizer_or_raise(path: str, trust_remote_code: bool, label: str):
+        try:
+            return hf_tokenizer(path, trust_remote_code=trust_remote_code)
+        except Exception as exc:
+            raise ValueError(f"MOPD tokenizer compatibility check failed while loading {label} tokenizer.") from exc
+
+    def _validate_mopd_tokenizer_compatibility(self) -> None:
+        if not self.config.algorithm.get("mopd", {}).get("enabled", False):
+            return
+
+        student_tokenizer_path = (
+            OmegaConf.select(self.config, "actor_rollout_ref.model.tokenizer_path")
+            or OmegaConf.select(self.config, "actor_rollout_ref.model.path")
+        )
+        student_compat_group = OmegaConf.select(self.config, "actor_rollout_ref.model.tokenizer_compat_group")
+        trust_remote_code = self.config.actor_rollout_ref.model.get("trust_remote_code", False)
+        student_tokenizer = None
+
+        for teacher_cfg in self.config.algorithm.mopd.teachers:
+            if getattr(teacher_cfg, "tokenizer_policy", "compatible") == "sequence_reward":
+                continue
+
+            teacher_tokenizer_path = getattr(teacher_cfg, "tokenizer_path", None) or teacher_cfg.model_path
+            if teacher_tokenizer_path == student_tokenizer_path:
+                continue
+
+            compat_group = getattr(teacher_cfg, "tokenizer_compat_group", None)
+            if compat_group is None:
+                raise ValueError(
+                    "MOPD tokenizer compatibility check failed: "
+                    f"teacher '{teacher_cfg.name}' uses tokenizer '{teacher_tokenizer_path}' while the student "
+                    f"uses '{student_tokenizer_path}'. Token-level teacher log-prob routing requires a matching "
+                    "tokenizer contract; sequence-level heterogeneous-tokenizer fallback is not implemented. "
+                    "Set tokenizer_compat_group only for tokenizers with matching metadata."
+                )
+
+            if student_compat_group is not None and compat_group != student_compat_group:
+                raise ValueError(
+                    "MOPD tokenizer compatibility check failed: "
+                    f"teacher '{teacher_cfg.name}' declared tokenizer_compat_group='{compat_group}', "
+                    f"but the student requires '{student_compat_group}'."
+                )
+
+            if student_tokenizer is None:
+                student_tokenizer = self._load_tokenizer_or_raise(
+                    student_tokenizer_path, trust_remote_code, "student"
+                )
+            teacher_tokenizer = self._load_tokenizer_or_raise(
+                teacher_tokenizer_path, trust_remote_code, f"teacher '{teacher_cfg.name}'"
+            )
+
+            student_signature = self._get_tokenizer_signature(student_tokenizer)
+            teacher_signature = self._get_tokenizer_signature(teacher_tokenizer)
+            if teacher_signature != student_signature:
+                raise ValueError(
+                    "MOPD tokenizer metadata mismatch: "
+                    f"teacher '{teacher_cfg.name}' declared tokenizer_compat_group='{compat_group}' but the "
+                    "loaded tokenizer metadata does not match the student tokenizer."
+                )
+
+        if getattr(self.config.algorithm.mopd, "use_base_normalization", False):
+            base_tokenizer_path = getattr(self.config.algorithm.mopd, "base_model_path", None)
+            if base_tokenizer_path is None:
+                raise ValueError("Base normalization requires a resolvable tokenizer path for the base model")
+            if base_tokenizer_path != student_tokenizer_path:
+                if student_tokenizer is None:
+                    student_tokenizer = self._load_tokenizer_or_raise(
+                        student_tokenizer_path, trust_remote_code, "student"
+                    )
+                base_tokenizer = self._load_tokenizer_or_raise(base_tokenizer_path, trust_remote_code, "base model")
+                if self._get_tokenizer_signature(base_tokenizer) != self._get_tokenizer_signature(student_tokenizer):
+                    raise ValueError(
+                        "MOPD tokenizer metadata mismatch: base model tokenizer does not match the student tokenizer."
+                    )
+
+    def _run_mopd_preflight_checks(self) -> None:
+        if not self.config.algorithm.get("mopd", {}).get("enabled", False):
+            return
+
+        teacher_counts = self._get_mopd_teacher_id_counts()
+        logger.info("MOPD teacher_id distribution: %s", dict(sorted(teacher_counts.items())))
+
+        configured_teachers = {teacher.name for teacher in self.config.algorithm.mopd.teachers}
+        observed_teachers = set(teacher_counts)
+        unknown_ids = sorted(observed_teachers - configured_teachers)
+        if unknown_ids:
+            raise ValueError(
+                f"MOPD preflight found unknown teacher_ids in the training dataset: {unknown_ids}. "
+                f"Configured teachers: {sorted(configured_teachers)}"
+            )
+
+        if len(configured_teachers) > 1 and (not teacher_counts or observed_teachers == {"default"}):
+            raise ValueError(
+                "MOPD preflight found no routed teacher_ids in the training dataset. "
+                "Check data.teacher_id_field and dataset teacher mappings."
+            )
+
+        missing_teachers = sorted(configured_teachers - observed_teachers)
+        if missing_teachers:
+            raise ValueError(
+                f"MOPD preflight found missing configured teachers in the training dataset: {missing_teachers}"
+            )
+
+        self._validate_mopd_tokenizer_compatibility()
+
+    def _build_mopd_manifest(self) -> dict[str, Any]:
+        if not self.config.algorithm.get("mopd", {}).get("enabled", False):
+            return {}
+
+        adv_estimator = self.config.algorithm.adv_estimator
+        if hasattr(adv_estimator, "value"):
+            adv_estimator = adv_estimator.value
+
+        teachers = sorted(self.config.algorithm.mopd.teachers, key=lambda teacher: teacher.name)
+        return {
+            "semantic": {
+                "adv_estimator": adv_estimator,
+                "lambda_val": float(getattr(self.config.algorithm.mopd, "lambda_val", 1.0)),
+                "orm_weight": float(getattr(self.config.algorithm.mopd, "orm_weight", 0.0)),
+                "is_correction": bool(getattr(self.config.algorithm.mopd, "is_correction", True)),
+                "is_epsilon_low": float(getattr(self.config.algorithm.mopd, "is_epsilon_low", 0.1)),
+                "is_epsilon_high": float(getattr(self.config.algorithm.mopd, "is_epsilon_high", 10.0)),
+                "use_base_normalization": bool(
+                    getattr(self.config.algorithm.mopd, "use_base_normalization", False)
+                ),
+                "base_model_path": getattr(self.config.algorithm.mopd, "base_model_path", None),
+                "teachers": [
+                    {
+                        "name": teacher.name,
+                        "model_path": teacher.model_path,
+                        "lambda_val": getattr(teacher, "lambda_val", None),
+                        "backend": getattr(teacher, "backend", "legacy_ref"),
+                        "tokenizer_path": getattr(teacher, "tokenizer_path", None),
+                        "tokenizer_compat_group": getattr(teacher, "tokenizer_compat_group", None),
+                        "tokenizer_policy": getattr(teacher, "tokenizer_policy", "compatible"),
+                        "seq_reward_weight": float(getattr(teacher, "seq_reward_weight", 1.0)),
+                    }
+                    for teacher in teachers
+                ],
+            },
+            "deployment": {
+                "resource_pools": {
+                    pool_name: {
+                        "nnodes": pool_cfg.nnodes,
+                        "n_gpus_per_node": pool_cfg.n_gpus_per_node,
+                        "max_colocate_count": getattr(pool_cfg, "max_colocate_count", None),
+                    }
+                    for pool_name, pool_cfg in getattr(self.config.algorithm.mopd, "resource_pools", {}).items()
+                },
+                "teachers": [
+                    {
+                        "name": teacher.name,
+                        "resource_pool": teacher.resource_pool,
+                        "log_prob_micro_batch_size": teacher.log_prob_micro_batch_size,
+                    }
+                    for teacher in teachers
+                ]
+            },
+        }
+
+    def _validate_loaded_mopd_manifest(self, loaded_manifest: dict[str, Any]) -> None:
+        current_manifest = self._build_mopd_manifest()
+        if loaded_manifest.get("semantic") != current_manifest.get("semantic"):
+            raise ValueError("MOPD checkpoint semantic drift detected between saved manifest and current config")
+
+        if loaded_manifest.get("deployment") != current_manifest.get("deployment"):
+            logger.warning("MOPD checkpoint has deployment-only drift: %s", loaded_manifest.get("deployment"))
+
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
 
@@ -699,6 +1343,7 @@ class RayPPOTrainer:
         1. Ray resource pools from configuration
         2. Worker groups for each role (actor, critic, etc.)
         """
+        self._run_mopd_preflight_checks()
         self.resource_pool_manager.create_resource_pool()
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
@@ -822,20 +1467,55 @@ class RayPPOTrainer:
                     "MOPD is not compatible with LoRA ref-in-actor mode. "
                     "Please ensure RefPolicy is mapped to a separate worker."
                 )
-            for teacher_cfg in self.config.algorithm.mopd.teachers:
-                # Use OmegaConf-safe deep copy instead of standard deepcopy
-                teacher_worker_config = OmegaConf.create(
-                    OmegaConf.to_container(self.config.actor_rollout_ref, resolve=True)
-                )
-                # Use open_dict to allow modification even if struct mode is enabled
-                with open_dict(teacher_worker_config):
-                    teacher_worker_config.model.path = teacher_cfg.model_path
-
-                teacher_cls = RayClassWithInitArgs(
+            if getattr(self.config.algorithm.mopd, "use_base_normalization", False):
+                base_worker_config = self._build_base_worker_config()
+                base_cls = RayClassWithInitArgs(
                     self.role_worker_mapping[Role.RefPolicy],
-                    config=teacher_worker_config,
-                    role=f"Teacher_{teacher_cfg.name}",
+                    config=base_worker_config,
+                    role=str(Role.RefPolicy),
                 )
+                base_resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
+                self.base_policy_wg = self.ray_worker_group_cls(
+                    resource_pool=base_resource_pool,
+                    ray_cls_with_init=base_cls,
+                    **wg_kwargs,
+                )
+                self.base_policy_wg.init_model()
+                logger.info(
+                    "Initialized shared base worker group for ExOPD (model: %s)",
+                    self.config.algorithm.mopd.base_model_path,
+                )
+
+            import ray
+
+            from verl.workers.teacher_workers import HFQuantizedTeacherWorker
+
+            for teacher_cfg in self.config.algorithm.mopd.teachers:
+                backend = getattr(teacher_cfg, "backend", "legacy_ref")
+                tokenizer_policy = getattr(teacher_cfg, "tokenizer_policy", "compatible")
+                if backend == "legacy_ref":
+                    if tokenizer_policy == "sequence_reward":
+                        raise ValueError(
+                            "tokenizer_policy=sequence_reward requires a dedicated quantized teacher worker "
+                            f"backend for teacher '{teacher_cfg.name}'."
+                        )
+                    teacher_worker_config = self._build_teacher_worker_config(teacher_cfg)
+                    teacher_cls = RayClassWithInitArgs(
+                        self.role_worker_mapping[Role.RefPolicy],
+                        config=teacher_worker_config,
+                        role=str(Role.RefPolicy),
+                    )
+                elif backend in {"hf_int8", "hf_4bit"}:
+                    teacher_worker_config = self._build_quantized_teacher_worker_config(teacher_cfg)
+                    teacher_cls = RayClassWithInitArgs(
+                        ray.remote(HFQuantizedTeacherWorker),
+                        config=teacher_worker_config,
+                        role="teacher",
+                    )
+                else:
+                    raise ValueError(
+                        f"Unsupported MOPD teacher backend '{backend}' for teacher '{teacher_cfg.name}'."
+                    )
 
                 # Validate resource pool exists before using it
                 if teacher_cfg.resource_pool not in self.resource_pool_manager.resource_pool_dict:
@@ -851,11 +1531,14 @@ class RayPPOTrainer:
                     ray_cls_with_init=teacher_cls,
                     **wg_kwargs,
                 )
-                teacher_wg.spawn()
                 teacher_wg.init_model()
                 self.teacher_wgs[teacher_cfg.name] = teacher_wg
                 logger.info(
-                    "Initialized teacher worker group: %s (model: %s)", teacher_cfg.name, teacher_cfg.model_path
+                    "Initialized teacher worker group: %s (model: %s, backend: %s, tokenizer_policy: %s)",
+                    teacher_cfg.name,
+                    teacher_cfg.model_path,
+                    backend,
+                    tokenizer_policy,
                 )
 
             # Validate MOPD + ppo_epochs constraint early (before training starts)
@@ -977,6 +1660,12 @@ class RayPPOTrainer:
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
 
+        mopd_manifest = self._build_mopd_manifest()
+        if mopd_manifest:
+            manifest_path = os.path.join(local_global_step_folder, MOPD_MANIFEST_FILENAME)
+            with open(manifest_path, "w", encoding="utf-8") as manifest_file:
+                json.dump(mopd_manifest, manifest_file, indent=2)
+
         # latest checkpointed iteration tracker (for atomic usage)
         if (
             hasattr(self.config.actor_rollout_ref.actor.checkpoint, "async_save")
@@ -1023,6 +1712,16 @@ class RayPPOTrainer:
                     working_dir = os.getcwd()
                     global_step_folder = os.path.join(working_dir, global_step_folder)
         print(f"Load from checkpoint folder: {global_step_folder}")
+        manifest_path = os.path.join(global_step_folder, MOPD_MANIFEST_FILENAME)
+        if os.path.exists(manifest_path):
+            with open(manifest_path, encoding="utf-8") as manifest_file:
+                self._validate_loaded_mopd_manifest(json.load(manifest_file))
+        elif self._build_mopd_manifest():
+            logger.warning(
+                "No %s found in %s; skipping MOPD drift validation",
+                MOPD_MANIFEST_FILENAME,
+                global_step_folder,
+            )
         # set global step
         self.global_steps = int(global_step_folder.split("global_step_")[-1])
 
@@ -1088,7 +1787,14 @@ class RayPPOTrainer:
             dp_rank_mapping = worker_group._dispatch_info[role]
         return max(dp_rank_mapping) + 1
 
-    def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
+    def _balance_batch(
+        self,
+        batch: DataProto,
+        metrics,
+        logging_prefix="global_seqlen",
+        keep_minibatch=False,
+        dp_size: Optional[int] = None,
+    ):
         """Reorder the data on single controller such that each dp rank gets similar total tokens.
 
         When use_prefix_grouper is enabled, uses group-level balancing to keep samples with
@@ -1100,7 +1806,8 @@ class RayPPOTrainer:
         workload_lst = calculate_workload(global_seqlen_lst)
         # Get dp_size from dispatch info to correctly balance across data parallel ranks
         # Note: world_size may include tensor/pipeline parallel dimensions, but we only want DP
-        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+        if dp_size is None:
+            dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
 
         # Use group-level balancing for PrefixGrouper to keep same-uid samples together
         if getattr(self, "use_prefix_grouper", False) and "uid" in batch.non_tensor_batch:
@@ -1217,57 +1924,116 @@ class RayPPOTrainer:
 
         Returns:
             torch.Tensor: Teacher log probs of shape [batch_size, response_len].
+
+        Raises:
+            ValueError: If any teacher_id in the batch has no corresponding teacher
+                worker group, or if a teacher returns output with mismatched
+                response length.
         """
-        teacher_ids = batch.non_tensor_batch["teacher_id"]
-        batch_size = len(teacher_ids)
-        response_len = batch.batch["responses"].shape[1]
-
-        # Validate all teacher_ids are known (fail fast before processing)
-        known_teachers = set(self.teacher_wgs.keys())
-        unique_ids = set(teacher_ids)
-        unknown_ids = unique_ids - known_teachers
-        if unknown_ids:
-            raise ValueError(
-                f"Samples have unknown teacher_ids not matching any teacher worker: "
-                f"{unknown_ids}. Available teachers: {sorted(known_teachers)}"
-            )
-
-        # Initialize output tensor for collecting teacher log probs
-        device = batch.batch["responses"].device
+        compatible_teacher_names = self._get_mopd_teacher_names_for_policy("compatible")
+        jobs, device, response_len = self._build_mopd_teacher_jobs(batch, teacher_names=compatible_teacher_names)
         teacher_log_probs = torch.zeros(
-            batch_size,
+            len(batch.non_tensor_batch["teacher_id"]),
             response_len,
             dtype=torch.float32,
             device=device,
         )
+        if not jobs:
+            return teacher_log_probs
 
-        # Group by teacher_id and forward sub-batches
-        for teacher_name, teacher_wg in self.teacher_wgs.items():
-            # Get indices for this teacher (ensure same device as output tensor)
-            mask = teacher_ids == teacher_name
-            indices = torch.tensor(np.where(mask)[0], dtype=torch.long, device=device)
+        jobs_by_pool = defaultdict(list)
+        for job in jobs:
+            jobs_by_pool[job["pool_name"]].append(job)
 
-            if len(indices) == 0:
-                continue
+        pending_by_pool = {}
+        for pool_name, pool_jobs in jobs_by_pool.items():
+            first_job = pool_jobs.pop(0)
+            pending_by_pool[pool_name] = (
+                first_job,
+                self._submit_teacher_log_prob(first_job["teacher_wg"], first_job["sub_batch"]),
+            )
 
-            # Select sub-batch using integer index tensor
-            sub_batch = batch.select_idxs(indices)
-
-            # Forward to teacher
-            teacher_output = teacher_wg.compute_ref_log_prob(sub_batch)
-            sub_log_probs = teacher_output.batch["ref_log_prob"]
-
-            # Validate shape matches expected response length
-            if sub_log_probs.shape[1] != response_len:
-                raise ValueError(
-                    f"Teacher '{teacher_name}' returned shape {sub_log_probs.shape}, "
-                    f"expected (*, {response_len})"
-                )
-
-            # Scatter back to full batch (ensure dtype/device match after Ray serialization)
-            teacher_log_probs[indices] = sub_log_probs.to(dtype=torch.float32, device=device)
+        for pool_name in list(pending_by_pool.keys()):
+            while pool_name in pending_by_pool:
+                job, teacher_output = pending_by_pool[pool_name]
+                self._consume_teacher_job_result(job, teacher_output, teacher_log_probs, response_len, device)
+                if jobs_by_pool[pool_name]:
+                    next_job = jobs_by_pool[pool_name].pop(0)
+                    pending_by_pool[pool_name] = (
+                        next_job,
+                        self._submit_teacher_log_prob(next_job["teacher_wg"], next_job["sub_batch"]),
+                    )
+                else:
+                    pending_by_pool.pop(pool_name)
 
         return teacher_log_probs
+
+    def _compute_teacher_sequence_rewards(self, batch: DataProto) -> DataProto:
+        jobs, device = self._build_mopd_sequence_teacher_jobs(batch)
+        batch_size, response_len = batch.batch["responses"].shape
+        teacher_seq_reward = torch.zeros(batch_size, dtype=torch.float32, device=device)
+        teacher_seq_weight = torch.zeros(batch_size, 1, dtype=torch.float32, device=device)
+        teacher_token_mask = torch.zeros(batch_size, response_len, dtype=torch.float32, device=device)
+
+        if not jobs:
+            return DataProto.from_single_dict(
+                {
+                    "teacher_seq_reward": teacher_seq_reward,
+                    "teacher_seq_weight": teacher_seq_weight,
+                    "teacher_token_mask": teacher_token_mask,
+                }
+            )
+
+        jobs_by_pool = defaultdict(list)
+        for job in jobs:
+            jobs_by_pool[job["pool_name"]].append(job)
+
+        pending_by_pool = {}
+        for pool_name, pool_jobs in jobs_by_pool.items():
+            first_job = pool_jobs.pop(0)
+            pending_by_pool[pool_name] = (
+                first_job,
+                self._submit_teacher_seq_scores(first_job["teacher_wg"], first_job["sub_batch"]),
+            )
+
+        for pool_name in list(pending_by_pool.keys()):
+            while pool_name in pending_by_pool:
+                job, teacher_output = pending_by_pool[pool_name]
+                teacher_output = self._resolve_teacher_log_prob_output(teacher_output)
+                teacher_output = unpad_dataproto(teacher_output, pad_size=job["pad_size"])
+                seq_scores = teacher_output.batch.get("seq_scores", None)
+                if seq_scores is None:
+                    seq_scores = teacher_output.batch.get("teacher_seq_reward", None)
+                if seq_scores is None:
+                    raise ValueError(
+                        f"Teacher '{job['teacher_name']}' sequence scorer must return 'seq_scores' or "
+                        "'teacher_seq_reward'."
+                    )
+
+                teacher_seq_reward[job["scatter_indices"]] = seq_scores.to(dtype=torch.float32, device=device)
+                teacher_seq_weight[job["scatter_indices"]] = float(
+                    getattr(job["teacher_cfg"], "seq_reward_weight", 1.0)
+                )
+                teacher_token_mask[job["scatter_indices"]] = batch.batch["response_mask"][job["scatter_indices"]].to(
+                    dtype=torch.float32, device=device
+                )
+
+                if jobs_by_pool[pool_name]:
+                    next_job = jobs_by_pool[pool_name].pop(0)
+                    pending_by_pool[pool_name] = (
+                        next_job,
+                        self._submit_teacher_seq_scores(next_job["teacher_wg"], next_job["sub_batch"]),
+                    )
+                else:
+                    pending_by_pool.pop(pool_name)
+
+        return DataProto.from_single_dict(
+            {
+                "teacher_seq_reward": teacher_seq_reward,
+                "teacher_seq_weight": teacher_seq_weight,
+                "teacher_token_mask": teacher_token_mask,
+            }
+        )
 
     def _compute_old_log_prob(self, batch: DataProto):
         if self.use_legacy_worker_impl == "disable":
@@ -1575,6 +2341,11 @@ class RayPPOTrainer:
                                 # MOPD: compute teacher log probs via sub-batch routing
                                 teacher_log_prob = self._compute_teacher_log_probs(batch)
                                 batch.batch["teacher_log_prob"] = teacher_log_prob
+                                batch = batch.union(self._compute_teacher_sequence_rewards(batch))
+                                batch.batch["lambda_val"] = self._build_mopd_lambda_tensor(batch)
+                                if getattr(self.config.algorithm.mopd, "use_base_normalization", False):
+                                    base_log_prob = self._compute_base_log_prob(batch)
+                                    batch = batch.union(base_log_prob)
                                 # Also compute ref_log_prob if KL loss or KL-in-reward is used alongside MOPD
                                 if (
                                     self.config.actor_rollout_ref.actor.use_kl_loss
@@ -1639,6 +2410,12 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+
+                        # Extract MOPD IS metrics if present (set by compute_mopd_advantage)
+                        if batch.meta_info.get("metrics"):
+                            metrics.update(batch.meta_info.pop("metrics"))
+                        if self.teacher_wgs:
+                            self._record_mopd_teacher_metrics(batch, metrics)
 
                     # update critic
                     if self.use_critic:

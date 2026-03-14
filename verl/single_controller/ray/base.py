@@ -184,9 +184,23 @@ class ResourcePoolManager:
     Define a resource pool specification. Resource pool will be initialized first.
     """
 
-    resource_pool_spec: dict[str, list[int]]
+    resource_pool_spec: dict[str, list[int] | dict[str, Any]]
     mapping: dict[int, str]
     resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
+
+    @staticmethod
+    def _parse_resource_pool_spec_entry(pool_spec: list[int] | dict[str, Any]) -> tuple[list[int], int, Optional[str]]:
+        if isinstance(pool_spec, dict) or (
+            hasattr(pool_spec, "keys") and "process_on_nodes" in pool_spec
+        ):
+            process_on_nodes = pool_spec["process_on_nodes"]
+            max_colocate_count = pool_spec.get("max_colocate_count", 3)
+            accelerator_type = pool_spec.get("accelerator_type")
+        else:
+            process_on_nodes = pool_spec
+            max_colocate_count = 3
+            accelerator_type = None
+        return process_on_nodes, max_colocate_count, accelerator_type
 
     def create_resource_pool(self):
         """Create Ray resource pools for distributed training.
@@ -196,13 +210,18 @@ class ResourcePoolManager:
         For FSDP backend, uses max_colocate_count=1 to merge WorkerGroups.
         For Megatron backend, uses max_colocate_count>1 for different models.
         """
-        for resource_pool_name, process_on_nodes in self.resource_pool_spec.items():
+        for resource_pool_name, pool_spec in self.resource_pool_spec.items():
+            process_on_nodes, max_colocate_count, accelerator_type = self._parse_resource_pool_spec_entry(pool_spec)
             # max_colocate_count means the number of WorkerGroups (i.e. processes) in each RayResourcePool
             # For FSDP backend, using max_colocate_count=3: actor_critic_ref, rollout, reward model (optional)
             # For Megatron backend, we recommend using max_colocate_count>1
             # that can utilize different WorkerGroup for differnt models
             resource_pool = RayResourcePool(
-                process_on_nodes=process_on_nodes, use_gpu=True, max_colocate_count=3, name_prefix=resource_pool_name
+                process_on_nodes=process_on_nodes,
+                use_gpu=True,
+                max_colocate_count=max_colocate_count,
+                name_prefix=resource_pool_name,
+                accelerator_type=accelerator_type,
             )
             self.resource_pool_dict[resource_pool_name] = resource_pool
 
@@ -214,7 +233,13 @@ class ResourcePoolManager:
 
     def get_n_gpus(self) -> int:
         """Get the number of gpus in this cluster."""
-        return sum([n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes])
+        return sum(
+            [
+                n_gpus
+                for pool_spec in self.resource_pool_spec.values()
+                for n_gpus in self._parse_resource_pool_spec_entry(pool_spec)[0]
+            ]
+        )
 
     def _check_resource_available(self):
         """Check if the resource pool can be satisfied in this ray cluster."""
@@ -227,7 +252,11 @@ class ResourcePoolManager:
         # check total required gpus can be satisfied
         total_available_gpus = sum(node_available_gpus.values())
         total_required_gpus = sum(
-            [n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes]
+            [
+                n_gpus
+                for pool_spec in self.resource_pool_spec.values()
+                for n_gpus in self._parse_resource_pool_spec_entry(pool_spec)[0]
+            ]
         )
         if total_available_gpus < total_required_gpus:
             raise ValueError(

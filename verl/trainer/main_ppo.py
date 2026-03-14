@@ -17,6 +17,7 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 
 import os
 import socket
+from collections import Counter
 
 import hydra
 import ray
@@ -220,7 +221,10 @@ class TaskRunner:
 
         global_pool_id = "global_pool"
         resource_pool_spec = {
-            global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
+            global_pool_id: {
+                "process_on_nodes": [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
+                "max_colocate_count": 3,
+            },
         }
 
         if config.reward.reward_model.enable_resource_pool:
@@ -229,11 +233,53 @@ class TaskRunner:
             if config.reward.reward_model.nnodes <= 0:
                 raise ValueError("config.reward.reward_model.nnodes must be greater than 0")
 
-            reward_pool = [config.reward.reward_model.n_gpus_per_node] * config.reward.reward_model.nnodes
+            reward_pool = {
+                "process_on_nodes": [config.reward.reward_model.n_gpus_per_node] * config.reward.reward_model.nnodes,
+                "max_colocate_count": 1,
+            }
             resource_pool_spec["reward_pool"] = reward_pool
         else:
             config.reward.reward_model.nnodes = config.trainer.nnodes
             config.reward.reward_model.n_gpus_per_node = config.trainer.n_gpus_per_node
+
+        mopd_cfg = config.algorithm.get("mopd", {})
+        for pool_name, pool_cfg in mopd_cfg.get("resource_pools", {}).items():
+            if pool_name in resource_pool_spec:
+                raise ValueError(
+                    f"algorithm.mopd.resource_pools cannot redefine reserved pool '{pool_name}'. "
+                    f"Reserved pools: {sorted(resource_pool_spec)}"
+                )
+            resource_pool_spec[pool_name] = {
+                "process_on_nodes": [pool_cfg.n_gpus_per_node] * pool_cfg.nnodes,
+                "max_colocate_count": pool_cfg.get("max_colocate_count", 1) or 1,
+            }
+
+        required_colocate_counts = Counter(self.mapping.values())
+        if mopd_cfg.get("enabled", False):
+            for teacher_cfg in mopd_cfg.get("teachers", []):
+                required_colocate_counts[teacher_cfg.resource_pool] += 1
+
+            if mopd_cfg.get("use_base_normalization", False):
+                from verl.trainer.ppo.ray_trainer import Role
+
+                ref_pool_name = self.mapping.get(Role.RefPolicy)
+                if ref_pool_name is None:
+                    raise ValueError("MOPD base normalization requires Role.RefPolicy to be mapped to a resource pool")
+                required_colocate_counts[ref_pool_name] += 1
+
+        unknown_pools = sorted(
+            pool_name for pool_name in required_colocate_counts if pool_name not in resource_pool_spec
+        )
+        if unknown_pools:
+            raise ValueError(
+                "Unknown resource pools referenced by the current trainer/MOPD configuration: "
+                f"{unknown_pools}. Known pools: {sorted(resource_pool_spec)}"
+            )
+
+        for pool_name, required_count in required_colocate_counts.items():
+            resource_pool_spec[pool_name]["max_colocate_count"] = max(
+                resource_pool_spec[pool_name].get("max_colocate_count", 1), required_count
+            )
 
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 

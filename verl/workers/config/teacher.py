@@ -17,7 +17,7 @@ from typing import Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["TeacherConfig", "MOPDConfig"]
+__all__ = ["TeacherConfig", "TeacherResourcePoolConfig", "MOPDConfig"]
 
 
 @dataclass
@@ -27,26 +27,82 @@ class TeacherConfig(BaseConfig):
     Args:
         name: Unique teacher identifier (e.g., "math", "code")
         model_path: HuggingFace model path or local checkpoint
+        backend: Teacher backend selection (legacy ref worker or dedicated HF quantized worker)
         weight: Teacher weight for weighted composition (unused in current impl)
         resource_pool: Ray resource pool name (default: "global_pool")
         log_prob_micro_batch_size: Micro-batch size for teacher forward pass
+        lambda_val: Optional per-teacher ExOPD lambda override
+        tokenizer_path: Optional tokenizer path for compatibility checks
+        tokenizer_compat_group: Optional explicit compatibility group label
+        tokenizer_policy: Whether this teacher participates through token-level log prob or sequence reward
+        seq_reward_weight: Weight for sequence-level teacher reward mixing in the estimator
         base_model_path: Optional base model for ExOPD normalization
     """
 
     name: str = ""
     model_path: str = ""
+    backend: str = "legacy_ref"
     weight: float = 1.0
     resource_pool: str = "global_pool"
     log_prob_micro_batch_size: int = 8
+    lambda_val: Optional[float] = None
+    tokenizer_path: Optional[str] = None
+    tokenizer_compat_group: Optional[str] = None
+    tokenizer_policy: str = "compatible"
+    seq_reward_weight: float = 1.0
     base_model_path: Optional[str] = None
 
     def __post_init__(self):
+        valid_backends = {"legacy_ref", "hf_int8", "hf_4bit"}
+        valid_tokenizer_policies = {"compatible", "sequence_reward"}
+
         if not self.name:
             raise ValueError("TeacherConfig.name must be non-empty")
         if not self.model_path:
             raise ValueError("TeacherConfig.model_path must be non-empty")
+        if self.backend not in valid_backends:
+            raise ValueError(f"TeacherConfig.backend must be one of {sorted(valid_backends)}. Got: {self.backend}")
         if self.weight <= 0:
             raise ValueError(f"TeacherConfig.weight must be positive: {self.weight}")
+        if self.lambda_val is not None and self.lambda_val <= 0:
+            raise ValueError(f"TeacherConfig.lambda_val must be positive: {self.lambda_val}")
+        if self.tokenizer_compat_group is not None and not self.tokenizer_compat_group:
+            raise ValueError("TeacherConfig.tokenizer_compat_group must be non-empty when provided")
+        if self.tokenizer_policy not in valid_tokenizer_policies:
+            raise ValueError(
+                "TeacherConfig.tokenizer_policy must be one of "
+                f"{sorted(valid_tokenizer_policies)}. Got: {self.tokenizer_policy}"
+            )
+        if self.seq_reward_weight <= 0:
+            raise ValueError(f"TeacherConfig.seq_reward_weight must be positive: {self.seq_reward_weight}")
+
+
+@dataclass
+class TeacherResourcePoolConfig(BaseConfig):
+    """Configuration for an explicit MOPD teacher resource pool.
+
+    Args:
+        nnodes: Number of nodes assigned to this pool
+        n_gpus_per_node: Number of GPUs per node in this pool
+        max_colocate_count: Optional explicit colocate budget override
+    """
+
+    nnodes: int = 1
+    n_gpus_per_node: int = 1
+    max_colocate_count: Optional[int] = None
+
+    def __post_init__(self):
+        if self.nnodes <= 0:
+            raise ValueError(f"TeacherResourcePoolConfig.nnodes must be positive: {self.nnodes}")
+        if self.n_gpus_per_node <= 0:
+            raise ValueError(
+                f"TeacherResourcePoolConfig.n_gpus_per_node must be positive: {self.n_gpus_per_node}"
+            )
+        if self.max_colocate_count is not None and self.max_colocate_count <= 0:
+            raise ValueError(
+                "TeacherResourcePoolConfig.max_colocate_count must be positive when provided: "
+                f"{self.max_colocate_count}"
+            )
 
 
 @dataclass
@@ -76,6 +132,7 @@ class MOPDConfig(BaseConfig):
     is_epsilon_high: float = 10.0
     use_base_normalization: bool = False
     base_model_path: Optional[str] = None
+    resource_pools: dict[str, TeacherResourcePoolConfig] = field(default_factory=dict)
 
     def __post_init__(self):
         # Validate non-empty teachers when enabled

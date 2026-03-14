@@ -1009,6 +1009,36 @@ def compute_multi_turn_optimal_token_baseline_advantage(
     return advantages, token_returns
 
 
+def compute_mopd_sequence_teacher_advantage(
+    teacher_seq_reward: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    teacher_token_mask: Optional[torch.Tensor] = None,
+    epsilon: float = 1e-6,
+) -> torch.Tensor:
+    """Normalize sequence-level teacher rewards on active sequence-teacher samples only."""
+    scores = teacher_seq_reward.reshape(-1).to(device=response_mask.device, dtype=torch.float32)
+    seq_sample_mask = torch.ones_like(scores, dtype=torch.bool)
+
+    if teacher_token_mask is not None:
+        sample_mask = teacher_token_mask.to(device=response_mask.device, dtype=torch.float32)
+        if sample_mask.ndim > 1:
+            sample_mask = sample_mask.reshape(sample_mask.shape[0], -1).amax(dim=-1)
+        seq_sample_mask = sample_mask > 0
+
+    if not torch.any(seq_sample_mask):
+        return torch.zeros_like(response_mask, dtype=torch.float32)
+
+    group_index = as_torch_index(index, device=scores.device)
+    active_scores = scores[seq_sample_mask]
+    active_group_index = group_index[seq_sample_mask]
+    mean_g, std_g, _ = group_mean_std(active_scores, active_group_index, eps=epsilon, device=scores.device)
+
+    normalized_scores = torch.zeros_like(scores, dtype=torch.float32)
+    normalized_scores[seq_sample_mask] = (active_scores - mean_g[active_group_index]) / std_g[active_group_index]
+    return normalized_scores.unsqueeze(-1) * response_mask
+
+
 @register_adv_est("mopd")
 def compute_mopd_advantage(
     token_level_rewards: torch.Tensor,
@@ -1019,11 +1049,14 @@ def compute_mopd_advantage(
     base_log_prob: Optional[torch.Tensor] = None,
     lambda_val: float = 1.0,
     orm_weight: float = 0.0,
+    teacher_seq_reward: Optional[torch.Tensor] = None,
+    teacher_seq_weight: float | torch.Tensor = 0.0,
+    teacher_token_mask: Optional[torch.Tensor] = None,
     is_correction: bool = True,
     is_epsilon_low: float = 0.1,
     is_epsilon_high: float = 10.0,
     **kwargs,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
     """Multi-Teacher On-Policy Distillation (MOPD) advantage estimator.
 
     Implements MiMo paper (arXiv:2601.02780) Eq. 7-9 + G-OPD ExOPD mode.
@@ -1037,6 +1070,9 @@ def compute_mopd_advantage(
         base_log_prob: Base model log probs for ExOPD (optional) [batch, response_len]
         lambda_val: G-OPD scaling (1.0=standard MOPD, >1.0=extrapolation)
         orm_weight: Weight for outcome reward (α in A_final = A_mopd + α·A_orm)
+        teacher_seq_reward: Sequence-level teacher scores for heterogeneous-tokenizer teachers [batch]
+        teacher_seq_weight: Weight for sequence-level teacher advantage mixing
+        teacher_token_mask: Sequence-teacher token mask [batch, 1] or [batch, response_len]
         is_correction: Enable importance sampling correction
         is_epsilon_low: Lower bound for IS ratio
         is_epsilon_high: Upper bound for IS ratio
@@ -1044,7 +1080,23 @@ def compute_mopd_advantage(
     Returns:
         advantages: MOPD advantages [batch, response_len]
         returns: Token-level rewards (for interface consistency)
+        is_metrics: Dict of IS correction diagnostic metrics (empty if IS disabled)
     """
+    if teacher_token_mask is None:
+        seq_token_mask = torch.zeros_like(response_mask, dtype=torch.float32)
+    else:
+        seq_token_mask = teacher_token_mask.to(device=response_mask.device, dtype=torch.float32)
+        if seq_token_mask.ndim == 1:
+            seq_token_mask = seq_token_mask.unsqueeze(-1)
+        if seq_token_mask.shape[-1] == 1:
+            seq_token_mask = seq_token_mask.expand_as(response_mask)
+        elif seq_token_mask.shape != response_mask.shape:
+            raise ValueError(
+                "teacher_token_mask must be broadcastable to response_mask. "
+                f"Got {tuple(seq_token_mask.shape)} vs {tuple(response_mask.shape)}"
+            )
+    token_teacher_mask = 1.0 - seq_token_mask
+
     # Token-level teacher advantage (stop-gradient)
     if base_log_prob is None:
         # Standard MOPD: reverse KL
@@ -1052,8 +1104,10 @@ def compute_mopd_advantage(
     else:
         # ExOPD: base-normalized reverse KL with scaling
         A_mopd = -((old_log_probs - base_log_prob) - lambda_val * (teacher_log_prob - base_log_prob)).detach()
+    A_mopd = A_mopd * token_teacher_mask
 
     # IS correction (training/inference engine mismatch)
+    is_metrics = {}
     if is_correction and rollout_log_probs is not None:
         # Clamp log difference to prevent exp() overflow (exp(20) ≈ 5e8, exp(88) overflows fp32)
         log_ratio = (old_log_probs - rollout_log_probs).clamp(-20, 20)
@@ -1070,8 +1124,48 @@ def compute_mopd_advantage(
             )
             # Use 2D indexing to set all tokens for masked samples
             weights[all_masked, :] = 1.0
+
+        # IS diagnostic metrics (computed on response tokens only, converted to Python scalars).
+        # NOTE: .item() is intentional here — advantage computation runs on the driver process
+        # (under `with marked_timer("adv")`), not in the GPU training loop hot path.
+        response_tokens = response_mask > 0
+        n_response_tokens = response_tokens.sum().clamp(min=1)
+        is_metrics["mopd/is_ratio_mean"] = ((ratio * response_tokens).sum() / n_response_tokens).item()
+        is_metrics["mopd/is_valid_fraction"] = ((valid & response_tokens).sum().float() / n_response_tokens).item()
+        is_metrics["mopd/is_zeroed_fraction"] = (((~valid) & response_tokens).sum().float() / n_response_tokens).item()
     else:
         weights = torch.ones_like(old_log_probs)
+
+    A_seq_teacher = torch.zeros_like(response_mask, dtype=torch.float32)
+    if teacher_seq_reward is not None:
+        if "index" not in kwargs or kwargs["index"] is None:
+            raise ValueError(
+                "MOPD with teacher_seq_reward requires 'index' (uid) in batch. "
+                "Ensure 'uid' is in data.non_tensor_batch."
+            )
+        A_seq_teacher = compute_mopd_sequence_teacher_advantage(
+            teacher_seq_reward=teacher_seq_reward,
+            response_mask=response_mask,
+            index=kwargs["index"],
+            teacher_token_mask=teacher_token_mask,
+        )
+
+    seq_weight_tensor = torch.as_tensor(
+        teacher_seq_weight,
+        device=response_mask.device,
+        dtype=torch.float32,
+    )
+    if seq_weight_tensor.ndim == 0:
+        seq_weight_tensor = seq_weight_tensor.view(1, 1).expand_as(response_mask)
+    elif seq_weight_tensor.ndim == 1:
+        seq_weight_tensor = seq_weight_tensor.unsqueeze(-1).expand_as(response_mask)
+    elif seq_weight_tensor.shape[-1] == 1:
+        seq_weight_tensor = seq_weight_tensor.expand_as(response_mask)
+    elif seq_weight_tensor.shape != response_mask.shape:
+        raise ValueError(
+            "teacher_seq_weight must be broadcastable to response_mask. "
+            f"Got {tuple(seq_weight_tensor.shape)} vs {tuple(response_mask.shape)}"
+        )
 
     # Compose with ORM outcome advantage
     if orm_weight > 0:
@@ -1086,9 +1180,9 @@ def compute_mopd_advantage(
             response_mask=response_mask,
             index=kwargs["index"],
         )[0]  # returns (advantages, returns)
-        A_final = weights * (A_mopd + orm_weight * A_orm)
+        A_final = weights * (A_mopd + seq_weight_tensor * A_seq_teacher + orm_weight * A_orm)
     else:
-        A_final = weights * A_mopd
+        A_final = weights * (A_mopd + seq_weight_tensor * A_seq_teacher)
 
     # Mask out invalid tokens
     A_final = A_final * response_mask
@@ -1096,7 +1190,7 @@ def compute_mopd_advantage(
     # Returns = token_level_rewards for interface consistency
     returns = token_level_rewards * response_mask
 
-    return A_final, returns
+    return A_final, returns, is_metrics
 
 
 def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):

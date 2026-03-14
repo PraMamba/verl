@@ -1134,9 +1134,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         return output
 
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
-    @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
-    def compute_ref_log_prob(self, data: DataProto):
+    def _compute_ref_log_prob_impl(self, data: DataProto):
         if self._is_lora:
             # if _is_lora, actor without lora applied is the ref
             data.meta_info["is_lora"] = True
@@ -1167,6 +1165,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.ref_policy.actor_module.reshard()
 
         return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
+    def compute_ref_log_prob(self, data: DataProto):
+        return self._compute_ref_log_prob_impl(data)
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"), blocking=False)
+    @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
+    def compute_ref_log_prob_async(self, data: DataProto):
+        return self._compute_ref_log_prob_impl(data)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):

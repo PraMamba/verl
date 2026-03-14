@@ -300,6 +300,7 @@ def make_nd_compute_dataproto_dispatch_fn(mesh_name):
     return {
         "dispatch_fn": partial(dispatch_lazy_compute_data_proto, mesh_name),
         "collect_fn": partial(collect_lazy_compute_data_proto, mesh_name),
+        "mesh_name": mesh_name,
     }
 
 

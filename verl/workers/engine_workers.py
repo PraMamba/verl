@@ -586,12 +586,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # Free cached GPU memory so colocated vLLM processes can see it via cudaMemGetInfo
         aggressive_empty_cache(force_sync=True)
 
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="ref"))
-    @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     @_with_routing_replay_flag(enabled=False)
-    def compute_ref_log_prob(self, data: TensorDict) -> TensorDict:
+    def _compute_ref_log_prob_impl(self, data: TensorDict) -> TensorDict:
         output = self.ref.infer_batch(data=data)
         return output.cpu() if output is not None else None
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="ref"))
+    @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
+    def compute_ref_log_prob(self, data: TensorDict) -> TensorDict:
+        return self._compute_ref_log_prob_impl(data)
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="ref"), blocking=False)
+    @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
+    def compute_ref_log_prob_async(self, data: TensorDict) -> TensorDict:
+        return self._compute_ref_log_prob_impl(data)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
