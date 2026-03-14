@@ -185,6 +185,38 @@ class TestMOPDDataFlow:
         expected = torch.ones(B, T) * 1.375
         torch.testing.assert_close(result.batch["advantages"], expected, rtol=1e-4, atol=1e-4)
 
+    def test_exopd_batch_lambda_overrides_config_scalar(self):
+        """Batch lambda should override config lambda when ExOPD normalization is active."""
+        teacher_lp = torch.full((2, 4), 2.0)
+        old_lp = torch.full((2, 4), 1.0)
+        base_lp = torch.full((2, 4), 0.5)
+        batch_lambda = torch.tensor([[1.0], [2.0]], dtype=torch.float32)
+
+        config = OmegaConf.create(
+            {
+                "mopd": {
+                    "lambda_val": 7.0,
+                    "is_correction": False,
+                },
+            }
+        )
+        data = DataProto.from_single_dict(
+            {
+                "token_level_rewards": torch.zeros(2, 4),
+                "response_mask": torch.ones(2, 4),
+                "old_log_probs": old_lp,
+                "teacher_log_prob": teacher_lp,
+                "base_log_prob": base_lp,
+                "lambda_val": batch_lambda,
+            }
+        )
+        data.non_tensor_batch["uid"] = np.array(["q1", "q2"])
+
+        result = compute_advantage(data, adv_estimator="mopd", config=config)
+
+        expected = -((old_lp - base_lp) - batch_lambda * (teacher_lp - base_lp))
+        torch.testing.assert_close(result.batch["advantages"], expected)
+
     def test_is_correction_through_dispatch(self):
         """Test IS correction flows correctly through compute_advantage."""
         B, T = 2, 5
@@ -300,7 +332,7 @@ class TestMOPDAdvantageEstimatorRegistry:
         assert fn.__name__ == "compute_mopd_advantage"
 
     def test_mopd_returns_tuple(self):
-        """Test that MOPD advantage estimator returns (advantages, returns) tuple."""
+        """Test that MOPD advantage estimator returns (advantages, returns, is_metrics) tuple."""
         B, T = 2, 4
         fn = get_adv_estimator_fn("mopd")
         result = fn(
@@ -310,10 +342,11 @@ class TestMOPDAdvantageEstimatorRegistry:
             old_log_probs=torch.randn(B, T),
         )
         assert isinstance(result, tuple)
-        assert len(result) == 2
-        advantages, returns = result
+        assert len(result) == 3
+        advantages, returns, is_metrics = result
         assert advantages.shape == (B, T)
         assert returns.shape == (B, T)
+        assert isinstance(is_metrics, dict)
 
 
 # ---------------------------------------------------------------------------

@@ -23,6 +23,8 @@ import numpy as np
 import torch
 
 from verl import DataProto
+from verl.single_controller.base.decorator import make_nd_compute_dataproto_dispatch_fn, register
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 
 
 class MockTeacherWG:
@@ -55,6 +57,74 @@ class MockTeacherWG:
         return result
 
 
+class CapturingTeacherWG(MockTeacherWG):
+    """Mock teacher that records the batch it receives for routing assertions."""
+
+    def __init__(self, fill_value: float = 0.0):
+        super().__init__(fill_value=fill_value)
+        self.last_sub_batch = None
+
+    def compute_ref_log_prob(self, sub_batch: DataProto) -> DataProto:
+        self.last_sub_batch = sub_batch
+        return super().compute_ref_log_prob(sub_batch)
+
+
+class SentinelTeacherWG(MockTeacherWG):
+    """Mock teacher that echoes a per-sample marker tensor for order-preservation checks."""
+
+    def compute_ref_log_prob(self, sub_batch: DataProto) -> DataProto:
+        markers = sub_batch.batch["sample_marker"].float()
+        response_len = sub_batch.batch["responses"].shape[1]
+        return DataProto.from_single_dict(
+            {
+                "ref_log_prob": markers.expand(markers.shape[0], response_len).clone(),
+            }
+        )
+
+
+class _FakeTeacherFuture:
+    def __init__(self, event_log: list[str], teacher_name: str, output: DataProto):
+        self.event_log = event_log
+        self.teacher_name = teacher_name
+        self.output = output
+
+    def get(self) -> DataProto:
+        self.event_log.append(f"get:{self.teacher_name}")
+        return self.output
+
+
+class AsyncTeacherWG(MockTeacherWG):
+    """Mock teacher worker group exposing the planned non-blocking API."""
+
+    def __init__(self, teacher_name: str, event_log: list[str], fill_value: float = 0.0):
+        super().__init__(fill_value=fill_value)
+        self.teacher_name = teacher_name
+        self.event_log = event_log
+        self.sync_call_count = 0
+        self.async_call_count = 0
+
+    def compute_ref_log_prob(self, sub_batch: DataProto) -> DataProto:
+        self.sync_call_count += 1
+        return super().compute_ref_log_prob(sub_batch)
+
+    def compute_ref_log_prob_async(self, sub_batch: DataProto) -> _FakeTeacherFuture:
+        self.async_call_count += 1
+        self.event_log.append(f"submit:{self.teacher_name}")
+        return _FakeTeacherFuture(self.event_log, self.teacher_name, super().compute_ref_log_prob(sub_batch))
+
+
+class EngineMeshTeacherClass:
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="ref"), blocking=False)
+    def compute_ref_log_prob_async(self, data):
+        return data
+
+
+class EngineMeshTeacherWG(AsyncTeacherWG):
+    def __init__(self, teacher_name: str, event_log: list[str], fill_value: float = 0.0):
+        super().__init__(teacher_name=teacher_name, event_log=event_log, fill_value=fill_value)
+        self.ray_cls_with_init = type("RayClsWithInit", (), {"cls": EngineMeshTeacherClass})()
+
+
 def compute_teacher_log_probs_standalone(
     batch: DataProto,
     teacher_wgs: dict,
@@ -64,6 +134,12 @@ def compute_teacher_log_probs_standalone(
     This replicates the logic of RayPPOTrainer._compute_teacher_log_probs
     without requiring a trainer instance, for unit testing purposes.
     Kept in sync with the production implementation.
+
+    NOTE: This test function intentionally omits pad_dataproto_to_divisor /
+    unpad_dataproto (DP padding). The production code pads sub-batches to be
+    divisible by the teacher worker DP size before forwarding. That padding
+    logic is exercised by the integration tests; this function focuses on
+    routing correctness only.
     """
     teacher_ids = batch.non_tensor_batch["teacher_id"]
     batch_size = len(teacher_ids)
@@ -273,3 +349,159 @@ def test_teacher_log_prob_unknown_teacher_id_raises():
     # Act & Assert: should raise ValueError with unknown teacher_id
     with pytest.raises(ValueError, match="unknown teacher_ids"):
         compute_teacher_log_probs_standalone(batch, teacher_wgs)
+
+
+def test_teacher_log_prob_balances_teacher_sub_batches_before_forward():
+    """Teacher-routed sub-batches should be balanced across DP chunks before forward."""
+    batch = DataProto.from_single_dict(
+        {
+            "responses": torch.randint(0, 1000, (4, 8)),
+            "attention_mask": torch.tensor(
+                [
+                    [1, 1, 1, 1, 1, 1, 1, 1],
+                    [1, 1, 1, 1, 1, 1, 1, 1],
+                    [1, 0, 0, 0, 0, 0, 0, 0],
+                    [1, 0, 0, 0, 0, 0, 0, 0],
+                ],
+                dtype=torch.long,
+            ),
+        }
+    )
+    batch.non_tensor_batch["teacher_id"] = np.array(["math", "math", "math", "math"])
+
+    math_wg = CapturingTeacherWG(fill_value=1.0)
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.teacher_wgs = {"math": math_wg}
+    trainer.use_prefix_grouper = False
+    trainer._get_dp_size = lambda worker_group, role: 2
+
+    teacher_log_prob = RayPPOTrainer._compute_teacher_log_probs(trainer, batch)
+
+    assert teacher_log_prob.shape == (4, 8)
+    assert math_wg.last_sub_batch is not None
+
+    dp_chunks = math_wg.last_sub_batch.chunk(2)
+    token_totals = [chunk.batch["attention_mask"].sum().item() for chunk in dp_chunks]
+
+    assert max(token_totals) - min(token_totals) <= 1
+
+
+def test_teacher_log_prob_preserves_sample_alignment_after_balancing():
+    """Balanced teacher routing must scatter results back to the original sample order."""
+    batch = DataProto.from_single_dict(
+        {
+            "responses": torch.randint(0, 1000, (4, 4)),
+            "sample_marker": torch.tensor([[10.0], [20.0], [30.0], [40.0]], dtype=torch.float32),
+            "attention_mask": torch.tensor(
+                [
+                    [1, 1, 1, 1],
+                    [1, 1, 1, 1],
+                    [1, 0, 0, 0],
+                    [1, 0, 0, 0],
+                ],
+                dtype=torch.long,
+            ),
+        }
+    )
+    batch.non_tensor_batch["teacher_id"] = np.array(["math", "math", "math", "math"])
+
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.teacher_wgs = {"math": SentinelTeacherWG()}
+    trainer.use_prefix_grouper = False
+    trainer._get_dp_size = lambda worker_group, role: 2
+
+    teacher_log_prob = RayPPOTrainer._compute_teacher_log_probs(trainer, batch)
+
+    expected = torch.tensor(
+        [
+            [10.0, 10.0, 10.0, 10.0],
+            [20.0, 20.0, 20.0, 20.0],
+            [30.0, 30.0, 30.0, 30.0],
+            [40.0, 40.0, 40.0, 40.0],
+        ],
+        dtype=torch.float32,
+    )
+    torch.testing.assert_close(teacher_log_prob, expected)
+
+
+def test_teacher_log_prob_async_overlaps_different_pools_but_serializes_same_pool():
+    """Teacher forwards should overlap across pools while preserving same-pool sequencing."""
+    batch = DataProto.from_single_dict(
+        {
+            "responses": torch.randint(0, 1000, (3, 4)),
+            "attention_mask": torch.ones(3, 4, dtype=torch.long),
+        }
+    )
+    batch.non_tensor_batch["teacher_id"] = np.array(["math", "reasoning", "code"])
+
+    event_log: list[str] = []
+    math_wg = AsyncTeacherWG("math", event_log, fill_value=1.0)
+    reasoning_wg = AsyncTeacherWG("reasoning", event_log, fill_value=2.0)
+    code_wg = AsyncTeacherWG("code", event_log, fill_value=3.0)
+
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.teacher_wgs = {"math": math_wg, "reasoning": reasoning_wg, "code": code_wg}
+    trainer.use_prefix_grouper = False
+    trainer._get_dp_size = lambda worker_group, role: 1
+    trainer.config = type(
+        "Cfg",
+        (),
+        {
+            "algorithm": type(
+                "AlgoCfg",
+                (),
+                {
+                    "mopd": type(
+                        "MOPDCfg",
+                        (),
+                        {
+                            "teachers": [
+                                type("Teacher", (), {"name": "math", "resource_pool": "global_pool"})(),
+                                type("Teacher", (), {"name": "reasoning", "resource_pool": "global_pool"})(),
+                                type("Teacher", (), {"name": "code", "resource_pool": "code_pool"})(),
+                            ]
+                        },
+                    )()
+                },
+            )()
+        },
+    )()
+
+    teacher_log_prob = RayPPOTrainer._compute_teacher_log_probs(trainer, batch)
+
+    expected = torch.tensor(
+        [
+            [1.0, 1.0, 1.0, 1.0],
+            [2.0, 2.0, 2.0, 2.0],
+            [3.0, 3.0, 3.0, 3.0],
+        ],
+        dtype=torch.float32,
+    )
+    torch.testing.assert_close(teacher_log_prob, expected)
+    assert event_log[:2] == ["submit:math", "submit:code"]
+    assert event_log.index("submit:reasoning") > event_log.index("get:math")
+    assert math_wg.sync_call_count == 0
+    assert reasoning_wg.sync_call_count == 0
+    assert code_wg.sync_call_count == 0
+
+
+def test_teacher_log_prob_uses_teacher_dispatch_mesh_for_dp_size():
+    """Teacher DP sizing should follow the worker method's dispatch mesh metadata."""
+    batch = DataProto.from_single_dict(
+        {
+            "responses": torch.randint(0, 1000, (1, 4)),
+            "attention_mask": torch.ones(1, 4, dtype=torch.long),
+        }
+    )
+    batch.non_tensor_batch["teacher_id"] = np.array(["engine"])
+
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.teacher_wgs = {"engine": EngineMeshTeacherWG("engine", [], fill_value=1.0)}
+    trainer.use_prefix_grouper = False
+    requested_meshes = []
+    trainer._get_dp_size = lambda worker_group, role: requested_meshes.append(role) or 1
+
+    teacher_log_prob = RayPPOTrainer._compute_teacher_log_probs(trainer, batch)
+
+    torch.testing.assert_close(teacher_log_prob, torch.ones(1, 4, dtype=torch.float32))
+    assert requested_meshes == ["ref"]
