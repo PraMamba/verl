@@ -40,7 +40,7 @@ resource_pools: {}
 # - name: math
 #   model_path: /models/math-teacher
 #   backend: legacy_ref
-#   weight: 1.0
+#   weight: 1.0  # deprecated placeholder; non-default values are rejected
 #   resource_pool: global_pool
 #   log_prob_micro_batch_size: 8
 #   lambda_val: 1.25
@@ -48,4 +48,5 @@ resource_pools: {}
 #   tokenizer_compat_group: qwen-shared
 #   tokenizer_policy: compatible
 #   seq_reward_weight: 1.0
+#   base_model_path: null  # unsupported; use algorithm.mopd.base_model_path instead
 teachers: []

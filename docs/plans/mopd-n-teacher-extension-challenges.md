@@ -55,7 +55,7 @@
 | 9. 数据管道缺少验证 | 已解决 | 已有 `teacher_id` 提取、preflight 分布检查、unknown/missing teacher fail-fast |
 | 10. 优势函数覆盖式计算与浪费 | 已解决 | MOPD 已是独立 estimator，不再在 actor 中覆盖优势 |
 | 11. 检查点与恢复缺失 | 部分缓解 | 已有 `mopd_manifest.json` 与 drift detection，但 teacher/base artifacts 仍不自包含 |
-| 12. 测试基础设施空白 | 已解决 | 当前已有 config/routing/runtime/manifest/advantage/E2E 多层测试 |
+| 12. 测试基础设施空白 | 已解决 | 当前已有 config/routing/runtime/manifest/advantage/E2E 多层测试，并已 fresh 跑通单机 4 卡 preflight / GPU E2E / full recipe run / 保守 `18/18` long-run rerun |
 
 ### 当前仍然最值得关注的真实挑战
 
@@ -63,9 +63,11 @@
 2. teacher 调度是“per-pool pipeline with limited overlap”，不是全局 fully parallel。
 3. 异构 tokenizer 当前只有 sequence-level bridge，没有跨 tokenizer 的 token-level exact reverse KL。
 4. checkpoint 仍依赖外部 teacher/base 模型路径，manifest 只能做 drift detection，不能提供 artifact 级自包含恢复。
-5. 生命周期清理已有明显推进，但仍未完全闭环：`fit()` 现在统一走 `_finalize_fit_resources()`，不过
-   `base_policy_wg` 仍无对称 cleanup，异常路径也还没有统一 `finally` 保障。
-6. 部分 schema 字段还没有成为真实 runtime 行为，例如 `TeacherConfig.weight`、per-teacher `base_model_path`。
+5. 生命周期清理主路径已经闭环：`fit()` 现在统一走 `_finalize_fit_resources()`，`cleanup_teacher_workers()`
+   也会释放 `base_policy_wg`，最新 preflight / GPU E2E / full run / `18/18` long-run rerun 都以成功退出收尾；
+   但 vLLM 关停阶段仍可见 `resource_tracker` 噪声，尚未彻底消除。
+6. 部分 schema 字段仍不是 runtime 能力，例如 `TeacherConfig.weight`、per-teacher `base_model_path`；
+   不过它们现在会 fail-fast，而不是静默漂移。
 
 ---
 
@@ -90,10 +92,16 @@
 - `verl/trainer/config/algorithm/mopd.yaml`
 - `verl/workers/config/teacher.py`
 
-但也要注意两个“schema 已有、runtime 未完全接线”的细节：
+但也要注意两个“schema 已有、能力边界必须写清”的细节：
 
-- `TeacherConfig.weight` 当前仍标注为 `unused in current impl`
-- `TeacherConfig.base_model_path` 当前未参与 worker 创建，ExOPD 实际只消费全局 `algorithm.mopd.base_model_path`
+- `TeacherConfig.weight` 不是当前 runtime 能力；非默认值现在会直接报错，而不是静默忽略
+- `TeacherConfig.base_model_path` 不是当前 runtime 能力；ExOPD 仍只消费全局 `algorithm.mopd.base_model_path`
+
+这里还有一个需要修正的旧判断：
+
+- `AlgoConfig.__post_init__` 现在会把 `mopd` 材料化成 `MOPDConfig`
+- `validate_config()` 也会先实例化 `AlgoConfig`，因此 runtime typed validation 已经接通
+- 当前真正残留的是 `AlgoConfig.mopd` 注解仍为 `Any`，所以 Hydra composition-time strictness 还弱于 actor/critic
 
 ### 2. teacher 不再是 actor/ref worker 内部插槽，而是 trainer 侧显式 worker graph
 
@@ -286,9 +294,9 @@ A_final
 2. teacher 创建发生在 colocated role 初始化之后，独立于 `Role` 扩展
 3. `resource_pool` 不是自动独占 GPU；只有专用 pool + 合适 colocate budget 才会形成真实隔离
 4. 当前 manifest/drift validation 已存在，不应再写成“恢复时完全没有 teacher 语义”
-5. 生命周期清理仍有缺口：
-   `fit()` 已新增 `_finalize_fit_resources()` 覆盖正常收尾与 `val_only` 返回，但 `cleanup_teacher_workers()`
-   仍只清 `teacher_wgs`，`base_policy_wg` 仍无对称 cleanup，异常路径也还缺统一 `finally`
+5. 生命周期清理主路径已经补齐：
+   `fit()` 现在有统一 `try/finally`，`cleanup_teacher_workers()` 也会释放 `base_policy_wg`；最新真实运行闭环里看到的
+   是完成后的 `resource_tracker` 噪声，而不是主链路清理失效
 
 ### 维度 4：推理引擎 / rollout backend
 
@@ -387,28 +395,41 @@ A_final
 
 **当前 checkpoint 更像“有自描述元数据的训练状态”，而不是“包含全部 teacher/base 依赖的完整快照”。**
 
-### 6. 生命周期与故障清理仍有缺口
+### 6. 生命周期主路径已闭环，但关停噪声仍需治理
 
-当前最容易被文档忽略，但实际存在的风险点是：
+当前最容易被误判的点是：
 
 - `fit()` 现在已经统一走 `_finalize_fit_resources()`，会关闭 progress bar、shutdown dataloader workers、
   async rollout manager、teacher workers，并调用 tracking finish
-- 但 `cleanup_teacher_workers()` 仍只清理 `teacher_wgs`
-- `base_policy_wg` 没有对称 cleanup 逻辑
-- 仍没有看到围绕整段训练循环的统一 `finally` 清理保证
+- `cleanup_teacher_workers()` 已经同时释放 `teacher_wgs` 与 `base_policy_wg`
+- `fit()` 末尾也已有统一 `try/finally` 兜底
 
-因此这不是“架构不存在 cleanup”，而是：
+2026-03-15 的 preflight、GPU E2E、full recipe run 和更保守的 `18/18` long-run rerun 都已成功退出，
+这说明 cleanup 主路径已经不是阻塞问题。
 
-**cleanup 语义已有工程收口进展，但仍偏向引用释放而不是严格的 actor / worker 生命周期管理。**
+这次长程闭环还补上了之前缺的三条运行侧证据：
 
-### 7. typed config 与 runtime 仍有一小段脱节
+- teacher 路由均值 `cell=0.4965`、`disease=0.5035`，与 `100 / 100` 数据分布对齐
+- IS mask 保持健康，`mopd/is_valid_fraction` 均值 `0.9999998278`，`mopd/is_zeroed_fraction` 均值 `1.714958e-7`
+- 在 `response_length/clip_ratio` 最高到 `1.0` 的高压力下仍完成 `18/18`；至少对这次保守 rollout 配置而言，
+  之前看到的 generation OOM / vLLM wake-up OOM 边界没有再次出现
 
-当前已经有 `TeacherConfig` / `TeacherResourcePoolConfig` / `MOPDConfig`，但：
+当前残留问题更准确地说是：
 
-- `AlgoConfig` 还没有显式 typed `mopd` 字段
-- `validate_config()` 也没有像 actor/critic 那样统一实例化并验证 `MOPDConfig`
+**vLLM / multiprocessing 关停阶段仍会出现 `resource_tracker` `KeyError` 噪声，但它们发生在成功完成之后。**
 
-这说明配置设计已经成型，但 typed config 全链路还没彻底收口。
+### 7. typed config 的 runtime 闭环已补齐，但 composition-time strictness 仍偏弱
+
+当前已经有 `TeacherConfig` / `TeacherResourcePoolConfig` / `MOPDConfig`，而且：
+
+- `AlgoConfig.__post_init__` 会把 `mopd` 材料化成 `MOPDConfig`
+- `validate_config()` 也会统一先实例化 `AlgoConfig`
+
+因此 runtime typed validation 已经接通。
+
+当前真正还没做到 actor/critic 同等强度的地方是：
+
+**`AlgoConfig.mopd` 的注解仍为 `Any`，所以 Hydra composition-time strictness 仍然较弱。**
 
 ---
 
@@ -457,7 +478,7 @@ A_final
   - per-pool teacher 调度扩展性
   - 异构 tokenizer 的 token-level bridge
   - checkpoint self-containment
-  - 生命周期清理
-  - typed config 收尾
+  - 关停噪声治理
+  - composition-time typed strictness
 
 这才是对当前 worktree 最贴近事实、也最适合指导后续工作的 MOPD N-teacher 挑战清单。

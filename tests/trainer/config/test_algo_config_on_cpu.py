@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -24,7 +25,8 @@ from verl.trainer.ppo.core_algos import (
     compute_grpo_outcome_advantage,
     get_adv_estimator_fn,
 )
-from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.config import omega_conf_to_dataclass, validate_config
+from verl.workers.config.teacher import MOPDConfig, TeacherConfig
 
 
 class TestAlgoConfig(unittest.TestCase):
@@ -123,6 +125,153 @@ class TestAlgoConfig(unittest.TestCase):
         self.assertIsNotNone(minimal_config.kl_ctrl)
         self.assertIsInstance(minimal_config.kl_ctrl, KLControlConfig)
         assert not minimal_config.pf_ppo
+
+    def test_mopd_nested_config_is_typed(self):
+        config = omega_conf_to_dataclass(
+            {
+                "adv_estimator": "mopd",
+                "mopd": {
+                    "enabled": True,
+                    "teachers": [
+                        {"name": "math", "model_path": "/models/math"},
+                    ],
+                },
+            },
+            AlgoConfig,
+        )
+
+        self.assertIsInstance(config.mopd, MOPDConfig)
+        self.assertEqual(config.mopd.enabled, True)
+        self.assertEqual(len(config.mopd.teachers), 1)
+        self.assertIsInstance(config.mopd.teachers[0], TeacherConfig)
+
+    def test_validate_config_runs_typed_mopd_validation(self):
+        class _FakeActorConfig:
+            def validate(self, *_args, **_kwargs):
+                return None
+
+        config = OmegaConf.create(
+            {
+                "trainer": {
+                    "n_gpus_per_node": 1,
+                    "nnodes": 1,
+                },
+                "data": {
+                    "train_batch_size": 1,
+                },
+                "actor_rollout_ref": {
+                    "actor": {
+                        "use_dynamic_bsz": True,
+                        "strategy": "fsdp",
+                        "use_kl_loss": False,
+                    },
+                    "ref": {
+                        "log_prob_micro_batch_size": 1,
+                        "log_prob_micro_batch_size_per_gpu": None,
+                    },
+                    "rollout": {
+                        "n": 1,
+                        "log_prob_micro_batch_size": 1,
+                        "log_prob_micro_batch_size_per_gpu": None,
+                        "val_kwargs": {"do_sample": False},
+                        "temperature": 1.0,
+                        "name": "hf",
+                    },
+                    "model": {
+                        "lora": {},
+                    },
+                },
+                "algorithm": {
+                    "_target_": "verl.trainer.config.AlgoConfig",
+                    "use_kl_in_reward": False,
+                    "mopd": {
+                        "enabled": True,
+                        "teachers": [
+                            {
+                                "name": "math",
+                                "model_path": "/models/math",
+                                "weight": 1.5,
+                            }
+                        ],
+                    },
+                },
+            }
+        )
+
+        original = omega_conf_to_dataclass
+
+        def _patched_omega_conf_to_dataclass(cfg, dataclass_type=None):
+            if cfg is config.actor_rollout_ref.actor:
+                return _FakeActorConfig()
+            return original(cfg, dataclass_type)
+
+        with patch("verl.utils.config.omega_conf_to_dataclass", _patched_omega_conf_to_dataclass):
+            with self.assertRaisesRegex(ValueError, "weight is not supported"):
+                validate_config(config=config, use_reference_policy=False, use_critic=False)
+
+    def test_validate_config_rejects_per_teacher_base_model_path(self):
+        class _FakeActorConfig:
+            def validate(self, *_args, **_kwargs):
+                return None
+
+        config = OmegaConf.create(
+            {
+                "trainer": {
+                    "n_gpus_per_node": 1,
+                    "nnodes": 1,
+                },
+                "data": {
+                    "train_batch_size": 1,
+                },
+                "actor_rollout_ref": {
+                    "actor": {
+                        "use_dynamic_bsz": True,
+                        "strategy": "fsdp",
+                        "use_kl_loss": False,
+                    },
+                    "ref": {
+                        "log_prob_micro_batch_size": 1,
+                        "log_prob_micro_batch_size_per_gpu": None,
+                    },
+                    "rollout": {
+                        "n": 1,
+                        "log_prob_micro_batch_size": 1,
+                        "log_prob_micro_batch_size_per_gpu": None,
+                        "val_kwargs": {"do_sample": False},
+                        "temperature": 1.0,
+                        "name": "hf",
+                    },
+                    "model": {
+                        "lora": {},
+                    },
+                },
+                "algorithm": {
+                    "_target_": "verl.trainer.config.AlgoConfig",
+                    "use_kl_in_reward": False,
+                    "mopd": {
+                        "enabled": True,
+                        "teachers": [
+                            {
+                                "name": "math",
+                                "model_path": "/models/math",
+                                "base_model_path": "/models/base",
+                            }
+                        ],
+                    },
+                },
+            }
+        )
+
+        original = omega_conf_to_dataclass
+
+        def _patched_omega_conf_to_dataclass(cfg, dataclass_type=None):
+            if cfg is config.actor_rollout_ref.actor:
+                return _FakeActorConfig()
+            return original(cfg, dataclass_type)
+
+        with patch("verl.utils.config.omega_conf_to_dataclass", _patched_omega_conf_to_dataclass):
+            with self.assertRaisesRegex(ValueError, "shared algorithm.mopd.base_model_path"):
+                validate_config(config=config, use_reference_policy=False, use_critic=False)
 
     def test_config_init_from_yaml(self):
         import os

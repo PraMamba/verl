@@ -3,9 +3,9 @@
 **Date**: 2026-03-15
 **Scope**: current worktree source, including uncommitted follow-up changes, not historical milestone snapshots
 **Branch**: `feature/mopd-implementation`
-**HEAD**: `a27ea313`
+**HEAD**: `4eb8e245`
 **Merge-base with `main`**: `80eb57ea`
-**Commits on top of `main`**: 20
+**Commits on top of `main`**: 21
 
 ---
 
@@ -59,13 +59,15 @@
 - teacher manifest + drift detection
 - preflight dataset/tokenizer validation
 - per-teacher runtime metrics
+- fresh single-node runtime evidence across preflight / GPU E2E / default `6/6` recipe run /
+  conservative `18/18` long-run rerun
 
 但当前代码也明确 **还不等于**：
 
 - 按 `TeacherConfig.weight` 做运行时多教师加权聚合
 - per-teacher base model
-- 全链路 typed `AlgoConfig.mopd` 接线
-- 长程收敛、多节点容错、恢复一致性的充分验证
+- Hydra composition-time typed `AlgoConfig.mopd` 强约束
+- 可重复的长程质量收益、多节点容错、恢复一致性的充分验证
 
 ---
 
@@ -73,11 +75,11 @@
 
 以下统计以父仓的 `git diff main...HEAD` 为准：
 
-- **37** 个 tracked files changed
-- **+10,985 / -28** lines
+- **47** 个 tracked files changed
+- **+9,579 / -53** lines
 - 文件分布：
-  - `verl/`: **20** 个 runtime/config 相关文件
-  - `tests/`: **12** 个测试文件
+  - `verl/`: **28** 个 runtime/config 相关文件
+  - `tests/`: **14** 个测试文件
   - `docs/`: **5** 个文档文件
 
 需要单独说明：
@@ -334,7 +336,7 @@ trainer 已经会按 teacher 输出指标，例如：
 - `mopd/<teacher>/seq_reward_mean`
 - `mopd/<teacher>/is_valid_fraction`
 
-#### 9.4 fit teardown 已有明确收口，但还没完全闭环
+#### 9.4 fit teardown 已有明确收口，并已在真实运行闭环中跑通
 
 当前 worktree 中，`RayPPOTrainer.fit()` 已不再只在训练循环末尾零散地做局部清理，而是新增了统一的
 `_finalize_fit_resources()`：
@@ -347,11 +349,24 @@ trainer 已经会按 teacher 输出指标，例如：
 
 这说明“工程收尾”已经从文档口号进入了真实 trainer 控制流。
 
-但当前仍然不能把 lifecycle cleanup 写成“已彻底收口”，因为：
+同时，当前代码已经补上了此前最明显的两处闭环缺口：
 
-- `cleanup_teacher_workers()` 仍只清理 `teacher_wgs`
-- `base_policy_wg` 没有对称 cleanup 逻辑
-- `fit()` 仍没有整段 `try/finally` 包裹，异常路径的收尾保障仍偏弱
+- `cleanup_teacher_workers()` 现在会同时释放 `teacher_wgs` 与 `base_policy_wg`
+- `fit()` 末尾已经有统一的 `try/finally` 兜底，异常路径也会进入 `_finalize_fit_resources()`
+
+2026-03-15 的真实运行闭环也给出了运行侧证据：
+
+- recipe preflight 成功到达首个真实 `training/global_step:1`
+- opt-in GPU E2E 外层 pytest 成功通过
+- full recipe shell run 退出码为 `0`，完成 `Training Progress: 100%|...| 6/6`
+- conservative long-run rerun 退出码也为 `0`，完成 `Training Progress: 100%|...| 18/18`，
+  打印 `validation generation end` 与 `Final validation metrics`
+
+当前仍需要如实记录的残余问题不是“cleanup 没接线”，而是：
+
+- GPU E2E、默认 full run 和 `18/18` long-run log 末尾仍可见
+  `multiprocessing.resource_tracker` `KeyError`
+- 这些噪声都出现在成功完成和 checkpoint 写出之后，更像 vLLM / multiprocessing 的关停噪声，而不是 MOPD 主链路失败
 
 ---
 
@@ -404,11 +419,20 @@ trainer 已经会按 teacher 输出指标，例如：
 
 ## Validation Surface
 
-当前测试面已经明显大于旧版文档描述的早期快照。本次刷新重新执行了 MOPD 相关 CPU-safe suite、collect-only 命令，以及一个独立的 teardown/cleanup 回归文件，结果为：
+当前测试面已经明显大于旧版文档描述的早期快照。本次刷新重新执行了 MOPD 相关 CPU-safe suite、
+collect-only 命令、一个独立的 teardown/cleanup 回归文件，以及一轮真实运行闭环，结果为：
 
-- `pytest -q ...` -> **111 passed, 1 skipped, 1 warning in 11.99s**
-- `pytest --collect-only -q ...` -> **112 tests collected in 7.97s**
-- `pytest -q tests/unit/test_teardown_cleanup.py` -> **5 passed, 3 warnings in 11.99s**
+- `pytest -q ...` -> **115 passed, 1 skipped, 1 warning in 11.31s**
+- `pytest --collect-only -q ...` -> **116 tests collected in 8.57s**
+- `pytest -q tests/unit/test_teardown_cleanup.py` -> **5 passed, 3 warnings in 11.55s**
+- `bash recipe/mopd/run_mopd_qwen3_4b_preflight.sh` -> **exit 0**, success boundary at `training/global_step:1`
+- `VERL_MOPD_E2E=1 pytest tests/integration/test_mopd_e2e.py::test_mopd_training_e2e -v` -> **1 passed, 1 warning in 345.91s**
+- `bash recipe/mopd/run_mopd_qwen3_4b.sh` -> **exit 0**, `Training Progress: 100%|...| 6/6`, `training/global_step:6`
+- conservative long-run rerun -> **exit 0**, `Training Progress: 100%|...| 18/18`,
+  `training/global_step:18`, `validation generation end`, `Final validation metrics`
+- 这次长程 run 还直接回答了三件事：teacher 路由均值 `cell=0.4965` / `disease=0.5035`，IS mask 均值
+  `is_valid_fraction=0.9999998278` / `is_zeroed_fraction=1.714958e-7`，最终 `adv_mean` /
+  `reverse_kl_mean` 仍在可解释区间而非发散
 
 当前测试覆盖已经包含：
 
@@ -425,14 +449,44 @@ trainer 已经会按 teacher 输出指标，例如：
 - production run-script self-checks
 - trainer finalization / teardown helper behavior
 - opt-in GPU E2E contract
+- recipe-aligned preflight shell path
+- full recipe shell path through final checkpoint write
+- conservative long-run closure through final validation at `18/18`
 
 本次刷新确认的 suite inventory 为：
 
-- **112 tests collected**
-- **111 passed**
+- **116 tests collected**
+- **115 passed**
 - **1 skipped**（GPU E2E opt-in path）
 
 这已经远超过旧版文档中“只完成少量 smoke/regression”的表述。
+并且“只验证 CPU-safe surface、没有 fresh preflight / GPU E2E / full run”这类说法也已经过时。
+
+此外，本次还补了一轮真实权重量化 teacher profiling。方法边界是：
+
+- 直接实例化 `HFQuantizedTeacherWorker`
+- 用 recipe 默认的两条真实 teacher checkpoint 路径做 `hf_int8` / `hf_4bit` 加载
+- 记录 `init_model()` 与首个 `_compute_ref_log_prob_impl()` 的启动时间、首步延迟和 `torch.cuda.max_memory_reserved()`
+- `N teacher` 取单机 4 卡；4-teacher 案例复用两条真实 checkpoint 扩成 4 个 teacher worker
+
+最小 profiling 表如下：
+
+| Teacher Count | Backend | `log_prob_micro_batch_size` | Peak Reserved GiB | First-Step Latency (s) | Startup Time (s) |
+|---:|---|---:|---:|---:|---:|
+| 1 | `hf_int8` | 2 | `5.05` (`5.05` total) | `1.70` | `17.95` |
+| 1 | `hf_int8` | 4 | `5.05` (`5.05` total) | `1.20` | `17.45` |
+| 2 | `hf_int8` | 2 | `5.05` (`10.05` total) | `2.44` | `28.20` |
+| 4 | `hf_int8` | 2 | `5.05` (`20.10` total) | `3.28` | `49.38` |
+| 1 | `hf_4bit` | 2 | `3.81` (`3.81` total) | `1.15` | `15.37` |
+| 1 | `hf_4bit` | 4 | `3.81` (`3.81` total) | `0.77` | `15.23` |
+| 2 | `hf_4bit` | 2 | `3.81` (`7.63` total) | `1.54` | `27.78` |
+| 4 | `hf_4bit` | 2 | `3.81` (`15.25` total) | `2.22` | `52.60` |
+
+这轮 profiling 说明了三件事：
+
+- `hf_int8` / `hf_4bit` 都不只是 mock contract，而是已经在真实 recipe teacher 权重上成功加载并完成首个 log-prob 前向
+- `hf_4bit` 相比 `hf_int8`，当前这组 teacher 权重的单卡峰值显存从约 `5.05 GiB` 降到了约 `3.81 GiB`
+- teacher 数和启动时间在当前 harness 里基本近似线性增长，这和当前 trainer 顺序初始化 teacher worker 的实现一致
 
 ---
 
@@ -459,10 +513,17 @@ trainer 已经会按 teacher 输出指标，例如：
    - 不成立。当前真实架构已是 `teachers[] + teacher_wgs + teacher_id routing`。
 
 7. **“TeacherConfig.weight 已参与 runtime 聚合”**
-   - 不成立。该字段目前仍是保留字段，当前实现没有按它做 teacher signal 的加权融合。
+   - 不成立。该字段当前仍不是 runtime 能力；非默认值会 fail-fast，当前实现也没有按它做 teacher signal 的加权融合。
 
 8. **“每个 teacher 都有自己的 base model path”**
-   - 不成立。当前 ExOPD 运行时使用的是 shared `algorithm.mopd.base_model_path`。
+   - 不成立。当前 ExOPD 运行时使用的是 shared `algorithm.mopd.base_model_path`；per-teacher `base_model_path` 会直接 fail-fast。
+
+9. **“真实 shell 链路这次没有重新执行”**
+   - 不成立。2026-03-15 已 fresh rerun recipe preflight、opt-in GPU E2E 和 `run_mopd_qwen3_4b.sh`。
+
+10. **“完整闭环面 `18/18` 还没有被一条已完成 run 证明”**
+   - 不成立。2026-03-15 的第三条更保守 rerun 已显示 `Training Progress: 100%|...| 18/18`，
+     并打印 `validation generation end` 与 `Final validation metrics`。
 
 ---
 
@@ -470,12 +531,15 @@ trainer 已经会按 teacher 输出指标，例如：
 
 为了让这份文档只反映真实状态，还需要把以下限制写清楚，而不是模糊成“已完成”：
 
-1. `TeacherConfig.weight` 当前未进入训练主链路。
-2. `TeacherConfig.base_model_path` 虽在 schema 中存在，但当前 runtime 实际消费的是全局 shared base。
+1. `TeacherConfig.weight` 当前仍不是 runtime 能力；非默认值会 fail-fast。
+2. `TeacherConfig.base_model_path` 虽在 schema 中存在，但当前 runtime 只支持全局 shared base，per-teacher 值会 fail-fast。
 3. `sequence_reward` 当前不是通用任意 backend 能力，而是绑定到 dedicated quantized teacher worker 路径。
-4. `MOPDConfig` dataclass 已存在，但 `AlgoConfig` / `validate_config()` 还没有把整个 `algorithm.mopd` 全链路 typed 化。
-5. trainer finalization 已明显改善，但 `base_policy_wg` cleanup 与异常路径 `finally` 保障仍未完全收口。
-6. 当前验证重点是 unit/integration/preflight/E2E contract；长程收敛、多节点、故障恢复和质量收益仍需单独验证。
+4. `MOPDConfig` 的 runtime typed 校验已经接入 `AlgoConfig.__post_init__` 和 `validate_config()`，但 `AlgoConfig.mopd` 的注解仍是 `Any`，因此 Hydra composition-time strictness 仍弱于 actor/critic。
+5. 当前单机 4 卡默认 recipe 路径和更保守的 `18/18` 长程 rerun 都已经 fresh 跑通，但关停阶段仍可见
+   `resource_tracker` 噪声；它们目前更像后处理噪声而不是主链路 blocker。
+6. 当前验证重点已经扩展到 unit/integration/preflight/GPU E2E/full recipe run/`18/18` long-run closure/
+   真实权重量化 teacher profiling；多节点、故障恢复、可重复的长程质量收益，以及 real-weight
+   `sequence_reward` 路径仍需单独验证。
 
 ---
 

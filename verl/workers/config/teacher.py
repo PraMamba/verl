@@ -28,7 +28,9 @@ class TeacherConfig(BaseConfig):
         name: Unique teacher identifier (e.g., "math", "code")
         model_path: HuggingFace model path or local checkpoint
         backend: Teacher backend selection (legacy ref worker or dedicated HF quantized worker)
-        weight: Teacher weight for weighted composition (unused in current impl)
+        weight: Deprecated placeholder. Only the default value 1.0 is accepted because
+            the current runtime routes each sample to exactly one teacher instead of
+            doing weighted multi-teacher fusion.
         resource_pool: Ray resource pool name (default: "global_pool")
         log_prob_micro_batch_size: Micro-batch size for teacher forward pass
         lambda_val: Optional per-teacher ExOPD lambda override
@@ -36,7 +38,8 @@ class TeacherConfig(BaseConfig):
         tokenizer_compat_group: Optional explicit compatibility group label
         tokenizer_policy: Whether this teacher participates through token-level log prob or sequence reward
         seq_reward_weight: Weight for sequence-level teacher reward mixing in the estimator
-        base_model_path: Optional base model for ExOPD normalization
+        base_model_path: Deprecated per-teacher base model knob. The current ExOPD runtime
+            only supports the shared algorithm.mopd.base_model_path setting.
     """
 
     name: str = ""
@@ -64,6 +67,11 @@ class TeacherConfig(BaseConfig):
             raise ValueError(f"TeacherConfig.backend must be one of {sorted(valid_backends)}. Got: {self.backend}")
         if self.weight <= 0:
             raise ValueError(f"TeacherConfig.weight must be positive: {self.weight}")
+        if self.weight != 1.0:
+            raise ValueError(
+                "TeacherConfig.weight is not supported by the current MOPD runtime. "
+                "The implementation routes each sample to exactly one teacher rather than doing weighted fusion."
+            )
         if self.lambda_val is not None and self.lambda_val <= 0:
             raise ValueError(f"TeacherConfig.lambda_val must be positive: {self.lambda_val}")
         if self.tokenizer_compat_group is not None and not self.tokenizer_compat_group:
@@ -75,6 +83,11 @@ class TeacherConfig(BaseConfig):
             )
         if self.seq_reward_weight <= 0:
             raise ValueError(f"TeacherConfig.seq_reward_weight must be positive: {self.seq_reward_weight}")
+        if self.base_model_path is not None:
+            raise ValueError(
+                "Per-teacher base_model_path is not supported by the current ExOPD runtime. "
+                "Use the shared algorithm.mopd.base_model_path instead."
+            )
 
 
 @dataclass
@@ -95,9 +108,7 @@ class TeacherResourcePoolConfig(BaseConfig):
         if self.nnodes <= 0:
             raise ValueError(f"TeacherResourcePoolConfig.nnodes must be positive: {self.nnodes}")
         if self.n_gpus_per_node <= 0:
-            raise ValueError(
-                f"TeacherResourcePoolConfig.n_gpus_per_node must be positive: {self.n_gpus_per_node}"
-            )
+            raise ValueError(f"TeacherResourcePoolConfig.n_gpus_per_node must be positive: {self.n_gpus_per_node}")
         if self.max_colocate_count is not None and self.max_colocate_count <= 0:
             raise ValueError(
                 "TeacherResourcePoolConfig.max_colocate_count must be positive when provided: "

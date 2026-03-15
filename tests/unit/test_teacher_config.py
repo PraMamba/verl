@@ -75,6 +75,16 @@ def test_teacher_config_exposes_backend_and_sequence_policy_fields():
     assert teacher_cfg.seq_reward_weight == pytest.approx(0.25)
 
 
+def test_teacher_config_rejects_non_default_weight_until_runtime_support_exists():
+    with pytest.raises(ValueError, match="weight is not supported"):
+        TeacherConfig(name="math", model_path="/models/math", weight=1.5)
+
+
+def test_teacher_config_rejects_per_teacher_base_model_path_until_runtime_support_exists():
+    with pytest.raises(ValueError, match="shared algorithm.mopd.base_model_path"):
+        TeacherConfig(name="math", model_path="/models/math", base_model_path="/models/base")
+
+
 def test_mopd_config_validates_epsilon_bounds():
     with pytest.raises(ValueError, match=r"is_epsilon_low .* must be < is_epsilon_high"):
         MOPDConfig(enabled=False, is_epsilon_low=10.0, is_epsilon_high=1.0)

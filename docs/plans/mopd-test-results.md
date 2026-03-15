@@ -11,20 +11,26 @@
 This document was refreshed against the current branch source, not against the older
 80-test snapshot that previously lived in this file.
 
-For this refresh, the evidence source is split into three parts:
+For this refresh, the evidence source is split into two parts:
 
 - **Freshly executed in this update**
   - `pytest -q` over the CPU-safe MOPD suite
   - `pytest --collect-only -q` over the same suite
   - `pytest -q tests/unit/test_teardown_cleanup.py`
-- **Source-inspected but not re-executed in this update**
-  - `recipe/mopd/run_mopd_qwen3_4b_preflight.sh`
-  - `recipe/mopd/check_mopd_first_batch.py`
-  - `tests/integration/test_mopd_e2e.py::test_mopd_training_e2e`
+  - `bash recipe/mopd/run_mopd_qwen3_4b_preflight.sh` on the latest worktree
+  - `VERL_MOPD_E2E=1 pytest tests/integration/test_mopd_e2e.py::test_mopd_training_e2e -v`
+  - `bash recipe/mopd/run_mopd_qwen3_4b.sh` with an isolated checkpoint directory
+  - conservative long-run reruns on the latest worktree, including the successful `18/18` closure run
+  - real-weight `HFQuantizedTeacherWorker` profiling for `hf_int8` / `hf_4bit`
+- **Not freshly exercised in this update**
+  - multi-node teacher deployment
+  - fault-recovery / kill-injection scenarios
+  - real-weight quantized-teacher `sequence_reward` scoring path
 
-That means this document now reflects the **current test surface, the current CPU-safe result,
-and an adjacent teardown/cleanup regression check**.
-It does **not** claim a fresh GPU/preflight rerun for the latest worktree state.
+That means this document now reflects the **current CPU-safe test surface and a fresh
+single-node, 4-GPU runtime closure for both the real recipe contract and a
+conservative long-run stress rerun**.
+It still does **not** claim fresh multi-node or fault-recovery coverage.
 
 ---
 
@@ -33,14 +39,30 @@ It does **not** claim a fresh GPU/preflight rerun for the latest worktree state.
 The old detailed breakdown in this file was stale. The current branch now exposes a
 larger and materially different MOPD validation surface:
 
-- The suite has grown from the old **80 collected tests** snapshot to **112 collected tests**.
+- The suite has grown from the old **80 collected tests** snapshot to **116 collected tests**.
 - A fresh CPU-safe rerun on the current worktree completed with:
-  - **111 passed**
+  - **115 passed**
   - **1 skipped**
   - **1 warning**
 - A separate teardown/cleanup regression file completed with:
   - **5 passed**
   - **3 warnings**
+- A fresh recipe-aligned runtime closure on 2026-03-15 completed with:
+  - preflight shell entrypoint success at `training/global_step:1`
+  - opt-in GPU E2E outer pytest success: **1 passed, 1 warning in 345.91s**
+  - full recipe shell run success with `Training Progress: 100%|...| 6/6`
+  - final checkpoint marker written as `latest_checkpointed_iteration.txt = 6`
+- A fresh conservative long-run rerun on 2026-03-15 completed with:
+  - successful `Training Progress: 100%|...| 18/18`
+  - `step:18 ... training/global_step:18`
+  - `validation generation end` and `Final validation metrics`
+  - routing mean `cell=0.4965` / `disease=0.5035`, matching the `100 / 100` dataset split
+  - stable IS mask behavior with mean `mopd/is_valid_fraction=0.9999998278` and mean `mopd/is_zeroed_fraction=1.714958e-7`
+- A fresh real-weight quantized-teacher profiling sweep on 2026-03-15 completed with:
+  - `hf_int8` and `hf_4bit` both loading the real recipe teacher checkpoints successfully
+  - 1 / 2 / 4 teacher cases profiled on GPUs 4-7
+  - per-teacher peak reserved memory of about **5.05 GiB** (`hf_int8`) vs **3.81 GiB** (`hf_4bit`)
+  - measurable first-step latency improvement when single-teacher micro-batch grows from `2` to `4`
 - The newly covered areas that did not exist in the old snapshot include:
   - batch-level `lambda_val` override semantics in ExOPD
   - sequence-teacher advantage composition and dispatch plumbing
@@ -51,8 +73,9 @@ larger and materially different MOPD validation surface:
   - GPU E2E env-contract and success-contract tests
   - trainer fit finalization and dataloader-worker shutdown checks
 
-The full GPU E2E path still exists, but in the current suite it remains an opt-in
-test gated by `VERL_MOPD_E2E=1` and CUDA availability.
+The full GPU E2E path still remains an opt-in pytest entrypoint gated by
+`VERL_MOPD_E2E=1` and CUDA availability, but unlike the previous version of this
+document it was also freshly executed in this refresh.
 
 ---
 
@@ -79,7 +102,7 @@ pytest -q \
 Result:
 
 ```text
-111 passed, 1 skipped, 1 warning in 11.99s
+115 passed, 1 skipped, 1 warning in 11.31s
 ```
 
 ### 2. Collected test inventory
@@ -103,7 +126,7 @@ pytest --collect-only -q \
 Result:
 
 ```text
-112 tests collected in 7.97s
+116 tests collected in 8.57s
 ```
 
 ### 3. Teardown / cleanup regression file
@@ -117,14 +140,164 @@ pytest -q tests/unit/test_teardown_cleanup.py
 Result:
 
 ```text
-5 passed, 3 warnings in 11.99s
+5 passed, 3 warnings in 11.55s
 ```
 
-This file is **not** part of the 112-test core MOPD suite. It is listed separately because
+### 4. Recipe preflight on the real shell entrypoint
+
+Command:
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5,6,7 \
+CKPTS_DIR=/tmp/mopd-real-run-closure-20260315 \
+PREFLIGHT_TIMEOUT_SECONDS=1200 \
+PREFLIGHT_LOG_FILE=/tmp/mopd-real-run-closure-20260315/preflight/mopd_preflight_latest.log \
+bash recipe/mopd/run_mopd_qwen3_4b_preflight.sh
+```
+
+Result:
+
+```text
+exit code 0
+success boundary reached at step:1 ... training/global_step:1
+```
+
+Artifact:
+
+- `/tmp/mopd-real-run-closure-20260315/preflight/mopd_preflight_latest.log`
+
+### 5. Opt-in GPU E2E subprocess path
+
+Command:
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5,6,7 \
+VERL_MOPD_E2E=1 \
+MOPD_E2E_TRAIN_MAX_SAMPLES=8 \
+MOPD_E2E_VAL_MAX_SAMPLES=8 \
+pytest tests/integration/test_mopd_e2e.py::test_mopd_training_e2e -v \
+  --basetemp=/tmp/mopd-real-run-closure-20260315/pytest-e2e
+```
+
+Result:
+
+```text
+1 passed, 1 warning in 345.91s
+```
+
+Inner training artifact:
+
+- `/tmp/mopd-real-run-closure-20260315/pytest-e2e/test_mopd_training_e2e0/mopd-e2e.log`
+
+Observed success boundary inside the subprocess log:
+
+```text
+step:1 ... training/global_step:1
+Training Progress: 100%|...| 1/1
+```
+
+### 6. Full recipe shell run
+
+Command:
+
+```bash
+CKPTS_DIR=/gpfs/Mamba/Project/Single_Cell/Training/MOPD-real-run-closure-20260315 \
+bash recipe/mopd/run_mopd_qwen3_4b.sh
+```
+
+Result:
+
+```text
+exit code 0
+Training Progress: 100%|...| 6/6
+step:6 ... training/global_step:6
+latest_checkpointed_iteration.txt = 6
+```
+
+Artifacts:
+
+- `/gpfs/Mamba/Project/Single_Cell/Training/MOPD-real-run-closure-20260315/logs/model_training_20260315_14.log`
+- `/gpfs/Mamba/Project/Single_Cell/Training/MOPD-real-run-closure-20260315/latest_checkpointed_iteration.txt`
+
+### 7. Conservative long-run rerun closure
+
+Run identifier:
+
+- `/gpfs/Mamba/Project/Single_Cell/Training/MOPD-longrun-closure-20260315-eager025-maxseq16-e3-r3`
+
+Observed rollout overrides from the run config dump:
+
+- `actor_rollout_ref.rollout.enforce_eager=True`
+- `actor_rollout_ref.rollout.gpu_memory_utilization=0.25`
+- `actor_rollout_ref.rollout.max_num_seqs=16`
+- `actor_rollout_ref.rollout.max_num_batched_tokens=8192`
+- `actor_rollout_ref.rollout.max_model_len=8192`
+
+Long-run lineage:
+
+- original run `/gpfs/Mamba/Project/Single_Cell/Training/MOPD-longrun-closure-20260315-e3`
+  failed before completion with generation-side `CUDA out of memory`
+- rerun #2 `/gpfs/Mamba/Project/Single_Cell/Training/MOPD-longrun-closure-20260315-eager035-maxseq32-e3-r2`
+  moved the boundary past generation but failed after `step:9` on vLLM wake-up with
+  `cumem_allocator.cpp:62`
+- rerun #3 `/gpfs/Mamba/Project/Single_Cell/Training/MOPD-longrun-closure-20260315-eager025-maxseq16-e3-r3`
+  completed successfully
+
+Result:
+
+```text
+exit code 0
+Training Progress: 100%|...| 18/18
+step:18 ... training/global_step:18
+validation generation end
+Final validation metrics
+```
+
+Artifacts:
+
+- `/gpfs/Mamba/Project/Single_Cell/Training/MOPD-longrun-closure-20260315-eager025-maxseq16-e3-r3/console.log`
+- `/gpfs/Mamba/Project/Single_Cell/Training/MOPD-longrun-closure-20260315-eager025-maxseq16-e3-r3/metrics.jsonl`
+
+Observed closure answers:
+
+- teacher routing matched the `100 / 100` dataset split:
+  `mopd/cell_type_teacher/sample_fraction` mean `0.4965277778`,
+  `mopd/disease_state_teacher/sample_fraction` mean `0.5034722222`
+- IS masking remained controlled:
+  `mopd/is_valid_fraction` mean `0.9999998278`,
+  `mopd/is_zeroed_fraction` mean `1.714958e-7`,
+  and the final step itself stayed at `1.0 / 0.0`
+- advantage and reverse-KL stayed interpretable rather than diverging:
+  final `adv_mean` was `-0.5929` / `-0.7875`,
+  final `reverse_kl_mean` was `-0.5919` / `-0.7870`
+- `seq_reward_mean` stayed `0.0` on both teachers because this run still used the
+  zero-reward recipe path, not because the sequence-teacher plumbing failed
+- response-length pressure remained high even in the successful run:
+  `response_length/clip_ratio` hit `1.0` at `step:17` and finished at `0.9921875`
+
+This is the first fresh run in this update that demonstrates the full `18/18`
+long-run closure on the latest worktree.
+
+### 8. Post-completion teardown noise review
+
+The GPU E2E log, the default `6/6` full-run log, and the conservative `18/18`
+long-run log all contain late `multiprocessing.resource_tracker` `KeyError`
+messages, and the E2E log also includes a Ray worker `SIGTERM` notice.
+In all three artifacts these lines appear **after** the successful completion markers:
+
+- after `Training Progress: 100%|...| 1/1` in the GPU E2E log
+- after `Training Progress: 100%|...| 6/6`, final validation, and checkpoint writes in the full-run log
+- after `Training Progress: 100%|...| 18/18`, `validation generation end`, and
+  `Final validation metrics` in the long-run log
+
+For this refresh they are treated as **post-completion shutdown noise**, not as
+evidence of an in-run MOPD failure.
+
+This file is **not** part of the 116-test core MOPD suite. It is listed separately because
 it strengthens the current "deployment / engineering closure" picture without changing the
 historical MOPD-suite comparison baseline.
 
-### 4. Warning profile
+### 9. Warning profile
 
 The fresh CPU-safe MOPD suite emitted one non-blocking warning:
 
@@ -137,6 +310,34 @@ The separate teardown file emitted:
 
 No MOPD-specific failures were observed in the fresh reruns.
 
+### 10. Real-weight quantized teacher profiling
+
+Method:
+
+- teacher-only harness that instantiated `HFQuantizedTeacherWorker` directly
+- `init_model()` + first `_compute_ref_log_prob_impl()` measured on an 8-sample batch
+- real checkpoints came from the recipe defaults for `CELL_TYPE_TEACHER_PATH` and `DISEASE_STATE_TEACHER_PATH`
+- the `N teacher` case used 4 GPUs and repeated those two real checkpoints across 4 teacher workers
+- peak memory below is `torch.cuda.max_memory_reserved()` on the busiest teacher GPU; total reserved memory is shown in parentheses
+
+| Teacher Count | Backend | `log_prob_micro_batch_size` | Peak Reserved GiB | First-Step Latency (s) | Startup Time (s) |
+|---:|---|---:|---:|---:|---:|
+| 1 | `hf_int8` | 2 | `5.05` (`5.05` total) | `1.70` | `17.95` |
+| 1 | `hf_int8` | 4 | `5.05` (`5.05` total) | `1.20` | `17.45` |
+| 2 | `hf_int8` | 2 | `5.05` (`10.05` total) | `2.44` | `28.20` |
+| 4 | `hf_int8` | 2 | `5.05` (`20.10` total) | `3.28` | `49.38` |
+| 1 | `hf_4bit` | 2 | `3.81` (`3.81` total) | `1.15` | `15.37` |
+| 1 | `hf_4bit` | 4 | `3.81` (`3.81` total) | `0.77` | `15.23` |
+| 2 | `hf_4bit` | 2 | `3.81` (`7.63` total) | `1.54` | `27.78` |
+| 4 | `hf_4bit` | 2 | `3.81` (`15.25` total) | `2.22` | `52.60` |
+
+Observed takeaways:
+
+- `hf_4bit` reduced per-teacher peak reserved memory from about `5.05 GiB` to `3.81 GiB` relative to `hf_int8`
+- increasing single-teacher micro-batch from `2` to `4` improved first-step latency without materially changing peak memory
+- total reserved memory scaled close to linearly with teacher count in this teacher-only harness
+- startup time also scaled close to linearly because the current trainer path initializes teacher workers sequentially
+
 ---
 
 ## Current Suite Inventory
@@ -145,15 +346,15 @@ No MOPD-specific failures were observed in the fresh reruns.
 |---|---:|---|
 | `tests/unit/test_mopd_advantage.py` | 15 | MOPD / ExOPD formulae, IS correction, ORM, sequence-teacher mixing, dispatch plumbing |
 | `tests/unit/test_teacher_routing.py` | 10 | `teacher_id` routing, balancing, scatter alignment, async scheduling, dispatch mesh |
-| `tests/unit/test_teacher_config.py` | 12 | `TeacherConfig`, `MOPDConfig`, `TeacherResourcePoolConfig` validation |
+| `tests/unit/test_teacher_config.py` | 14 | `TeacherConfig`, `MOPDConfig`, `TeacherResourcePoolConfig` validation |
 | `tests/unit/test_teacher_workers.py` | 11 | worker-config building, tokenizer propagation, quantized worker path, shared base path |
 | `tests/unit/test_dataset_teacher_id.py` | 5 | dataset extraction and collation of `teacher_id` |
 | `tests/unit/test_mopd_preflight.py` | 9 | preflight command synthesis and success/failure log detection |
 | `tests/unit/test_mopd_resource_pools.py` | 4 | teacher resource pool registration and colocate budget behavior |
 | `tests/unit/test_mopd_run_script.py` | 3 | production script defaults, `PYTHONPATH` binding, self-check logging |
-| `tests/unit/test_mopd_trainer_runtime.py` | 23 | tokenizer compatibility, sequence teacher runtime, metrics, manifest drift |
+| `tests/unit/test_mopd_trainer_runtime.py` | 25 | tokenizer compatibility, sequence teacher runtime, metrics, manifest drift |
 | `tests/integration/test_mopd_e2e.py` | 20 | lightweight integration, env contract, success contract, opt-in GPU E2E |
-| **Total** | **112** | |
+| **Total** | **116** | |
 
 The single skipped test in the fresh run is the GPU-only
 `tests/integration/test_mopd_e2e.py::test_mopd_training_e2e`.
@@ -365,13 +566,13 @@ snapshot. That is no longer representative of the current branch.
 
 The current delta is:
 
-- **112 collected now**
-- **+32 tests** relative to the old snapshot
+- **116 collected now**
+- **+36 tests** relative to the old snapshot
 
 The most important additions are:
 
-- 5 new advantage-path tests around batch lambda and sequence-teacher composition
-- 4 deeper routing/scheduling tests
+- deeper advantage-path coverage around batch lambda and sequence-teacher composition
+- deeper routing/scheduling tests
 - expanded config coverage for backend, tokenizer policy, and resource-pool validation
 - quantized teacher worker tests
 - 2 new run-script contract tests
@@ -391,37 +592,36 @@ Freshly validated in this update:
 - current collected test inventory and per-file counts
 - current lightweight integration and contract tests
 - current teardown/cleanup regression helpers
+- recipe-aligned preflight on the real shell entrypoint
+- full GPU subprocess path in `test_mopd_training_e2e`
+- full `run_mopd_qwen3_4b.sh` recipe path through final checkpoint write
+- conservative long-run rerun through `Training Progress: 100%|...| 18/18`,
+  final validation, and `training/global_step:18`
+- real-weight quantized-teacher load / memory / first-step profiling for `hf_int8` and `hf_4bit`
 
 Not freshly re-executed in this update:
 
-- `recipe/mopd/run_mopd_qwen3_4b_preflight.sh`
-- full GPU subprocess path in `test_mopd_training_e2e`
-- any multi-node or fault-recovery scenario
+- any multi-node teacher resource pool deployment
+- any deliberate fault-recovery or kill-injection scenario
+- real-weight quantized-teacher `sequence_reward` scoring path
 
-Still not proven by the current CPU-safe suite:
+Still not proven by the current closure:
 
-- actual quantized teacher loading with real model weights
-- long-run training stability or convergence quality
 - multi-node teacher resource pools under a real cluster
 - worker crash recovery or OOM recovery
-- symmetric cleanup for `base_policy_wg` or exception-path `finally` behavior in `RayPPOTrainer.fit()`
+- repeatability and quality gain beyond a single successful `18/18` long-run stress run
+- quantized-teacher quality tradeoff and sequence-score path under real model weights
+- whether the post-completion `resource_tracker` noise can be eliminated entirely at the vLLM / multiprocessing layer
 
 ---
 
-## Recommended Next Manual Checks
+## Recommended Next Checks Beyond Current Closure
 
-If a fresh runtime closure is needed beyond the CPU-safe suite, the next commands are:
+The three core recipe-aligned commands have now been run for the latest worktree
+state. The next validation gaps are no longer “run preflight / run GPU E2E”, but:
 
-```bash
-# Optional GPU availability check
-python -c "import torch; print('GPU available:', torch.cuda.is_available())"
-
-# Recipe preflight on the real shell entrypoint
-bash recipe/mopd/run_mopd_qwen3_4b_preflight.sh
-
-# Full GPU E2E
-VERL_MOPD_E2E=1 \
-pytest tests/integration/test_mopd_e2e.py::test_mopd_training_e2e -v
-```
-
-Those commands were **not** run as part of this document refresh.
+- longer-horizon or repeated long-run quality / convergence studies beyond the current `18/18` closure run
+- multi-node teacher placement and resource-pool behavior
+- failure-path validation such as actor kill, Ray restart, or rollout teardown interruption
+- real quantized-teacher `sequence_reward` scoring and quality validation with `hf_int8` / `hf_4bit`
+- explicit investigation of the post-completion `resource_tracker` noise in the vLLM path

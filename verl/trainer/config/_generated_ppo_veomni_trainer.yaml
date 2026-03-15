@@ -584,6 +584,7 @@ algorithm:
     is_epsilon_high: 10.0
     use_base_normalization: false
     base_model_path: null
+    resource_pools: {}
     teachers: []
   _target_: verl.trainer.config.AlgoConfig
   gamma: 1.0

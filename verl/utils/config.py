@@ -146,6 +146,10 @@ def validate_config(
                     f"'{name}.{param}' because only '*_{param_per_gpu}' is supported (the former is deprecated)."
                 )
 
+    from verl.trainer.config import AlgoConfig
+
+    algo_config = omega_conf_to_dataclass(config.algorithm, AlgoConfig)
+
     # Actor validation done in ActorConfig.__post_init__ and validate()
     actor_config = omega_conf_to_dataclass(config.actor_rollout_ref.actor)
     actor_config.validate(n_gpus, config.data.train_batch_size, config.actor_rollout_ref.model)
@@ -166,7 +170,7 @@ def validate_config(
             "actor_rollout_ref.rollout",
         )
 
-    if config.algorithm.use_kl_in_reward and config.actor_rollout_ref.actor.use_kl_loss:
+    if algo_config.use_kl_in_reward and config.actor_rollout_ref.actor.use_kl_loss:
         print("NOTICE: You have both enabled in-reward kl and kl loss.")
 
     # critic

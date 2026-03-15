@@ -182,8 +182,11 @@ def _load_mopd_preflight_module():
 def _build_mopd_e2e_command_from_env(ckpt_dir: str) -> list[str]:
     module = _load_mopd_preflight_module()
     config = module.PreflightConfig(
-        student_model_path=os.environ.get("STUDENT_MODEL_PATH") or os.environ.get("MOPD_TEST_MODEL_PATH", "/models/base"),
-        cell_type_teacher_path=os.environ.get("CELL_TYPE_TEACHER_PATH", os.environ.get("MOPD_TEST_TEACHER_PATH", "/models/math-teacher")),
+        student_model_path=os.environ.get("STUDENT_MODEL_PATH")
+        or os.environ.get("MOPD_TEST_MODEL_PATH", "/models/base"),
+        cell_type_teacher_path=os.environ.get(
+            "CELL_TYPE_TEACHER_PATH", os.environ.get("MOPD_TEST_TEACHER_PATH", "/models/math-teacher")
+        ),
         disease_state_teacher_path=os.environ.get(
             "DISEASE_STATE_TEACHER_PATH", os.environ.get("MOPD_TEST_TEACHER_PATH", "/models/math-teacher")
         ),
@@ -462,11 +465,11 @@ class TestMOPDConfigIntegration:
 
     def test_teacher_config_roundtrip(self):
         """Test TeacherConfig can be created from dict and exported back."""
-        cfg_dict = {"name": "math", "model_path": "/models/math", "weight": 1.5}
+        cfg_dict = {"name": "math", "model_path": "/models/math", "weight": 1.0}
         teacher = TeacherConfig(**cfg_dict)
         assert teacher.name == "math"
         assert teacher.model_path == "/models/math"
-        assert teacher.weight == 1.5
+        assert teacher.weight == 1.0
 
     def test_mopd_config_with_teachers(self):
         """Test MOPDConfig accepts properly constructed teachers."""
@@ -673,14 +676,10 @@ def test_mopd_training_e2e(tmp_path):
 
     if result.returncode != 0:
         log_tail = "\n".join(log_file.read_text(encoding="utf-8").splitlines()[-60:])
-        pytest.fail(
-            "GPU E2E command failed with exit code "
-            f"{result.returncode}. Log tail:\n{log_tail}"
-        )
+        pytest.fail(f"GPU E2E command failed with exit code {result.returncode}. Log tail:\n{log_tail}")
 
     if not _mopd_e2e_log_reached_training_step(log_file):
         log_tail = "\n".join(log_file.read_text(encoding="utf-8").splitlines()[-60:])
         pytest.fail(
-            "GPU E2E command exited successfully but did not report a completed training step. "
-            f"Log tail:\n{log_tail}"
+            f"GPU E2E command exited successfully but did not report a completed training step. Log tail:\n{log_tail}"
         )

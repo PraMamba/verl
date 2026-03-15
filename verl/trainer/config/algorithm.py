@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -179,7 +181,7 @@ class RolloutCorrectionConfig(BaseConfig):
     loss_type: str = "ppo_clip"
 
     @classmethod
-    def decoupled_token_is(cls, threshold: float = 2.0) -> "RolloutCorrectionConfig":
+    def decoupled_token_is(cls, threshold: float = 2.0) -> RolloutCorrectionConfig:
         """Decoupled Mode with Token-level Importance Sampling.
 
         IS weight correction at token level in decoupled mode (three policies).
@@ -193,7 +195,7 @@ class RolloutCorrectionConfig(BaseConfig):
         return cls(rollout_is="token", rollout_is_threshold=threshold, rollout_rs=None)
 
     @classmethod
-    def decoupled_seq_is(cls, threshold: float = 2.0) -> "RolloutCorrectionConfig":
+    def decoupled_seq_is(cls, threshold: float = 2.0) -> RolloutCorrectionConfig:
         """Decoupled Mode with Sequence-level Importance Sampling.
 
         IS weight correction at sequence level in decoupled mode (three policies).
@@ -211,7 +213,7 @@ class RolloutCorrectionConfig(BaseConfig):
         cls,
         is_threshold: float = 2.0,
         rs_threshold: Optional[str | float] = "0.5_2.0",
-    ) -> "RolloutCorrectionConfig":
+    ) -> RolloutCorrectionConfig:
         """Decoupled Mode with Sequence-level IS + Rejection Sampling.
 
         Sequence-level IS with sequence-level rejection sampling in decoupled mode.
@@ -235,7 +237,7 @@ class RolloutCorrectionConfig(BaseConfig):
     def decoupled_geo_rs(
         cls,
         rs_threshold: Optional[str | float] = "0.999_1.001",
-    ) -> "RolloutCorrectionConfig":
+    ) -> RolloutCorrectionConfig:
         """Decoupled Mode with Geometric Mean Rejection Sampling (ratio-based).
 
         Uses geometric mean IS ratio E[log(r)] for rejection sampling at sequence level.
@@ -255,7 +257,7 @@ class RolloutCorrectionConfig(BaseConfig):
         )
 
     @classmethod
-    def bypass_ppo_clip(cls) -> "RolloutCorrectionConfig":
+    def bypass_ppo_clip(cls) -> RolloutCorrectionConfig:
         """Bypass mode with PPO-clip loss.
 
         PPO clipped objective in bypass mode. The PPO ratio = π_θ/π_rollout
@@ -277,7 +279,7 @@ class RolloutCorrectionConfig(BaseConfig):
     def bypass_ppo_clip_geo_rs(
         cls,
         rs_threshold: Optional[str | float] = "0.999_1.001",
-    ) -> "RolloutCorrectionConfig":
+    ) -> RolloutCorrectionConfig:
         """Bypass mode with PPO-clip loss and Geometric Mean RS (ratio-based).
 
         PPO clipped objective in bypass mode with geometric mean IS ratio RS.
@@ -301,7 +303,7 @@ class RolloutCorrectionConfig(BaseConfig):
     def bypass_ppo_clip_k3_rs(
         cls,
         rs_threshold: float = 0.01,
-    ) -> "RolloutCorrectionConfig":
+    ) -> RolloutCorrectionConfig:
         """Bypass mode with PPO-clip loss and K3 Rejection Sampling.
 
         PPO clipped objective in bypass mode with K3 KL estimator RS to mask outliers.
@@ -323,7 +325,7 @@ class RolloutCorrectionConfig(BaseConfig):
         )
 
     @classmethod
-    def bypass_pg_is(cls, threshold: float = 2.0) -> "RolloutCorrectionConfig":
+    def bypass_pg_is(cls, threshold: float = 2.0) -> RolloutCorrectionConfig:
         """Bypass mode with REINFORCE loss and IS Correction.
 
         Uses REINFORCE loss with explicit IS correction in bypass mode.
@@ -347,7 +349,7 @@ class RolloutCorrectionConfig(BaseConfig):
     def bypass_pg_geo_rs(
         cls,
         rs_threshold: Optional[str | float] = "0.999_1.001",
-    ) -> "RolloutCorrectionConfig":
+    ) -> RolloutCorrectionConfig:
         """Bypass mode with REINFORCE loss and Geometric Mean RS (ratio-based).
 
         REINFORCE with geometric mean IS ratio rejection sampling in bypass mode.
@@ -372,7 +374,7 @@ class RolloutCorrectionConfig(BaseConfig):
         cls,
         is_threshold: float = 2.0,
         rs_threshold: Optional[str | float] = "0.999_1.001",
-    ) -> "RolloutCorrectionConfig":
+    ) -> RolloutCorrectionConfig:
         """Decoupled mode with Geometric Mean RS and Sequence-level Truncated IS (ratio-based).
 
         Combines the Geometric Mean Filter (ratio-based validity check) with
@@ -397,7 +399,7 @@ class RolloutCorrectionConfig(BaseConfig):
         cls,
         is_threshold: float = 2.0,
         rs_threshold: Optional[str | float] = "0.999_1.001",
-    ) -> "RolloutCorrectionConfig":
+    ) -> RolloutCorrectionConfig:
         """Decoupled mode with Geometric Mean RS and Token-level Truncated IS (ratio-based).
 
         Combines the Geometric Mean Filter (ratio-based validity check) with
@@ -422,7 +424,7 @@ class RolloutCorrectionConfig(BaseConfig):
         cls,
         is_threshold: float = 2.0,
         rs_threshold: Optional[str | float] = "0.999_1.001",
-    ) -> "RolloutCorrectionConfig":
+    ) -> RolloutCorrectionConfig:
         """Bypass mode with REINFORCE loss, Geo-RS, and Sequence-level IS.
 
         Combines geometric mean IS ratio rejection with sequence-level IS
@@ -450,7 +452,7 @@ class RolloutCorrectionConfig(BaseConfig):
         cls,
         is_threshold: float = 2.0,
         rs_threshold: Optional[str | float] = "0.999_1.001",
-    ) -> "RolloutCorrectionConfig":
+    ) -> RolloutCorrectionConfig:
         """Bypass mode with REINFORCE loss, Geo-RS, and Token-level IS.
 
         Combines geometric mean IS ratio rejection with token-level IS weights
@@ -479,7 +481,7 @@ class RolloutCorrectionConfig(BaseConfig):
     def decoupled_k3_rs(
         cls,
         rs_threshold: float = 0.01,
-    ) -> "RolloutCorrectionConfig":
+    ) -> RolloutCorrectionConfig:
         """Decoupled mode with K3 KL Estimator Rejection Sampling.
 
         Uses K3 KL estimator at sequence level for rejection sampling.
@@ -506,7 +508,7 @@ class RolloutCorrectionConfig(BaseConfig):
         cls,
         is_threshold: float = 2.0,
         rs_threshold: float = 0.01,
-    ) -> "RolloutCorrectionConfig":
+    ) -> RolloutCorrectionConfig:
         """Decoupled mode with K3 RS and Sequence-level Truncated IS.
 
         Combines K3 KL estimator rejection with sequence-level IS weights.
@@ -531,7 +533,7 @@ class RolloutCorrectionConfig(BaseConfig):
         cls,
         is_threshold: float = 2.0,
         rs_threshold: float = 0.01,
-    ) -> "RolloutCorrectionConfig":
+    ) -> RolloutCorrectionConfig:
         """Decoupled mode with K3 RS and Token-level Truncated IS.
 
         Combines K3 KL estimator rejection with token-level IS weights.
@@ -553,7 +555,7 @@ class RolloutCorrectionConfig(BaseConfig):
         )
 
     @classmethod
-    def disabled(cls) -> "RolloutCorrectionConfig":
+    def disabled(cls) -> RolloutCorrectionConfig:
         """Disabled - Metrics Only Mode.
 
         Computes and logs off-policy metrics without applying correction.
@@ -612,3 +614,15 @@ class AlgoConfig(BaseConfig):
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None
+    # Delayed conversion avoids a package-level import cycle between trainer.config
+    # and verl.workers.config while still forcing MOPDConfig validation in __post_init__.
+    mopd: Any = None
+
+    def __post_init__(self):
+        from verl.utils.config import omega_conf_to_dataclass
+        from verl.workers.config.teacher import MOPDConfig
+
+        if self.mopd is None:
+            object.__setattr__(self, "mopd", MOPDConfig())
+        elif not isinstance(self.mopd, MOPDConfig):
+            object.__setattr__(self, "mopd", omega_conf_to_dataclass(self.mopd, MOPDConfig))

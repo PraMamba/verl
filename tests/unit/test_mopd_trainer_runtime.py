@@ -15,6 +15,7 @@
 """Unit tests for MOPD trainer runtime helpers."""
 
 import logging
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -202,6 +203,67 @@ def test_compute_base_log_prob_uses_base_worker():
     torch.testing.assert_close(result.batch["base_log_prob"], torch.full((3, 5), 1.25))
 
 
+def test_cleanup_teacher_workers_releases_base_policy_group_and_is_idempotent():
+    trainer = _make_trainer()
+    trainer.teacher_wgs = {"math": object()}
+    trainer.base_policy_wg = object()
+
+    trainer.cleanup_teacher_workers()
+
+    assert trainer.teacher_wgs == {}
+    assert trainer.base_policy_wg is None
+
+    trainer.cleanup_teacher_workers()
+
+    assert trainer.teacher_wgs == {}
+    assert trainer.base_policy_wg is None
+
+
+def test_fit_finalizes_resources_when_validation_raises(monkeypatch):
+    tracker_instances = []
+
+    class _FakeTracking:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.finished = False
+            tracker_instances.append(self)
+
+        def log(self, *args, **kwargs):
+            raise AssertionError("log should not be called when validation raises")
+
+        def finish(self):
+            self.finished = True
+
+    monkeypatch.setattr("verl.utils.tracking.Tracking", _FakeTracking)
+
+    config = _make_config()
+    config.trainer.project_name = "mopd-tests"
+    config.trainer.experiment_name = "fit-finalize"
+    config.trainer.logger = ["console"]
+    config.trainer.val_before_train = True
+    config.trainer.val_only = False
+    config.trainer.total_epochs = 1
+
+    trainer = _make_trainer(config=config)
+    trainer.train_dataloader = [object()]
+    trainer.checkpoint_manager = SimpleNamespace(update_weights=lambda *_args, **_kwargs: None)
+    trainer._load_checkpoint = lambda: None
+
+    finalize_calls = []
+
+    def _finalize_fit_resources(*, tracking_logger=None, progress_bar=None):
+        finalize_calls.append((tracking_logger, progress_bar))
+
+    trainer._finalize_fit_resources = _finalize_fit_resources
+    trainer._validate = lambda: (_ for _ in ()).throw(RuntimeError("validation boom"))
+
+    with pytest.raises(RuntimeError, match="validation boom"):
+        trainer.fit()
+
+    assert len(tracker_instances) == 1
+    assert finalize_calls == [(tracker_instances[0], None)]
+
+
 def test_build_mopd_lambda_tensor_uses_teacher_overrides():
     trainer = _make_trainer()
     trainer.config.algorithm.mopd.teachers[1].lambda_val = 2.5
@@ -230,7 +292,7 @@ def test_run_mopd_preflight_rejects_unknown_teacher_ids():
                 {"teacher_id": "math"},
                 {"teacher_id": "biology"},
             ]
-        )
+        ),
     )
 
     with pytest.raises(ValueError, match="unknown teacher_ids"):
@@ -248,7 +310,7 @@ def test_run_mopd_preflight_rejects_missing_configured_teachers():
                 {"teacher_id": "math"},
                 {"teacher_id": "math"},
             ]
-        )
+        ),
     )
 
     with pytest.raises(ValueError, match="missing configured teachers"):
