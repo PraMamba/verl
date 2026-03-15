@@ -13,6 +13,7 @@
 # limitations under the License.
 import argparse
 import asyncio
+import contextlib
 import inspect
 import json
 import logging
@@ -479,7 +480,9 @@ class vLLMHttpServer:
             logger.info(f"Initializing a V1 LLM engine with config: {vllm_config}")
 
         self.engine = engine_client
-        self._server_port, self._server_task = await run_uvicorn(app, args, self._server_address)
+        self._server_port, self._server_task, self._uvicorn_server = await run_uvicorn(
+            app, args, self._server_address
+        )
 
     async def run_headless(self, args: argparse.Namespace):
         """Run headless server in a separate thread."""
@@ -672,6 +675,36 @@ class vLLMHttpServer:
 
     async def wait_for_requests_to_drain(self):
         await self.engine.wait_for_requests_to_drain()
+
+    async def shutdown(self):
+        """Best-effort shutdown for the vLLM server and engine."""
+        if self.node_rank != 0:
+            return
+
+        server_task = getattr(self, "_server_task", None)
+        uvicorn_server = getattr(self, "_uvicorn_server", None)
+        if uvicorn_server is not None:
+            uvicorn_server.should_exit = True
+
+        if server_task is not None and not server_task.done():
+            try:
+                # Let uvicorn/FastAPI drive app lifespan shutdown so AsyncLLM
+                # is finalized exactly once by vLLM's own cleanup hook.
+                await asyncio.wait_for(server_task, timeout=5)
+            except asyncio.TimeoutError:
+                logger.warning("Timed out while waiting for vLLM HTTP server to stop; cancelling the task.")
+                server_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await server_task
+            except Exception:
+                logger.exception("Failed while stopping vLLM HTTP server task")
+        elif server_task is None:
+            engine = getattr(self, "engine", None)
+            if engine is not None:
+                try:
+                    engine.shutdown()
+                except Exception:
+                    logger.exception("Failed to shutdown vLLM engine cleanly without HTTP server task")
 
     async def abort_all_requests(self, reset_prefix_cache: bool = True) -> dict[str, Any]:
         """Abort all ongoing generation requests.
@@ -915,6 +948,19 @@ class vLLMReplica(RolloutReplica):
     async def resume_generation(self):
         """Resume generation on all servers after abort_all_requests."""
         await asyncio.gather(*[server.resume_generation.remote() for server in self.servers])
+
+    async def shutdown(self):
+        """Gracefully stop vLLM servers before releasing Ray actors."""
+        if self.servers:
+            results = await asyncio.gather(
+                *[server.shutdown.remote() for server in self.servers],
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.warning("vLLM server shutdown returned an exception: %s", result)
+
+        await super().shutdown()
 
     async def abort_request(self, request_id: str) -> dict[str, Any]:
         """Abort a specific request. Tries all servers since we don't know which one has it.

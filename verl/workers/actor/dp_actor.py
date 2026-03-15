@@ -21,6 +21,7 @@ import logging
 import os
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.tensor import DTensor
@@ -46,6 +47,100 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _log_dynamic_bsz_diagnostics(
+    *,
+    log_name: str,
+    batch: DataProto,
+    micro_batches: list[DataProto],
+    batch_idx: int | None = None,
+    sync_group=None,
+) -> None:
+    """Log per-rank dynamic batch split counts for a dynamic-bsz operation.
+
+    This is intentionally lightweight and read-only: it does not alter batching or
+    synchronization behavior beyond a tiny object gather for diagnostics.
+    """
+
+    if not dist.is_initialized():
+        return
+
+    sync_group = _get_dynamic_bsz_sync_group(sync_group)
+
+    local_payload = {
+        "rank": dist.get_rank(),
+        "num_micro_batches": len(micro_batches),
+        "local_batch_size": len(batch),
+        "local_token_sum": int(batch.batch["attention_mask"].sum().item()),
+    }
+    if batch_idx is not None:
+        local_payload["mini_batch_idx"] = batch_idx
+    gathered_payloads = [None] * dist.get_world_size(group=sync_group)
+    dist.all_gather_object(gathered_payloads, local_payload, group=sync_group)
+
+    if dist.get_rank(group=sync_group) != 0:
+        return
+
+    gathered_payloads = sorted(gathered_payloads, key=lambda payload: payload["rank"])
+    num_micro_batches_by_rank = {payload["rank"]: payload["num_micro_batches"] for payload in gathered_payloads}
+    local_batch_size_by_rank = {payload["rank"]: payload["local_batch_size"] for payload in gathered_payloads}
+    local_token_sum_by_rank = {payload["rank"]: payload["local_token_sum"] for payload in gathered_payloads}
+    mismatch = len(set(num_micro_batches_by_rank.values())) > 1
+
+    if batch_idx is not None:
+        logger.warning(
+            "%s mini_batch_idx=%s num_micro_batches_by_rank=%s "
+            "local_batch_size_by_rank=%s local_token_sum_by_rank=%s mismatch=%s",
+            log_name,
+            batch_idx,
+            num_micro_batches_by_rank,
+            local_batch_size_by_rank,
+            local_token_sum_by_rank,
+            mismatch,
+        )
+    else:
+        logger.warning(
+            "%s num_micro_batches_by_rank=%s local_batch_size_by_rank=%s "
+            "local_token_sum_by_rank=%s mismatch=%s",
+            log_name,
+            num_micro_batches_by_rank,
+            local_batch_size_by_rank,
+            local_token_sum_by_rank,
+            mismatch,
+        )
+
+
+def _log_dynamic_bsz_update_diagnostics(
+    mini_batch: DataProto,
+    micro_batches: list[DataProto],
+    batch_idx: int,
+    sync_group=None,
+) -> None:
+    _log_dynamic_bsz_diagnostics(
+        log_name="dynamic_bsz_update_diagnostics",
+        batch=mini_batch,
+        micro_batches=micro_batches,
+        batch_idx=batch_idx,
+        sync_group=sync_group,
+    )
+
+
+def _log_dynamic_bsz_compute_log_prob_diagnostics(batch: DataProto, micro_batches: list[DataProto], sync_group=None) -> None:
+    _log_dynamic_bsz_diagnostics(
+        log_name="dynamic_bsz_compute_log_prob_diagnostics",
+        batch=batch,
+        micro_batches=micro_batches,
+        sync_group=sync_group,
+    )
+
+
+def _get_dynamic_bsz_sync_group(sync_group=None):
+    if sync_group is not None:
+        return sync_group
+    if dist.is_initialized():
+        return dist.group.WORLD
+    return None
+
+
 class DataParallelPPOActor(BasePPOActor):
     """FSDP DataParallel PPO Actor or Ref worker
 
@@ -55,11 +150,18 @@ class DataParallelPPOActor(BasePPOActor):
         actor_optimizer (torch.optim.Optimizer, optional): Actor optimizer. Defaults to None.
     """
 
-    def __init__(self, config: ActorConfig, actor_module: nn.Module, actor_optimizer: torch.optim.Optimizer = None):
+    def __init__(
+        self,
+        config: ActorConfig,
+        actor_module: nn.Module,
+        actor_optimizer: torch.optim.Optimizer = None,
+        dynamic_bsz_sync_group=None,
+    ):
         """When optimizer is None, it is Reference Policy"""
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
+        self.dynamic_bsz_sync_group = _get_dynamic_bsz_sync_group(dynamic_bsz_sync_group)
         role = "Ref" if actor_optimizer is None else "Actor"
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
@@ -465,7 +567,16 @@ class DataParallelPPOActor(BasePPOActor):
 
         if use_dynamic_bsz:
             max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
-            micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
+            micro_batches, batch_idx_list = prepare_dynamic_batch(
+                data,
+                max_token_len=max_token_len,
+                dp_group=self.dynamic_bsz_sync_group,
+            )
+            _log_dynamic_bsz_compute_log_prob_diagnostics(
+                batch=data,
+                micro_batches=micro_batches,
+                sync_group=self.dynamic_bsz_sync_group,
+            )
         else:
             micro_batches = data.split(micro_batch_size)
 
@@ -557,7 +668,17 @@ class DataParallelPPOActor(BasePPOActor):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
+                    micro_batches, _ = prepare_dynamic_batch(
+                        mini_batch,
+                        max_token_len=max_token_len,
+                        dp_group=self.dynamic_bsz_sync_group,
+                    )
+                    _log_dynamic_bsz_update_diagnostics(
+                        mini_batch=mini_batch,
+                        micro_batches=micro_batches,
+                        batch_idx=batch_idx,
+                        sync_group=self.dynamic_bsz_sync_group,
+                    )
                 else:
                     self.gradient_accumulation = (
                         self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu

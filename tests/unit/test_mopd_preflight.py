@@ -77,6 +77,7 @@ def test_build_training_command_uses_first_batch_overrides():
     assert "name: disease_state_teacher" in teacher_override
     assert "model_path: '/teachers/disease'" in teacher_override
     assert "log_prob_micro_batch_size: 4" in teacher_override
+    assert "tokenizer_compat_group: 'qwen3-shared'" in teacher_override
 
 
 def test_build_training_command_allows_rollout_n_override():

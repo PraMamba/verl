@@ -1083,3 +1083,34 @@ class AgentLoopManager:
     async def stop_profile(self):
         """Stop profiling on all rollout replicas."""
         await asyncio.gather(*[replica.stop_profile() for replica in self.rollout_replicas])
+
+    @auto_await
+    async def shutdown(self):
+        """Best-effort shutdown for rollout replicas and helper actors."""
+        if getattr(self, "rollout_replicas", None):
+            results = await asyncio.gather(
+                *[replica.shutdown() for replica in self.rollout_replicas],
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.warning("Rollout replica shutdown returned an exception: %s", result)
+
+        for actor in list(getattr(self, "agent_loop_workers", [])):
+            try:
+                ray.kill(actor, no_restart=True)
+            except Exception:
+                logger.exception("Failed to kill agent loop worker during shutdown")
+
+        load_balancer = getattr(self, "global_load_balancer", None)
+        if load_balancer is not None:
+            try:
+                ray.kill(load_balancer, no_restart=True)
+            except Exception:
+                logger.exception("Failed to kill global load balancer during shutdown")
+
+        self.rollout_replicas = []
+        self.agent_loop_workers = []
+        self.server_handles = []
+        self.server_addresses = []
+        self.global_load_balancer = None

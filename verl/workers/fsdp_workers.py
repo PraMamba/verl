@@ -912,8 +912,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self._is_actor:
             actor_cfg = omega_conf_to_dataclass(self.config.actor)
+            actor_dynamic_bsz_sync_group = (
+                self.ulysses_device_mesh.get_group(mesh_dim="dp")
+                if self.ulysses_device_mesh is not None
+                else torch.distributed.group.WORLD
+            )
             self.actor = DataParallelPPOActor(
-                config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
+                config=actor_cfg,
+                actor_module=self.actor_module_fsdp,
+                actor_optimizer=self.actor_optimizer,
+                dynamic_bsz_sync_group=actor_dynamic_bsz_sync_group,
             )
 
         if self._is_rollout:
@@ -957,7 +965,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.config.ref.use_fused_kernels = use_fused_kernels
                 if use_prefix_grouper:
                     self.config.ref.use_prefix_grouper = use_prefix_grouper
-            self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
+            ref_dynamic_bsz_sync_group = (
+                self.ulysses_device_mesh.get_group(mesh_dim="dp")
+                if self.ulysses_device_mesh is not None
+                else torch.distributed.group.WORLD
+            )
+            self.ref_policy = DataParallelPPOActor(
+                config=self.config.ref,
+                actor_module=self.ref_module_fsdp,
+                dynamic_bsz_sync_group=ref_dynamic_bsz_sync_group,
+            )
 
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)

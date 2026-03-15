@@ -273,6 +273,17 @@ class RolloutReplica(ABC):
         """Stop profiling on the replica."""
         await asyncio.gather(*[server.stop_profile.remote() for server in self.servers])
 
+    async def shutdown(self):
+        """Best-effort shutdown for rollout server actors."""
+        for server in list(self.servers):
+            try:
+                ray.kill(server, no_restart=True)
+            except Exception:
+                logger.exception("Failed to kill rollout server actor during shutdown")
+        self.servers.clear()
+        self._server_handle = None
+        self._server_address = None
+
 
 class RolloutReplicaRegistry:
     """Factory for managing rollout replica implementations."""

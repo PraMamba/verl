@@ -19,6 +19,11 @@ verifying all MOPD components work together correctly.
 """
 
 import os
+import re
+import subprocess
+import sys
+from importlib import util
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -29,6 +34,200 @@ from verl import DataProto
 from verl.trainer.ppo.core_algos import get_adv_estimator_fn
 from verl.trainer.ppo.ray_trainer import compute_advantage
 from verl.workers.config.teacher import MOPDConfig, TeacherConfig
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_GENERATED_PPO_CFG = _REPO_ROOT / "verl" / "trainer" / "config" / "_generated_ppo_trainer.yaml"
+_MOPD_E2E_SUCCESS_RE = re.compile(r"\bstep:(?P<step>\d+)\b.*\btraining/global_step:(?P<global_step>\d+)\b")
+
+
+def _build_mopd_e2e_config_from_env() -> OmegaConf:
+    """Build a full trainer config using the recipe's environment-variable contract."""
+    student_model_path = os.environ.get("STUDENT_MODEL_PATH") or os.environ.get("MOPD_TEST_MODEL_PATH", "/models/base")
+    train_files = os.environ.get("TRAIN_FILE") or os.environ.get("MOPD_TEST_TRAIN_FILES", "/data/train.jsonl")
+    val_files = (
+        os.environ.get("TEST_FILE")
+        or os.environ.get("MOPD_TEST_VAL_FILES")
+        or os.environ.get("MOPD_TEST_TRAIN_FILES")
+        or train_files
+    )
+    cell_teacher_path = os.environ.get("CELL_TYPE_TEACHER_PATH")
+    disease_teacher_path = os.environ.get("DISEASE_STATE_TEACHER_PATH")
+    legacy_teacher_path = os.environ.get("MOPD_TEST_TEACHER_PATH", "/models/math-teacher")
+
+    config = OmegaConf.load(_GENERATED_PPO_CFG)
+    config.algorithm.adv_estimator = "mopd"
+    config.algorithm.use_kl_in_reward = False
+    config.algorithm.kl_ctrl.kl_coef = 0.0
+    config.algorithm.mopd.enabled = True
+    config.algorithm.mopd.lambda_val = 1.0
+    config.algorithm.mopd.orm_weight = 0.0
+    config.algorithm.mopd.is_correction = True
+    config.algorithm.mopd.is_epsilon_low = 0.1
+    config.algorithm.mopd.is_epsilon_high = 10.0
+    if cell_teacher_path and disease_teacher_path:
+        config.algorithm.mopd.teachers = [
+            {
+                "name": "cell_type_teacher",
+                "model_path": cell_teacher_path,
+                "resource_pool": "global_pool",
+                "tokenizer_compat_group": "qwen3-shared",
+            },
+            {
+                "name": "disease_state_teacher",
+                "model_path": disease_teacher_path,
+                "resource_pool": "global_pool",
+                "tokenizer_compat_group": "qwen3-shared",
+            },
+        ]
+    else:
+        config.algorithm.mopd.teachers = [
+            {
+                "name": "math",
+                "model_path": legacy_teacher_path,
+                "resource_pool": "global_pool",
+                "tokenizer_compat_group": "qwen3-shared",
+            },
+        ]
+
+    max_prompt_length = int(os.environ.get("MOPD_E2E_MAX_PROMPT_LENGTH", "4096"))
+    max_response_length = int(os.environ.get("MOPD_E2E_MAX_RESPONSE_LENGTH", "128"))
+    max_model_len = max_prompt_length + max_response_length
+    train_batch_size = int(os.environ.get("MOPD_E2E_TRAIN_BATCH_SIZE", "8"))
+
+    config.data.train_files = train_files
+    config.data.val_files = val_files
+    config.data.train_max_samples = int(os.environ.get("MOPD_E2E_TRAIN_MAX_SAMPLES", "8"))
+    config.data.val_max_samples = int(os.environ.get("MOPD_E2E_VAL_MAX_SAMPLES", "8"))
+    config.data.prompt_key = "prompt"
+    config.data.truncation = "left"
+    config.data.max_prompt_length = max_prompt_length
+    config.data.max_response_length = max_response_length
+    config.data.train_batch_size = train_batch_size
+    config.data.return_raw_chat = True
+    config.data.filter_overlong_prompts = True
+    config.data.teacher_id_field = "teacher_id"
+
+    config.actor_rollout_ref.model.path = student_model_path
+    config.actor_rollout_ref.model.use_remove_padding = True
+    config.actor_rollout_ref.model.enable_gradient_checkpointing = True
+    config.actor_rollout_ref.nccl_timeout = int(os.environ.get("MOPD_E2E_NCCL_TIMEOUT_SECONDS", "180"))
+    config.actor_rollout_ref.actor.use_kl_loss = False
+    config.actor_rollout_ref.actor.kl_loss_coef = 0.0
+    config.actor_rollout_ref.actor.optim.lr = 1e-6
+    config.actor_rollout_ref.actor.optim.lr_warmup_steps = 10
+    config.actor_rollout_ref.actor.optim.weight_decay = 0.1
+    config.actor_rollout_ref.actor.ppo_epochs = 1
+    config.actor_rollout_ref.actor.ppo_mini_batch_size = train_batch_size
+    config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu = 1
+    config.actor_rollout_ref.actor.use_dynamic_bsz = True
+    config.actor_rollout_ref.actor.ppo_max_token_len_per_gpu = max_model_len
+    config.actor_rollout_ref.actor.fsdp_config.param_offload = False
+    config.actor_rollout_ref.actor.fsdp_config.optimizer_offload = False
+    config.actor_rollout_ref.actor.entropy_coeff = 0
+    config.actor_rollout_ref.actor.grad_clip = 1.0
+    config.actor_rollout_ref.actor.fsdp_config.fsdp_size = int(os.environ.get("MOPD_E2E_FSDP_SIZE", "2"))
+
+    config.actor_rollout_ref.rollout.n = int(os.environ.get("MOPD_E2E_ROLLOUT_N", "4"))
+    config.actor_rollout_ref.rollout.name = "vllm"
+    config.actor_rollout_ref.rollout.gpu_memory_utilization = float(
+        os.environ.get("MOPD_E2E_ROLLOUT_GPU_MEMORY_UTILIZATION", "0.45")
+    )
+    config.actor_rollout_ref.rollout.max_model_len = max_model_len
+    config.actor_rollout_ref.rollout.calculate_log_probs = True
+    config.actor_rollout_ref.rollout.tensor_model_parallel_size = 1
+    config.actor_rollout_ref.rollout.enable_chunked_prefill = True
+    config.actor_rollout_ref.rollout.max_num_batched_tokens = max_model_len
+    config.actor_rollout_ref.rollout.temperature = 1.0
+    config.actor_rollout_ref.rollout.top_p = 1.0
+    config.actor_rollout_ref.rollout.top_k = -1
+    config.actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu = max_model_len
+    config.actor_rollout_ref.rollout.log_prob_use_dynamic_bsz = True
+
+    config.actor_rollout_ref.ref.log_prob_max_token_len_per_gpu = max_model_len
+    config.actor_rollout_ref.ref.log_prob_use_dynamic_bsz = True
+    config.actor_rollout_ref.ref.fsdp_config.param_offload = False
+
+    config.reward_model.enable = False
+    config.reward_model.reward_manager = "naive"
+    config.custom_reward_function.path = str(_REPO_ROOT / "recipe" / "mopd" / "zero_reward.py")
+    config.custom_reward_function.name = "compute_score"
+
+    config.trainer.logger = ["console"]
+    config.trainer.project_name = os.environ.get("PROJECT_NAME", "RVQ-Alpha_MOPD")
+    config.trainer.experiment_name = os.environ.get("EXP_NAME", "mopd-e2e")
+    config.trainer.n_gpus_per_node = int(os.environ.get("NGPUS_PER_NODE", "4"))
+    config.trainer.nnodes = int(os.environ.get("NNODES", "1"))
+    config.trainer.val_before_train = False
+    config.trainer.test_freq = -1
+    config.trainer.save_freq = -1
+    config.trainer.total_epochs = 1
+    config.trainer.default_local_dir = os.environ.get("MOPD_E2E_CKPTS_DIR", "/tmp/mopd-e2e")
+    config.trainer.resume_mode = "disable"
+    config.trainer.log_val_generations = 0
+
+    return config
+
+
+def _load_mopd_preflight_module():
+    module_path = _REPO_ROOT / "recipe" / "mopd" / "check_mopd_first_batch.py"
+    spec = util.spec_from_file_location("check_mopd_first_batch_for_e2e", module_path)
+    module = util.module_from_spec(spec)
+    assert spec is not None
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _build_mopd_e2e_command_from_env(ckpt_dir: str) -> list[str]:
+    module = _load_mopd_preflight_module()
+    config = module.PreflightConfig(
+        student_model_path=os.environ.get("STUDENT_MODEL_PATH") or os.environ.get("MOPD_TEST_MODEL_PATH", "/models/base"),
+        cell_type_teacher_path=os.environ.get("CELL_TYPE_TEACHER_PATH", os.environ.get("MOPD_TEST_TEACHER_PATH", "/models/math-teacher")),
+        disease_state_teacher_path=os.environ.get(
+            "DISEASE_STATE_TEACHER_PATH", os.environ.get("MOPD_TEST_TEACHER_PATH", "/models/math-teacher")
+        ),
+        train_file=os.environ.get("TRAIN_FILE") or os.environ.get("MOPD_TEST_TRAIN_FILES", "/data/train.jsonl"),
+        val_file=(
+            os.environ.get("TEST_FILE")
+            or os.environ.get("MOPD_TEST_VAL_FILES")
+            or os.environ.get("MOPD_TEST_TRAIN_FILES", "/data/train.jsonl")
+        ),
+        ckpt_dir=ckpt_dir,
+        project_name=os.environ.get("PROJECT_NAME", "RVQ-Alpha_MOPD"),
+        experiment_name=os.environ.get("EXP_NAME", "mopd-e2e"),
+        train_batch_size=int(os.environ.get("MOPD_E2E_TRAIN_BATCH_SIZE", "8")),
+        max_prompt_length=int(os.environ.get("MOPD_E2E_MAX_PROMPT_LENGTH", "4096")),
+        max_response_length=int(os.environ.get("MOPD_E2E_MAX_RESPONSE_LENGTH", "128")),
+        rollout_n=int(os.environ.get("MOPD_E2E_ROLLOUT_N", "4")),
+        teacher_log_prob_micro_batch_size=int(os.environ.get("MOPD_E2E_TEACHER_LOG_PROB_MICRO_BATCH_SIZE", "4")),
+        rollout_gpu_memory_utilization=float(os.environ.get("MOPD_E2E_ROLLOUT_GPU_MEMORY_UTILIZATION", "0.45")),
+        n_gpus_per_node=int(os.environ.get("NGPUS_PER_NODE", "4")),
+        nnodes=int(os.environ.get("NNODES", "1")),
+        fsdp_size=int(os.environ.get("MOPD_E2E_FSDP_SIZE", "2")),
+        ppo_micro_batch_size_per_gpu=1,
+        nccl_timeout_seconds=int(os.environ.get("MOPD_E2E_NCCL_TIMEOUT_SECONDS", "180")),
+        timeout_seconds=int(os.environ.get("MOPD_E2E_TIMEOUT_SECONDS", "1800")),
+    )
+    command = module.build_training_command(config)
+    command.extend(
+        [
+            f"data.train_max_samples={int(os.environ.get('MOPD_E2E_TRAIN_MAX_SAMPLES', '8'))}",
+            f"data.val_max_samples={int(os.environ.get('MOPD_E2E_VAL_MAX_SAMPLES', '8'))}",
+        ]
+    )
+    return command
+
+
+def _mopd_e2e_log_reached_training_step(log_path: Path) -> bool:
+    for line in log_path.read_text(encoding="utf-8").splitlines():
+        match = _MOPD_E2E_SUCCESS_RE.search(line)
+        if match is None:
+            continue
+        if int(match.group("step")) >= 1 and int(match.group("global_step")) >= 1:
+            return True
+    return False
+
 
 # ---------------------------------------------------------------------------
 # Lightweight integration tests (run without GPU or Ray)
@@ -349,6 +548,71 @@ class TestMOPDAdvantageEstimatorRegistry:
         assert isinstance(is_metrics, dict)
 
 
+class TestMOPDE2EEnvContract:
+    """Test that the full GPU E2E path follows the recipe environment contract."""
+
+    def test_build_mopd_e2e_config_prefers_recipe_env_vars(self, monkeypatch):
+        monkeypatch.setenv("STUDENT_MODEL_PATH", "/models/student-from-recipe")
+        monkeypatch.setenv("CELL_TYPE_TEACHER_PATH", "/teachers/cell-from-recipe")
+        monkeypatch.setenv("DISEASE_STATE_TEACHER_PATH", "/teachers/disease-from-recipe")
+        monkeypatch.setenv("TRAIN_FILE", "/data/train-from-recipe.parquet")
+        monkeypatch.setenv("TEST_FILE", "/data/test-from-recipe.parquet")
+        monkeypatch.setenv("MOPD_TEST_MODEL_PATH", "/models/student-from-legacy")
+        monkeypatch.setenv("MOPD_TEST_TEACHER_PATH", "/teachers/legacy")
+        monkeypatch.setenv("MOPD_TEST_TRAIN_FILES", "/data/train-from-legacy.parquet")
+
+        config = _build_mopd_e2e_config_from_env()
+
+        assert config.actor_rollout_ref.model.path == "/models/student-from-recipe"
+        assert config.data.train_files == "/data/train-from-recipe.parquet"
+        assert config.data.val_files == "/data/test-from-recipe.parquet"
+        assert [teacher.name for teacher in config.algorithm.mopd.teachers] == [
+            "cell_type_teacher",
+            "disease_state_teacher",
+        ]
+        assert [teacher.model_path for teacher in config.algorithm.mopd.teachers] == [
+            "/teachers/cell-from-recipe",
+            "/teachers/disease-from-recipe",
+        ]
+
+    def test_build_mopd_e2e_config_falls_back_to_legacy_env_vars(self, monkeypatch):
+        monkeypatch.delenv("STUDENT_MODEL_PATH", raising=False)
+        monkeypatch.delenv("CELL_TYPE_TEACHER_PATH", raising=False)
+        monkeypatch.delenv("DISEASE_STATE_TEACHER_PATH", raising=False)
+        monkeypatch.delenv("TRAIN_FILE", raising=False)
+        monkeypatch.delenv("TEST_FILE", raising=False)
+        monkeypatch.setenv("MOPD_TEST_MODEL_PATH", "/models/student-from-legacy")
+        monkeypatch.setenv("MOPD_TEST_TEACHER_PATH", "/teachers/legacy")
+        monkeypatch.setenv("MOPD_TEST_TRAIN_FILES", "/data/train-from-legacy.parquet")
+
+        config = _build_mopd_e2e_config_from_env()
+
+        assert config.actor_rollout_ref.model.path == "/models/student-from-legacy"
+        assert config.data.train_files == "/data/train-from-legacy.parquet"
+        assert config.data.val_files == "/data/train-from-legacy.parquet"
+        assert [teacher.name for teacher in config.algorithm.mopd.teachers] == ["math"]
+        assert [teacher.model_path for teacher in config.algorithm.mopd.teachers] == ["/teachers/legacy"]
+
+
+class TestMOPDE2ESuccessContract:
+    """Test the success predicate for the full GPU E2E subprocess."""
+
+    def test_log_reports_success_when_first_training_step_is_reached(self, tmp_path):
+        log_path = tmp_path / "mopd-e2e.log"
+        log_path.write_text(
+            "step:1 - actor/pg_loss:2.10 - training/global_step:1 - perf/time_per_step:61.3\n",
+            encoding="utf-8",
+        )
+
+        assert _mopd_e2e_log_reached_training_step(log_path) is True
+
+    def test_log_reports_failure_when_training_step_is_missing(self, tmp_path):
+        log_path = tmp_path / "mopd-e2e.log"
+        log_path.write_text("TaskRunner initialized but no optimization step completed\n", encoding="utf-8")
+
+        assert _mopd_e2e_log_reached_training_step(log_path) is False
+
+
 # ---------------------------------------------------------------------------
 # Full E2E test (requires GPU + Ray + model weights)
 # ---------------------------------------------------------------------------
@@ -365,7 +629,7 @@ _MOPD_E2E_ENABLED = os.environ.get("VERL_MOPD_E2E", "0") == "1"
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.skipif(not _MOPD_E2E_ENABLED, reason="Set VERL_MOPD_E2E=1 to run full E2E test")
-def test_mopd_training_e2e():
+def test_mopd_training_e2e(tmp_path):
     """Test full MOPD training loop with actual model workers.
 
     This test requires:
@@ -381,55 +645,42 @@ def test_mopd_training_e2e():
     - Training completes at least one step
 
     To run:
-        VERL_MOPD_E2E=1 MOPD_TEST_MODEL_PATH=/path/to/model \\
-        MOPD_TEST_TEACHER_PATH=/path/to/teacher \\
+        VERL_MOPD_E2E=1 STUDENT_MODEL_PATH=/path/to/model \\
+        CELL_TYPE_TEACHER_PATH=/path/to/cell-teacher \\
+        DISEASE_STATE_TEACHER_PATH=/path/to/disease-teacher \\
+        TRAIN_FILE=/path/to/train.parquet TEST_FILE=/path/to/test.parquet \\
         pytest tests/integration/test_mopd_e2e.py::test_mopd_training_e2e -v
     """
-    import ray
+    ckpt_dir = tmp_path / "mopd-e2e"
+    log_file = tmp_path / "mopd-e2e.log"
+    command = _build_mopd_e2e_command_from_env(str(ckpt_dir))
+    env = os.environ.copy()
+    env.setdefault("HYDRA_FULL_ERROR", "1")
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    env.setdefault("RAY_DEDUP_LOGS", "0")
 
-    from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+    with log_file.open("w", encoding="utf-8") as handle:
+        result = subprocess.run(
+            command,
+            cwd=str(_REPO_ROOT),
+            env=env,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=int(os.environ.get("MOPD_E2E_TIMEOUT_SECONDS", "1800")),
+            check=False,
+        )
 
-    model_path = os.environ.get("MOPD_TEST_MODEL_PATH", "/models/base")
-    teacher_path = os.environ.get("MOPD_TEST_TEACHER_PATH", "/models/math-teacher")
-    train_files = os.environ.get("MOPD_TEST_TRAIN_FILES", "/data/train.jsonl")
+    if result.returncode != 0:
+        log_tail = "\n".join(log_file.read_text(encoding="utf-8").splitlines()[-60:])
+        pytest.fail(
+            "GPU E2E command failed with exit code "
+            f"{result.returncode}. Log tail:\n{log_tail}"
+        )
 
-    config = OmegaConf.create(
-        {
-            "algorithm": {
-                "adv_estimator": "mopd",
-                "use_kl_in_reward": False,
-                "ppo_epochs": 1,
-                "mopd": {
-                    "enabled": True,
-                    "lambda_val": 1.0,
-                    "orm_weight": 0.0,
-                    "is_correction": True,
-                    "is_epsilon_low": 0.1,
-                    "is_epsilon_high": 10.0,
-                    "teachers": [
-                        {
-                            "name": "math",
-                            "model_path": teacher_path,
-                            "resource_pool": "global_pool",
-                        },
-                    ],
-                },
-            },
-            "trainer": {"total_epochs": 1},
-            "actor_rollout_ref": {"actor": {"use_kl_loss": False}},
-            "model": {"path": model_path},
-            "data": {"train_files": train_files},
-        }
-    )
-
-    if not ray.is_initialized():
-        ray.init(num_cpus=4, num_gpus=torch.cuda.device_count())
-
-    try:
-        trainer = RayPPOTrainer(config=config)
-        trainer.init_workers()
-        trainer.fit()
-        assert trainer.global_steps > 0
-    finally:
-        if ray.is_initialized():
-            ray.shutdown()
+    if not _mopd_e2e_log_reached_training_step(log_file):
+        log_tail = "\n".join(log_file.read_text(encoding="utf-8").splitlines()[-60:])
+        pytest.fail(
+            "GPU E2E command exited successfully but did not report a completed training step. "
+            f"Log tail:\n{log_tail}"
+        )

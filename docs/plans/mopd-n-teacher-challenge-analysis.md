@@ -1,264 +1,424 @@
 # 当前分支 MOPD 实现如何应对 N-Teacher 扩展挑战
 
-## 分析范围
+## 分析边界
 
-本文基于以下材料交叉分析：
+本文只以当前 worktree 的源码、脚本、测试和同仓文档为依据，不复用旧版双教师实现的结论；这里的
+“当前”包含 worktree 中尚未提交的跟进改动。
 
-- 外部挑战文档：`/home/scbjtfy/G-OPD/docs/analysis/n-teacher-extension-challenges.md`
+本次交叉核对的主要材料：
+
+- 挑战来源：`/home/scbjtfy/G-OPD/docs/analysis/n-teacher-extension-challenges.md`
 - 论文笔记：`/home/scbjtfy/Paper_Reading/MiMo-V2-Flash/MOPD.md`
 - 论文笔记：`/home/scbjtfy/Paper_Reading/MiMo-V2-Flash/MOPD-1.md`
-- 论文分析：`/home/scbjtfy/Paper_Reading/MiMo-V2-Flash/analysis.md`
-- 当前分支源码与测试：`verl/`, `recipe/mopd/`, `tests/`
+- 当前分支源码：`verl/`, `recipe/mopd/`, `tests/`
+- 当前分支验证记录：`docs/plans/mopd-test-results.md`
 
-这份文档回答的问题不是“旧的双教师 G-OPD 代码为什么难扩展”，而是：
+> 说明：文中“trainer 侧多教师 worker graph”是对当前实现的描述性概括，不是代码里的正式命名。
+
+本文要回答三件事：
 
 1. 当前分支为了落地 MOPD，实际上采用了什么新架构。
-2. 这套新架构逐项怎样绕开、缓解、或者彻底解决 `n-teacher-extension-challenges.md` 里列出的 12 个挑战。
-3. 哪些挑战当前已经解决，哪些只是部分缓解，哪些其实还没有真正解决。
+2. 这套架构如何逐项绕开、缓解或解决旧文档列出的 12 个 N-teacher 挑战。
+3. 哪些挑战已经解决，哪些只是部分缓解，哪些还不能算彻底解决。
 
 ---
 
-## 总结结论
+## 结论摘要
 
-当前分支实现 MOPD 的核心思路，不是继续在旧的“单个 actor/ref worker 内部塞更多教师插槽”的 G-OPD 双教师架构上打补丁，而是做了一个更关键的架构转向：
+当前分支没有沿着旧的“双教师塞进单个 actor/ref worker 内部插槽”路线继续打补丁，而是把教师提升成
+trainer/controller 侧的显式 worker graph：
 
-- 把“教师”从 actor 内部硬编码的模型槽位，提升成 `algorithm.mopd.teachers` 里的显式配置对象。
-- 把“教师执行”从单 worker 内部的多模型切换，改成 trainer 侧维护的多个独立 `RefPolicy` worker group。
-- 把“教师选择”从 `dp_actor.py` 里的 `"math"` / `"code"` if/elif，改成 batch 中 `teacher_id` 驱动的按样本子批路由。
-- 把“蒸馏优势”从 actor 内部覆盖式逻辑，改成 `core_algos.py` 里独立注册的 `mopd` advantage estimator。
+- 配置层：`algorithm.mopd.teachers[]` 成为教师声明入口，`algorithm.mopd` 负责算法级参数，
+  见 `verl/trainer/config/ppo_trainer.yaml:41-42`、`verl/trainer/config/algorithm/mopd.yaml:1-51`。
+- 数据层：数据集和 recipe 明确传递 `teacher_id`，必要时保留 `raw_prompt` 以支持异构 tokenizer
+  教师，见 `verl/utils/dataset/rl_dataset.py:349-375`、`recipe/mopd/prepare_data.py:53-71`。
+- 控制层：`RayPPOTrainer` 维护 `self.teacher_wgs: dict[str, RayWorkerGroup]`，并在 ExOPD 模式下额外维护
+  `self.base_policy_wg`，见 `verl/trainer/ppo/ray_trainer.py:347-349`、`1462-1535`。
+- 执行层：兼容 tokenizer 的教师走 token-level `teacher_log_prob` 路径；异构 tokenizer 的教师走
+  `teacher_seq_reward` 路径；两条路径都由 trainer 侧按 `teacher_id` 路由，见
+  `verl/trainer/ppo/ray_trainer.py:913-1042`、`1912-2035`。
+- 算法层：`compute_mopd_advantage()` 显式组合 token-level MOPD、ExOPD base normalization、
+  sequence teacher signal、ORM 和 IS correction，见
+  `verl/trainer/ppo/core_algos.py:1012-1193`。
 
-这意味着当前分支解决 N-teacher 扩展问题的主线，不是“把旧双教师逻辑泛化”，而是“把教师身份外置到 trainer 层，做配置化、worker 化、路由化、算法注册化”。
+换句话说，当前分支真正落地的是：
 
-如果把 12 个挑战按状态划分，当前分支大致是：
+**“配置化 teacher 声明 + trainer 侧 teacher worker graph + per-sample teacher 路由 +
+dual-path teacher signal（token log prob / sequence reward）+ 独立的 MOPD advantage estimator”**
 
-| 挑战 | 状态 | 结论 |
+而不是旧双教师实现的泛化版。
+
+### 12 个挑战的当前状态
+
+| 挑战 | 状态 | 当前结论 |
 |---|---|---|
-| 挑战 1 模型插槽二值化硬编码 | ✅ 已完全解决 | 通过独立 teacher worker groups 绕开单 worker 多插槽设计 |
-| 挑战 2 GPU/CPU 内存线性增长 | ⚠️ 部分解决 | 有工程缓解（资源池、micro-batch、量化后端），但没有改变线性增长本质 |
-| 挑战 3 顺序推理时间瓶颈 | ⚠️ 部分解决 | 解决了”全批次全教师”浪费，支持资源池隔离，但仍串行执行 |
-| 挑战 4 配置系统语义重载 | ✅ 已完全解决 | 引入专门的 `algorithm.mopd` 配置树与 dataclass，带完整验证 |
-| 挑战 5 教师路由硬编码字符串匹配 | ✅ 已完全解决 | 改成数据驱动的 `teacher_id -> teacher_wg` 路由，fail-fast 验证 |
-| 挑战 6 Batch Pop/Restore 脆弱模式 | ✅ 已完全解决 | 改成 `select_idxs()` 子批视图，不再原地改 batch |
-| 挑战 7 分词器单一假设 | ✅ 已完全解决 | 支持 `tokenizer_policy`（compatible/sequence_reward）+ 异构 tokenizer 验证 |
-| 挑战 8 全局 lambda 无法适配异构教师 | ✅ 已完全解决 | 支持 per-teacher `lambda_val` 覆盖 + batch lambda tensor 构建 |
-| 挑战 9 数据管道缺少验证 | ⚠️ 部分解决 | 有 preflight fail-fast 校验 + tokenizer 兼容性验证，但缺数据集级统计 |
-| 挑战 10 优势函数覆盖式计算与浪费 | ✅ 已完全解决 | MOPD advantage 已成为独立注册 estimator |
-| 挑战 11 检查点与恢复缺失 | ⚠️ 部分解决 | 有 manifest 序列化 + 语义漂移检测，但 checkpoint 未完全自描述 |
-| 挑战 12 测试基础设施空白 | ✅ 已基本解决 | 已补 unit/integration/preflight 多层测试（97+ 测试用例），缺长程 GPU E2E |
+| 1. 模型插槽二值化硬编码 | 已解决 | 教师不再是 actor/ref worker 内部槽位，而是 trainer 维护的独立 worker group |
+| 2. GPU/CPU 内存线性增长 | 部分缓解 | 有 shared base、量化 backend、resource pool、micro-batch 缓解，但总体仍随教师数近似线性增长 |
+| 3. 顺序推理时间瓶颈 | 部分缓解 | 已支持“跨 pool 重叠、同 pool 串行”的调度；默认 recipe 仍把两个教师放在同一 `global_pool` |
+| 4. 配置系统语义重载 | 已解决 | `algorithm.mopd` 成为显式配置树，不再借用 `base_model_path` 之类字段偷塞教师 |
+| 5. 教师路由硬编码字符串匹配 | 已解决 | 改为 `teacher_id -> teacher_wg` 的数据驱动路由，未知 teacher fail-fast |
+| 6. Batch Pop/Restore 脆弱模式 | 已解决 | 改为 `select_idxs()` 子批 + `pad/unpad` + scatter，不再原地 pop/restore 全局 batch |
+| 7. 分词器单一假设 | 部分缓解 | 兼容 tokenizer 可走 token-level；异构 tokenizer 可走 `sequence_reward`，但不是通用 token-level 方案 |
+| 8. 全局 lambda 无法适配异构教师 | 已解决 | 支持 per-teacher `lambda_val`，并在 batch 内构造 per-sample lambda tensor |
+| 9. 数据管道缺少验证 | 已解决 | 增加 `teacher_id` 提取、preflight 分布统计、unknown/missing teacher fail-fast、recipe 侧 teacher_id 注入 |
+| 10. 优势函数覆盖式计算与浪费 | 已解决 | MOPD 成为独立注册 estimator，不再在 actor 侧覆盖已有优势 |
+| 11. 检查点与恢复缺失 | 部分缓解 | 有 manifest 持久化和 drift 检测，但 checkpoint 仍不自包含 teacher/base artifacts |
+| 12. 测试基础设施空白 | 已解决 | 已有 unit/integration/preflight/GPU E2E 多层覆盖；但长程稳定性、多节点和故障恢复仍未充分验证 |
 
-**实现完整度评估：95%**
-
-当前分支已经把 MOPD 从双教师 ad-hoc 逻辑重构成生产就绪的 N-teacher 主链路，核心功能全部实现：
-- ✅ 标准 MOPD（MiMo 论文 Eq. 7-9）
-- ✅ ExOPD with base normalization（完整实现，含 base worker + base log prob 计算）
-- ✅ Per-teacher lambda overrides（`TeacherConfig.lambda_val` + batch lambda tensor）
-- ✅ 异构 tokenizer 支持（tokenizer_policy + sequence_reward fallback）
-- ✅ IS correction with overflow protection
-- ✅ ORM mixing
-- ✅ Resource pool management + 量化后端（hf_int8/hf_4bit）
-- ✅ Checkpoint manifest + drift detection
-- ✅ 综合测试覆盖（config/data/routing/advantage/integration）
-
-剩余 5% 主要是工程优化空间（teacher 并行化、数据集统计、checkpoint 完全自描述）而非核心功能缺失。
+严格按“彻底解决”的标准看，当前仍不能算完全收口的主要是 **2 / 3 / 7 / 11**。
+其余挑战在当前实现里已经不再是旧文档描述的那个问题。
 
 ---
 
-## 当前分支的 MOPD 主执行链路
+## 当前分支的真实架构
 
-理解这条链路之后，再看 12 个挑战会非常清楚。
+### 1. 配置入口已经迁移到 `algorithm.mopd`
 
-### 1. 配置入口
+MOPD 不是靠重载原有字段拼出来的，而是通过 Hydra defaults 显式挂到 `algorithm.mopd` 下：
 
-`verl/trainer/config/ppo_trainer.yaml:38-42` 已经把 `mopd` 作为标准 trainer 配置的一部分挂入 defaults：
+- `verl/trainer/config/ppo_trainer.yaml:41-42`
+- `verl/trainer/config/algorithm/mopd.yaml:1-51`
 
-- `algorithm@algorithm.mopd: mopd`
+`TeacherConfig` / `TeacherResourcePoolConfig` / `MOPDConfig` 定义了教师、教师资源池和 MOPD 算法参数：
 
-`verl/trainer/config/algorithm/mopd.yaml:1-36` 定义了专门的 MOPD 配置子树：
+- `verl/workers/config/teacher.py:23-77`
+- `verl/workers/config/teacher.py:80-105`
+- `verl/workers/config/teacher.py:108-162`
 
-- `enabled`
-- `teachers`
+当前真正被运行时代码消费的关键字段包括：
+
+- `teachers[].name`
+- `teachers[].model_path`
+- `teachers[].backend`
+- `teachers[].resource_pool`
+- `teachers[].log_prob_micro_batch_size`
+- `teachers[].lambda_val`
+- `teachers[].tokenizer_path`
+- `teachers[].tokenizer_compat_group`
+- `teachers[].tokenizer_policy`
+- `teachers[].seq_reward_weight`
+- `algorithm.mopd.lambda_val`
+- `algorithm.mopd.orm_weight`
+- `algorithm.mopd.is_correction`
+- `algorithm.mopd.is_epsilon_low/high`
+- `algorithm.mopd.use_base_normalization`
+- `algorithm.mopd.base_model_path`
+- `algorithm.mopd.resource_pools`
+
+同时也要区分“schema 已声明”和“运行时已真正接线”：
+
+- `TeacherConfig.weight` 目前还只是保留字段，当前主链路没有按 teacher weight 做加权聚合，
+  `verl/workers/config/teacher.py:31` 已明确标注 “unused in current impl”。
+- `TeacherConfig.base_model_path` 也存在于 schema 中，但当前 ExOPD 实际消费的是全局
+  `algorithm.mopd.base_model_path` 这一条 shared base 配置，而不是 per-teacher base。
+
+这里还有一个必须单独点出来的现实细节：
+
+- `TeacherConfig`/`MOPDConfig` 确实存在，并实现了 `__post_init__` 校验，见
+  `verl/workers/config/teacher.py:55-77`、`137-162`。
+- 但当前 trainer 主路径并没有把 `config.algorithm.mopd` 统一实例化成 `MOPDConfig`；
+  `validate_config()` 只显式实例化了 actor/critic，而没有实例化 MOPD 配置，见
+  `verl/utils/config.py:149-175`。
+- 同时 `AlgoConfig` 自身也没有显式 `mopd` 字段，见 `verl/trainer/config/algorithm.py:567-614`。
+
+这意味着：
+
+- “配置语义重载”已经解决。
+- “typed config 全链路统一接线”还没有完全收尾。
+
+### 2. 数据契约是 `teacher_id`，不是旧实现里的隐式教师字符串
+
+当前数据管线里的教师身份信号是显式的 `teacher_id`：
+
+- `RLHFDataset` 读取 `teacher_id_field` 配置，见 `verl/utils/dataset/rl_dataset.py:106-116`
+  和 `349-375`。
+- `collate_fn()` 会把非 tensor 字段放进 `np.ndarray(dtype=object)`，因此 `teacher_id`
+  和 `raw_prompt` 都能进入 `batch.non_tensor_batch`，见 `verl/utils/dataset/rl_dataset.py:40-68`。
+
+recipe 侧也不再假设用户自己手工维护这个字段，而是明确生成它：
+
+- teacher 名称映射：`recipe/mopd/prepare_data.py:53-57`
+- 注入 `teacher_id`：`recipe/mopd/prepare_data.py:60-71`
+- 打印训练集/测试集 teacher 分布：`recipe/mopd/prepare_data.py:214-229`
+
+当前生产 recipe 会把 `teacher_id_field` 打开：
+
+- `recipe/mopd/run_mopd_qwen3_4b.sh:166`
+- `recipe/mopd/check_mopd_first_batch.py:124`
+
+这意味着 trainer 不再需要在热路径里猜“这条样本应该走 math 还是 code”。
+
+### 3. 新的核心不是“多模型插槽”，而是 trainer 侧 teacher worker graph
+
+`RayPPOTrainer` 在初始化时显式持有：
+
+- `self.teacher_wgs: dict[str, RayWorkerGroup]`
+- `self.base_policy_wg: Optional[RayWorkerGroup]`
+
+见 `verl/trainer/ppo/ray_trainer.py:347-349`。
+
+教师 worker 的创建不是通过扩展 `Role` 枚举完成的，而是 `init_workers()` 在标准 actor / critic / ref
+初始化完之后，再额外循环 `self.config.algorithm.mopd.teachers` 创建：
+
+- shared base worker：`verl/trainer/ppo/ray_trainer.py:1470-1487`
+- legacy ref teacher：`verl/trainer/ppo/ray_trainer.py:1493-1507`
+- quantized teacher：`verl/trainer/ppo/ray_trainer.py:1508-1514`
+- 写入 `self.teacher_wgs[name]`：`verl/trainer/ppo/ray_trainer.py:1529-1542`
+
+这点很关键，因为它说明当前分支的设计不是：
+
+- 在 `Role` 里增加 `Teacher1` / `Teacher2` / `Teacher3`
+- 在 `fsdp_workers.py` 里加更多模型成员变量
+- 在 actor worker 里加更多 `compute_teacher_k_log_prob()`
+
+而是：
+
+- 一个 teacher = 一个独立 worker group
+- 多教师 = `dict[str, RayWorkerGroup]`
+- 教师 identity = `teacher.name` + `teacher_id`
+
+### 4. teacher backend 已经分成两条实现路径
+
+当前并不是所有教师都复用一个 ref worker：
+
+#### 4.1 `legacy_ref`
+
+兼容 tokenizer 的教师可以复用现有 ref worker 路径：
+
+- 构造 teacher config：`verl/trainer/ppo/ray_trainer.py:719-740`
+- 本质上仍调用 `compute_ref_log_prob`
+
+这个路径的特点是：
+
+- 仍然走 token-level teacher log prob
+- 仍要求 student 和 teacher 的 token contract 兼容
+- ref worker 使用固定 per-teacher micro-batch，而不是全局 dynamic ref path
+
+#### 4.2 `hf_int8` / `hf_4bit`
+
+量化教师使用专门的 `HFQuantizedTeacherWorker`：
+
+- 类定义：`verl/workers/teacher_workers.py:34-262`
+- BitsAndBytes 量化配置：`verl/workers/teacher_workers.py:76-91`
+- token-level `compute_ref_log_prob`：`verl/workers/teacher_workers.py:183-210`
+- sequence-level `compute_seq_scores`：`verl/workers/teacher_workers.py:212-262`
+
+这个 dedicated worker 的意义是：
+
+- 它不依赖 legacy ref worker 的 FSDP 初始化路径
+- 它可以支持量化推理后端
+- 它既能算 token-level log prob，也能算 sequence-level score
+
+#### 4.3 shared base worker
+
+ExOPD 不是给每个教师配一个 base，而是用一个 shared base worker：
+
+- config builder：`verl/trainer/ppo/ray_trainer.py:757-766`
+- worker 初始化：`verl/trainer/ppo/ray_trainer.py:1470-1487`
+- base log prob 计算：`verl/trainer/ppo/ray_trainer.py:798-814`
+
+这降低了旧分析里“每新增一个教师就再多一个 base 模型”的复杂度，但也意味着当前实现假设
+**所有教师共享同一个 `algorithm.mopd.base_model_path`**。
+
+### 5. teacher signal 已经分成两条独立数据流
+
+当前分支不是“只有一个 `teacher_log_prob` 张量”的单一路径。
+
+#### 5.1 compatible teacher：token-level log prob
+
+trainer 先按 `teacher_id` 分组构造 sub-batch job：
+
+- `verl/trainer/ppo/ray_trainer.py:913-972`
+
+然后 `_compute_teacher_log_probs()`：
+
+- 只挑 `tokenizer_policy == "compatible"` 的教师，见
+  `verl/trainer/ppo/ray_trainer.py:1933-1934`
+- 为每个 resource pool 先提交一个异步 job，见
+  `verl/trainer/ppo/ray_trainer.py:1944-1954`
+- 同一 pool 内串行接续，下一个 job 在上一个 `get()` 之后再发，见
+  `verl/trainer/ppo/ray_trainer.py:1956-1967`
+- 结果 scatter 回统一的 `[batch, response_len] teacher_log_prob` 张量，见
+  `verl/trainer/ppo/ray_trainer.py:1912-1969`
+
+#### 5.2 sequence teacher：raw prompt + decoded response text
+
+异构 tokenizer 教师不走 token alignment，而是走 sequence reward：
+
+- 先用 student tokenizer decode `responses`，见
+  `verl/trainer/ppo/ray_trainer.py:974-978`
+- 要求 batch 中必须保留 `raw_prompt`，见 `verl/trainer/ppo/ray_trainer.py:980-982`
+- 构造 `response_text` + `raw_prompt` 子任务，见 `verl/trainer/ppo/ray_trainer.py:999-1042`
+- teacher worker 在本地重新套 chat template、重新 tokenize、计算 response span 的平均 log prob，
+  见 `verl/workers/teacher_workers.py:127-157`、`212-254`
+- trainer 把结果写回：
+  - `teacher_seq_reward`
+  - `teacher_seq_weight`
+  - `teacher_token_mask`
+  见 `verl/trainer/ppo/ray_trainer.py:1971-2035`
+
+这条路径还有两个很重要的边界：
+
+- `sequence_reward` 只能配 dedicated quantized teacher backend；legacy ref backend 会直接报错，
+  见 `verl/trainer/ppo/ray_trainer.py:1496-1501`
+- 它给的是 **sequence-level scalar signal**，不是跨 tokenizer 的 token-level exact reverse KL
+
+### 6. MOPD 已经是独立算法节点，而不是 actor 内的特判
+
+`compute_advantage()` 会把 MOPD 相关字段统一从 batch 转交给 estimator：
+
+- `teacher_log_prob` / `old_log_probs` / `rollout_log_probs` / `base_log_prob`
 - `lambda_val`
-- `orm_weight`
-- `is_correction`
-- `is_epsilon_low`
-- `is_epsilon_high`
-- `use_base_normalization`
-- `base_model_path`
+- `teacher_seq_reward` / `teacher_seq_weight` / `teacher_token_mask`
+- `orm_weight` / `is_correction` / epsilon bounds
 
-`verl/workers/config/teacher.py:23-105` 则把这组字段实体化为两个 dataclass：
+见 `verl/trainer/ppo/ray_trainer.py:137-259`。
 
-- `TeacherConfig`
-- `MOPDConfig`
+真正的 MOPD 公式在 `compute_mopd_advantage()` 里：
 
-其中：
+- sequence teacher advantage：`verl/trainer/ppo/core_algos.py:1012-1039`
+- 主 estimator：`verl/trainer/ppo/core_algos.py:1042-1193`
 
-- `TeacherConfig` 负责单教师的 `name/model_path/resource_pool/log_prob_micro_batch_size`
-- `MOPDConfig` 负责多教师集合和全局算法参数
+当前 estimator 明确做了四件事：
 
-这一步已经把“教师”从旧代码里的隐式命名约定，提升成了显式 schema。
+1. token-level MOPD 或 ExOPD：
+   `verl/trainer/ppo/core_algos.py:1100-1107`
+2. IS correction + clamp + all-masked fallback：
+   `verl/trainer/ppo/core_algos.py:1109-1137`
+3. sequence teacher signal：
+   `verl/trainer/ppo/core_algos.py:1139-1168`
+4. ORM mixing：
+   `verl/trainer/ppo/core_algos.py:1170-1185`
 
-### 2. 数据入口
+sequence teacher 样本不会错误地再吃到 token-level MOPD，因为：
 
-`RLHFDataset` 在 `verl/utils/dataset/rl_dataset.py:139` 读取 `teacher_id_field` 配置。
+- trainer 对 sequence teacher 样本写入 `teacher_token_mask = response_mask`
+- estimator 先构造 `seq_token_mask`
+- 再用 `token_teacher_mask = 1 - seq_token_mask` 将 `A_mopd` 清零
 
-在 `verl/utils/dataset/rl_dataset.py:371-374`，如果配置了该字段，就从数据行里抽出 `teacher_id`：
+见 `verl/trainer/ppo/ray_trainer.py:2013-2019` 和
+`verl/trainer/ppo/core_algos.py:1085-1108`。
 
-- 存在就写入 `row_dict["teacher_id"]`
-- 不存在则回退为 `"default"`
+### 7. 资源池、preflight、manifest 和测试已经成为架构的一部分
 
-`collate_fn()` 在 `verl/utils/dataset/rl_dataset.py:40-68` 会把字符串类非 tensor 字段放进 `np.ndarray(dtype=object)`，因此 `teacher_id` 会进入 `batch.non_tensor_batch`。
+#### 7.1 resource pools
 
-更进一步，当前 recipe 已经把“teacher_id 写入数据集”这一步也脚本化了，而不是要求用户手工准备脆弱字段：
+`TaskRunner.init_resource_pool_mgr()` 会把 MOPD teacher pools 纳入 resource pool spec，并按
+actor / critic / ref / teachers / optional base worker 的实际 colocate 数需求抬高
+`max_colocate_count`，见 `verl/trainer/main_ppo.py:220-287`。
 
-- 生产数据脚本中的 teacher mapping：`recipe/mopd/prepare_data.py:53-57`
-- 生产数据脚本中的 `add_teacher_id()`：`recipe/mopd/prepare_data.py:60-72`
-- smoke 数据脚本中的 `add_teacher_id()` 与 teacher 分布打印：`recipe/mopd/build_mopd_smoke_data.py:41-66`
+#### 7.2 preflight
 
-此外，trainer 在 generation 阶段不会把 `teacher_id` 丢掉。`_get_gen_batch()` 在 `verl/trainer/ppo/ray_trainer.py:503-508` 的 `reward_keys` 白名单里显式保留了 `teacher_id`。
+在真正初始化 worker 前，trainer 会先做：
 
-这意味着教师路由的“身份信号”已经进入了标准数据管线，而不是藏在 `extra_info.opd_teacher` 里由后续逻辑硬猜。
+- `teacher_id` 分布统计：`verl/trainer/ppo/ray_trainer.py:1250-1251`
+- unknown teacher 检查：`1253-1260`
+- “全是 default”检查：`1262-1266`
+- missing teacher 检查：`1268-1272`
+- tokenizer 兼容性检查：`1177-1244`
 
-### 3. Teacher worker 初始化
+并且 MOPD 会强制 `ppo_epochs == 1`，防止 teacher advantage 跨 PPO epoch 过期，
+见 `verl/trainer/ppo/ray_trainer.py:1544-1552`。
 
-`RayPPOTrainer` 在 `verl/trainer/ppo/ray_trainer.py:703-715` 通过 `_build_teacher_worker_config()` 为每个教师复制一份 `actor_rollout_ref` 配置，然后覆写：
+#### 7.3 manifest
 
-- `model.path = teacher_cfg.model_path`
-- `ref.log_prob_use_dynamic_bsz = False`
-- `ref.log_prob_micro_batch_size = None`
-- `ref.log_prob_micro_batch_size_per_gpu = teacher_cfg.log_prob_micro_batch_size`
+checkpoint 现在会把 MOPD manifest 一起写出并在恢复时检查 drift：
 
-随后在 `verl/trainer/ppo/ray_trainer.py:839-884`：
+- 写 manifest：`verl/trainer/ppo/ray_trainer.py:1657-1667`
+- 读 manifest：`1685-1718`
+- manifest 内容：`1276-1329`
 
-- 检查 MOPD 是否启用
-- 要求必须存在 `Role.RefPolicy`
-- 循环 `for teacher_cfg in self.config.algorithm.mopd.teachers`
-- 为每个 teacher 单独创建 `RayWorkerGroup`
-- 将其存入 `self.teacher_wgs[teacher_cfg.name]`
+semantic manifest 里已经记录：
 
-这里最关键的一点是：当前分支没有去扩展 `Role` 枚举，也没有在 actor worker 内部增加 `teacher3/teacher4/...` 模型槽位，而是重用了现有的 `RefPolicy` worker 实现，手工创建了多个 teacher worker groups。
+- global lambda / orm / IS bounds / base normalization
+- 每个 teacher 的 `name/model_path/lambda_val/backend/tokenizer_* / seq_reward_weight`
 
-### 4. 训练时的按样本路由
+deployment manifest 里记录：
 
-训练主循环在 `verl/trainer/ppo/ray_trainer.py:1616-1629` 的行为是：
+- teacher resource pools
+- per-teacher `resource_pool`
+- per-teacher `log_prob_micro_batch_size`
 
-- 如果存在 `teacher_wgs`
-- 则调用 `_compute_teacher_log_probs(batch)`
-- 将结果写入 `batch.batch["teacher_log_prob"]`
-- 如果还同时启用了 KL loss 或 KL-in-reward，再额外计算常规 `ref_log_prob`
+#### 7.4 tests
 
-`_compute_teacher_log_probs()` 的核心逻辑在 `verl/trainer/ppo/ray_trainer.py:1227-1315`：
+当前不再是“多教师逻辑没有测试”：
 
-- 从 `batch.non_tensor_batch["teacher_id"]` 取每个样本的 teacher name
-- 对未知 teacher id 做 fail-fast 校验
-- 先分配一个 `[batch_size, response_len]` 的 `teacher_log_probs` 张量
-- 按 teacher 分组
-- 用 `batch.select_idxs(indices)` 选出该 teacher 的 routed sub-batch
-- 对 sub-batch 重新 balance
-- 对 sub-batch 做 DP divisibility padding
-- 调用对应 teacher worker 的 `compute_ref_log_prob`
-- 再把结果 scatter 回整批 `teacher_log_probs`
+- 路由调度：`tests/unit/test_teacher_routing.py`
+- 配置：`tests/unit/test_teacher_config.py`
+- trainer 运行时：`tests/unit/test_mopd_trainer_runtime.py`
+- advantage：`tests/unit/test_mopd_advantage.py`
+- teacher worker：`tests/unit/test_teacher_workers.py`
+- preflight：`tests/unit/test_mopd_preflight.py`
+- resource pools：`tests/unit/test_mopd_resource_pools.py`
+- E2E：`tests/integration/test_mopd_e2e.py`
 
-这就是当前分支的 N-teacher 核心。
+而且当前 worktree 的最新验证记录已经明确区分了“重新执行”和“仅源码复核”两类边界：
 
-### 5. 蒸馏优势计算
+- core CPU-safe MOPD suite：`112 collected / 111 passed / 1 skipped / 1 warning`
+- 额外 teardown/cleanup regression：`5 passed / 3 warnings`
+- recipe preflight shell、完整 GPU subprocess E2E、本轮没有重新执行
 
-`compute_advantage()` 在 `verl/trainer/ppo/ray_trainer.py:195-240` 中：
+这说明当前测试基础设施已经很强，但它证明的是：
 
-- 把 `teacher_log_prob`
-- `old_log_probs`
-- `rollout_log_probs`
-- `base_log_prob`
-- `lambda_val`
-- `orm_weight`
-- `is_correction`
-- `is_epsilon_low`
-- `is_epsilon_high`
+- MOPD 主链路的 CPU-safe runtime / contract / routing / manifest 覆盖
+- 一部分工程收尾辅助逻辑
 
-统一传给 advantage estimator。
+而不是：
 
-真正的 MOPD 逻辑在 `verl/trainer/ppo/core_algos.py:1012-1105`：
-
-- `base_log_prob is None` 时，使用标准 MOPD：`teacher_log_prob - old_log_probs`
-- 否则走 ExOPD 形式
-- 可选做 training/rollout importance sampling correction
-- 可选把 ORM outcome advantage 混进来
-- 最后把结果写成标准 `advantages`
-
-所以在 actor 侧已经没有任何“教师身份路由”逻辑。
-
-### 6. Actor 更新阶段
-
-`dp_actor.update_policy()` 在 `verl/workers/actor/dp_actor.py:516-544` 只选择通用字段：
-
-- `responses`
-- `response_mask`
-- `input_ids`
-- `attention_mask`
-- `position_ids`
-- `old_log_probs`
-- `advantages`
-- 可选 `ref_log_prob`
-
-这说明 MOPD 已经被压缩成“trainer 预先算好 `advantages`，actor 像处理普通 PPO 一样更新”，旧的 actor 内部双教师反向 KL 分支已经被彻底挪出了热点路径。
+- 本轮 fresh preflight / GPU E2E / multi-node / fault recovery 全部重新通过
 
 ---
+
+## 逐项挑战分析
 
 ## 挑战 1：模型插槽的二值化硬编码架构
 
 ### 旧挑战的本质
 
-旧文档指出，双教师 G-OPD 的痛点在于：
+旧实现把教师身份编码在单个 worker 的命名槽位和专用方法里，扩展第 3 个教师就会继续膨胀
+成员变量、方法名和输出键名。
 
-- 教师身份绑定在单个 worker 内部的多个模型插槽上
-- 想扩展到第 3 个教师，就要继续加 `base_policy/base_ref_policy/teacher3_policy/...`
-- 每个模型都要对应一套新的 log-prob 计算方法和输出键名
+### 当前分支怎么处理
 
-这是典型的“把模型数量编码进类结构”。
+当前分支直接换了抽象层：
 
-### 当前分支的解决方式
+- 一个 teacher = 一个独立 worker group
+- 多教师 = `self.teacher_wgs[name]`
+- trainer 按 `teacher_id` 把样本路由给对应 worker group
 
-当前分支没有尝试把 `fsdp_workers.py` 里的模型插槽泛化成 `dict[str, policy]`，而是直接换了一层抽象：
+核心证据：
 
-- 一个 teacher = 一个独立 `RefPolicy` worker group
-- 多教师 = `self.teacher_wgs: dict[str, RayWorkerGroup]`
-- teacher identity 不再表现为“某个成员变量名”，而表现为“字典键 + worker group 实例”
+- `verl/trainer/ppo/ray_trainer.py:347-349`
+- `verl/trainer/ppo/ray_trainer.py:1462-1535`
+- `verl/trainer/ppo/ray_trainer.py:913-972`
+- `verl/trainer/ppo/ray_trainer.py:1912-1969`
 
-对应源码：
+### 为什么这算已解决
 
-- `TeacherConfig` 定义教师对象：`verl/workers/config/teacher.py:23-49`
-- trainer 循环创建 teacher workers：`verl/trainer/ppo/ray_trainer.py:839-873`
-- trainer 路由并聚合 teacher log prob：`verl/trainer/ppo/ray_trainer.py:1227-1315`
-- teacher 端复用现有 `compute_ref_log_prob` API：`verl/workers/fsdp_workers.py:1139-1169`
+新增教师不再需要：
 
-### 为什么这能解决旧问题
-
-因为现在新增教师不再需要：
-
-- 在 worker 类里新增模型成员
-- 新增 `compute_teacher_k_log_prob()` 方法
+- 改 actor/ref worker 的模型成员变量
+- 新增 `compute_teacher_k_log_prob()`
 - 新增新的 tensor 键名
-- 新增 `"math"` / `"code"` 这种特判分支
+- 在 actor 热路径里扩 if/elif
 
-现在新增教师只需要：
+现在新增教师的必要步骤只剩：
 
-- 在 `algorithm.mopd.teachers` 里多加一个 `TeacherConfig`
-- 数据里出现相应 `teacher_id`
+- 在 `algorithm.mopd.teachers[]` 里加一个 teacher 配置
+- 保证数据里有对应的 `teacher_id`
 
-trainer 就会自动：
+### 残留边界
 
-- 初始化新的 worker group
-- 在 batch 中找到属于它的样本
-- 计算该 teacher 的 `ref_log_prob`
-- scatter 回统一的 `teacher_log_prob`
+当前 ExOPD 仍假设所有教师共享一个全局 base worker，而不是 per-teacher base：
 
-### 这项挑战的残留问题
+- `verl/trainer/ppo/ray_trainer.py:757-766`
+- `verl/trainer/ppo/ray_trainer.py:1470-1487`
 
-“模型插槽硬编码”这个挑战本身已经基本被解决，但 ExOPD 所需的 base-model plumbing 并没有接通。也就是说：
+这不影响“N-teacher 不再受插槽数量限制”的结论，但说明“多 teacher + 多 base anchor”不是当前实现目标。
 
-- `teacher worker` 的 N 扩展已经打通
-- `base model worker` 的并行扩展没有完成
+### 状态
 
-这一点会在挑战 8 和挑战 11 里再次出现。
+**已解决**
 
 ---
 
@@ -266,59 +426,51 @@ trainer 就会自动：
 
 ### 旧挑战的本质
 
-旧文档指出，只要每加一个教师就要多起一个冻结模型，CPU 卸载内存和若干 FSDP 元数据就会线性增长。
+旧分析担心每新增一个教师都要新增模型实例、CPU offload 和 GPU unshard 开销，内存随教师数线性增长。
 
-### 当前分支做了什么
+### 当前分支怎么处理
 
-当前分支没有消除线性增长的物理事实，但做了三层缓解。
+当前分支做了四层缓解：
 
-第一层是“隔离”。
+1. **shared base worker**
+   不再给每个教师单独配一个 base，而是共享 `algorithm.mopd.base_model_path`：
+   `verl/trainer/ppo/ray_trainer.py:757-766`、`1470-1487`
+2. **dedicated quantized teacher backend**
+   支持 `hf_int8` / `hf_4bit`：
+   `verl/workers/teacher_workers.py:76-91`
+3. **per-teacher micro batch**
+   token 和 sequence 两条 teacher 路径都使用 per-teacher micro-batch：
+   `verl/trainer/ppo/ray_trainer.py:735-739`、
+   `verl/workers/teacher_workers.py:66-69`、
+   `183-200`、
+   `226-254`
+4. **resource pool 隔离**
+   可把特定教师移到单独 pool：
+   `verl/trainer/main_ppo.py:245-286`
 
-旧问题里最糟糕的一点，是多个教师共享一个 worker 实例里的 `self.tokenizer/self.processor/self.model slot`，甚至会互相覆盖。当前分支里，每个 teacher 都是独立 worker process，因此：
+### 为什么还不能算彻底解决
 
-- 每个 teacher 的 tokenizer 单独加载：`verl/workers/fsdp_workers.py:370-371`
-- 每个 teacher 的 ref forward 单独执行：`verl/workers/fsdp_workers.py:1148-1157`
+当前架构仍然是一教师一 worker group 一模型实例：
 
-这至少消除了“同一 worker 内 tokenizer 被后一个 teacher 覆盖”的结构性 bug。
+- legacy ref teacher：`verl/trainer/ppo/ray_trainer.py:1496-1507`
+- quantized teacher：`verl/trainer/ppo/ray_trainer.py:1508-1514`
+- quantized worker 仍是 rank-local 加载完整模型：
+  `verl/workers/teacher_workers.py:71-74`、`163-173`
 
-第二层是“峰值内存约束”。
+这意味着：
 
-`_build_teacher_worker_config()` 在 `verl/trainer/ppo/ray_trainer.py:703-715` 显式把 teacher ref log-prob 改成固定 micro-batch 路径：
+- 总体模型实例数仍随 teacher 数增加
+- quantized backend 只是把单 teacher 成本压低，不是消掉增长趋势
+- resource pool 只是把内存压力隔离到不同 GPU 池，不是做模型共享
 
-- 关闭 `ref.log_prob_use_dynamic_bsz`
-- 使用 `teacher_cfg.log_prob_micro_batch_size`
+当前默认生产 recipe 也没有使用独立 teacher pool，而是两个教师都在 `global_pool`：
 
-这样做的目的非常直接：teacher 是 routed sub-batch forward，不再盲目继承全局 ref 的动态批处理策略，从而把 OOM 风险收敛到可控的固定 micro-batch 上。
+- `recipe/mopd/run_mopd_qwen3_4b.sh:171`
+- `recipe/mopd/check_mopd_first_batch.py:90-107`
 
-第三层是“运行脚本与预检”。
+### 状态
 
-生产脚本 `recipe/mopd/run_mopd_qwen3_4b.sh:106-140` 暴露了几项关键内存参数：
-
-- `REF_PARAM_OFFLOAD`
-- `ROLLOUT_GPU_MEMORY_UTILIZATION`
-- `TEACHER_LOG_PROB_MICRO_BATCH_SIZE`
-
-并给出保守默认值：
-
-- `REF_PARAM_OFFLOAD=true`
-- `ROLLOUT_GPU_MEMORY_UTILIZATION=0.60`
-- `TEACHER_LOG_PROB_MICRO_BATCH_SIZE=2`
-
-`recipe/mopd/README.md:98-115` 也明确承认 full-run 仍然可能 OOM，因此推荐用这些 knob 调整。
-
-### 还没有解决的部分
-
-这一挑战目前只是“工程缓解”，不是“复杂度消除”：
-
-- `RefPolicy` 在 FSDP 路径仍然使用 CPU offload：`verl/workers/fsdp_workers.py:589-591`
-- 每个 teacher 依然是一份完整冻结模型
-- 因此 N 增长时 CPU/GPU 占用仍然是近似线性的
-
-所以当前分支的真实答案是：
-
-- 解决了共享 worker 带来的脆弱性
-- 缓解了峰值显存问题
-- 但没有改变 N-teacher 内存线性增长的根本规律
+**部分缓解**
 
 ---
 
@@ -326,46 +478,48 @@ trainer 就会自动：
 
 ### 旧挑战的本质
 
-旧文档的问题不是“有没有 teacher 计算”，而是“所有 teacher 计算都在单 worker 内串行执行，而且每个 teacher 都吃整批样本”。
+旧实现按阶段串行计算多个教师 log prob，N 增大时 wall-clock 近似线性变差。
 
-### 当前分支的解决方式
+### 当前分支怎么处理
 
-当前分支的优化重点不是“teacher 并行执行”，而是“teacher 只处理属于自己的样本”。
+当前实现至少做了两件关键改进：
 
-`_compute_teacher_log_probs()` 在 `verl/trainer/ppo/ray_trainer.py:1271-1313` 的关键收益有两个：
+1. **只计算“这批样本真正命中的教师”**
+   trainer 先按 `teacher_id` 切 sub-batch，再送给对应教师：
+   `verl/trainer/ppo/ray_trainer.py:913-972`
+2. **引入按 resource pool 的异步提交**
+   `_compute_teacher_log_probs()` / `_compute_teacher_sequence_rewards()` 都先为每个 pool 提交一个 job：
+   `verl/trainer/ppo/ray_trainer.py:1944-1954`、
+   `1987-1997`
 
-- 不再让每个 teacher 看完整 batch
-- 而是按 `teacher_id` 分组成 routed sub-batch
+单测也明确验证了调度语义：
 
-因此对于一个混合 batch：
+- 不同 pool 的 teacher 会先重叠提交
+- 同一 pool 内保持串行
 
-- `math` teacher 只看数学样本
-- `code` teacher 只看代码样本
-- 不激活的 teacher 完全跳过
+见 `tests/unit/test_teacher_routing.py:427-485`。
 
-这解决的是“全教师全批次计算浪费”。
+### 为什么还只是部分缓解
 
-同时，teacher worker group 由 `TeacherConfig.resource_pool` 驱动，trainer 在 `verl/trainer/ppo/ray_trainer.py:855-868` 可以把不同 teacher 放进不同资源池。这给未来做 teacher 级并行提供了架构接口，而不需要修改 `Role` 枚举。
+当前调度仍不是“所有教师 fully parallel”：
 
-### 为什么说只是部分解决
+- 同一 pool 内是串行 drain：
+  `verl/trainer/ppo/ray_trainer.py:1956-1967`、
+  `1999-2028`
+- ExOPD 的 `base_policy_wg` 仍是独立额外阶段：
+  `verl/trainer/ppo/ray_trainer.py:2345-2348`
+- 当前生产 recipe 把两个教师都放在 `global_pool`，因此真实默认路径并不会享受到跨 pool 的重叠：
+  `recipe/mopd/run_mopd_qwen3_4b.sh:171`
 
-因为当前实现仍然是：
+所以现在的真实情况是：
 
-- `for teacher_name, teacher_wg in self.teacher_wgs.items(): ...`
+- 已经消除了“全 batch 走所有教师”的浪费
+- 已经具备“跨 pool 重叠”的能力
+- 但默认部署形态仍会在共享 pool 上串行跑 teacher forwards
 
-也就是在 `verl/trainer/ppo/ray_trainer.py:1271-1313` 里顺序遍历 teacher。
+### 状态
 
-因此当前分支解决了两件事：
-
-- 解决了旧实现的“全批浪费”
-- 避免了为多教师新增 `Role.Teacher1/2/3...`
-
-但没有解决：
-
-- teacher forward 的 wall-clock 串行累加
-- 多 teacher 真正并行执行
-
-所以在时间复杂度层面，它从“串行且浪费”变成了“串行但按需路由”。
+**部分缓解**
 
 ---
 
@@ -373,61 +527,43 @@ trainer 就会自动：
 
 ### 旧挑战的本质
 
-旧实现靠复用：
+旧双教师实现通过重载已有字段表达 student / base / teacher1 / teacher2，
+语义混乱且无法扩展到 teacher3。
 
-- `model.base_model_path`
-- `ref.model.base_model_path`
+### 当前分支怎么处理
 
-这样的字段去偷偷塞第二个教师，配置语义已经被破坏。
+当前实现已经把配置语义重新分层：
 
-### 当前分支的解决方式
+- `actor_rollout_ref.model.path` 只表示 student
+- `algorithm.mopd.base_model_path` 只表示 ExOPD shared base
+- `algorithm.mopd.teachers[]` 表示 teacher 集合
+- `algorithm.mopd.*` 表示算法参数
 
-当前分支是这 12 个挑战里处理得最干净的一项。
+证据：
 
-它做了完整的三件事：
+- `verl/trainer/config/ppo_trainer.yaml:41-42`
+- `verl/trainer/config/algorithm/mopd.yaml:1-51`
+- `verl/workers/config/teacher.py:23-162`
+- `recipe/mopd/run_mopd_qwen3_4b.sh:167-176`
 
-第一，Hydra 层有独立子树。
+### 为什么这算已解决
 
-- `verl/trainer/config/ppo_trainer.yaml:38-42`
-- `verl/trainer/config/algorithm/mopd.yaml:1-36`
+当前再增加一个 teacher，不需要再滥用别的配置字段，只需要在
+`algorithm.mopd.teachers[]` 增加一项。
 
-第二，Python 层有独立 dataclass。
+### 仍需记录的实现细节
 
-- `TeacherConfig`: `verl/workers/config/teacher.py:23-49`
-- `MOPDConfig`: `verl/workers/config/teacher.py:52-105`
+当前 `mopd` 的 typed dataclass 校验没有像 actor/critic 那样在
+`validate_config()` 中统一实例化：
 
-第三，运行脚本层按显式 teacher list 传参。
+- `verl/utils/config.py:149-175`
+- `verl/trainer/config/algorithm.py:567-614`
 
-- `recipe/mopd/run_mopd_qwen3_4b.sh:130-140`
+所以这项挑战的“语义重载问题”已解决，但“typed validation 全链路统一化”还没完全做完。
 
-因此现在的配置语义是清晰的：
+### 状态
 
-- `actor_rollout_ref.model.path` = student
-- `algorithm.mopd.teachers[i].model_path` = 第 i 个 teacher
-- `algorithm.mopd.lambda_val` / `orm_weight` / `is_correction` = MOPD 算法参数
-
-这里还有一个值得记录的实现细节：当前分支虽然已经有了 `mopd.yaml` 和 `MOPDConfig`，但 trainer 侧读取 `mopd` 时仍然主要依赖 `DictConfig` 的动态字段访问，而不是 `AlgoConfig` 上的显式 typed `mopd` 成员。这不影响当前功能，但说明“配置语义问题”已经解决，“typed config 完整接线”则还没有完全收尾。
-
-### 配置验证的改进
-
-`MOPDConfig.__post_init__()` 在 `verl/workers/config/teacher.py:80-105` 做了以下校验：
-
-- `enabled=True` 时必须至少有一个 teacher
-- teacher name 不能重复
-- `lambda_val > 0`
-- `is_epsilon_low < is_epsilon_high`
-- 若启用 base normalization，则必须提供 `base_model_path`
-
-这使得当前实现已经从“语义重载 + CLI 猜测”升级为“显式 schema + 基本验证”。
-
-### 残留问题
-
-语义重载问题已经基本解决。还没完成的不是 schema，而是 schema 背后的某些运行时能力，例如：
-
-- `use_base_normalization` 目前只是在配置上存在
-- `base_model_path` 目前没有真正被 trainer 接通成运行时 `base_log_prob`
-
-但这属于功能未接通，不属于配置语义混乱。
+**已解决**
 
 ---
 
@@ -435,41 +571,37 @@ trainer 就会自动：
 
 ### 旧挑战的本质
 
-旧方案的问题不是“用了字符串”，而是：
+旧实现在 actor 热路径里用 `"math"` / `"code"` if/elif/else 做路由和公式选择。
 
-- 字符串集合被硬编码成 `"math"` / `"code"`
-- 映射逻辑写在 actor loss 热路径里
-- 未知值会静默回退到默认教师
+### 当前分支怎么处理
 
-### 当前分支的解决方式
+现在的教师路由完全数据驱动：
 
-当前分支仍然使用字符串 teacher name，但已经从“硬编码字符串分支”升级成“数据驱动的通用字典路由”。
+- 数据里显式携带 `teacher_id`：
+  `verl/utils/dataset/rl_dataset.py:371-374`
+- trainer 将 `teacher_id` 转成 mask/indices：
+  `verl/trainer/ppo/ray_trainer.py:918-969`、
+  `999-1040`
+- unknown teacher 会 fail-fast：
+  `verl/trainer/ppo/ray_trainer.py:921-928`、
+  `985-991`
 
-具体表现为：
+### 为什么这算已解决
 
-- 数据集输出 `teacher_id`：`verl/utils/dataset/rl_dataset.py:371-374`
-- trainer 用 `self.teacher_wgs: dict[str, RayWorkerGroup]` 维护所有 teacher：`verl/trainer/ppo/ray_trainer.py:335`
-- `_compute_teacher_log_probs()` 通过 `teacher_ids == teacher_name` 做通用分组：`verl/trainer/ppo/ray_trainer.py:1271-1278`
-- 算法层只关心最终选出的 `teacher_log_prob`，不再关心 teacher 名字：`verl/trainer/ppo/core_algos.py:1012-1105`
+当前不存在下面这种扩展方式了：
 
-### 相比旧实现的关键提升
+- 在 actor 里继续加 `elif teacher == "reasoning":`
+- 把 teacher 名到张量名的映射藏在控制流里
+- unknown teacher 静默回退到默认教师
 
-1. 不再有 `"math"` / `"code"` 的写死分支。
-2. 不再在 actor 内部做教师判断。
-3. 未知 teacher id 会 fail-fast，而不是静默 fallback。
+teacher identity 现在只由两件事决定：
 
-fail-fast 校验在 `verl/trainer/ppo/ray_trainer.py:1252-1260`：
+- `teacher_id`
+- `self.teacher_wgs[teacher_id]`
 
-- `unknown_ids = unique_ids - known_teachers`
-- 非空就直接 `raise ValueError`
+### 状态
 
-对应单测也已经补上：
-
-- `tests/unit/test_teacher_routing.py:274-294`
-
-### 还剩下什么
-
-严格来说，teacher name 仍然是字符串，不是整数化 ID，也没有做更深的向量化优化；但“硬编码 teacher 词表”这个挑战已经被解决。
+**已解决**
 
 ---
 
@@ -477,39 +609,33 @@ fail-fast 校验在 `verl/trainer/ppo/ray_trainer.py:1252-1260`：
 
 ### 旧挑战的本质
 
-旧实现为了在一个 batch 上切换不同模型输入，会：
+旧实现为了在同一个 batch 上临时切换不同输入视图，会原地 pop/restore 张量，
+导致数据流脆弱、易污染。
 
-- `pop("ref_input_ids")`
-- 临时改 batch
-- 算完后再 restore
+### 当前分支怎么处理
 
-这类模式一旦中间报错，batch 就可能被破坏，而且根本不适合 N-teacher。
+当前实现的策略是：
 
-### 当前分支的解决方式
+- 对 teacher 路由：`batch.select_idxs(indices)` 生成子批，再 `pad/unpad` 后 scatter 回原 batch
+  位置，见 `verl/trainer/ppo/ray_trainer.py:943-969`
+- 对 sequence teacher：同样在子批上操作，不改原 batch 的主张量结构，
+  见 `verl/trainer/ppo/ray_trainer.py:1008-1039`
+- 对 base log prob：直接用 dedicated `base_policy_wg.compute_ref_log_prob(batch)`，
+  再把输出键从 `ref_log_prob` 重命名为 `base_log_prob`，见
+  `verl/trainer/ppo/ray_trainer.py:798-814`
 
-当前分支彻底放弃了这种“原地改 batch”的做法，改成了“子批视图 + 独立 forward”。
+### 为什么这算已解决
 
-核心代码在 `verl/trainer/ppo/ray_trainer.py:1280-1299`：
+当前没有看到旧式“先 pop 掉一组张量，再算完以后 restore 回去”的全局 batch 改写模式。
+新方案的核心是：
 
-- `sub_batch = batch.select_idxs(indices)`
-- 对 sub-batch 单独 balance/pad
-- 直接送入 teacher `compute_ref_log_prob`
+- 子批视图
+- 局部 padding/unpadding
+- scatter 回原始索引
 
-整个过程没有：
+### 状态
 
-- `pop`
-- `restore`
-- 原地篡改原始 batch 的输入键
-
-actor 侧同样只消费统一字段；`dp_actor.update_policy()` 在 `verl/workers/actor/dp_actor.py:516-544` 只选用标准 `advantages`、`old_log_probs`、`input_ids` 等字段，不包含任何 teacher-specific 输入切换逻辑。
-
-### 这项挑战为什么算已基本解决
-
-因为当前 MOPD 路径已经把“多教师输入切换”从“原地修改同一批次”变成了“独立子批路由”，异常一致性、可读性、可扩展性都明显更好。
-
-### 剩余限制
-
-它仍然默认所有 teacher 可以直接消费当前 batch 的 token ids，因此只解决了“batch 变异”问题，没有解决“跨 tokenizer 的输入重建”问题。
+**已解决**
 
 ---
 
@@ -517,226 +643,88 @@ actor 侧同样只消费统一字段；`dp_actor.update_policy()` 在 `verl/work
 
 ### 旧挑战的本质
 
-旧文档指出，多教师一旦跨模型家族，不能再假设：
+旧实现默认 student 和 teacher 共用一套 ref tokenization 流，跨 tokenizer 时既无法对齐
+输入，也无法对齐 token 级别的 teacher 信号。
 
-- 相同的 token ids 对所有 teacher 都有相同语义
-- 可以直接拿 student 的 response token ids 去喂 teacher
+### 当前分支怎么处理
 
-### 当前分支的完整解决方案
+当前分支做了两层处理：
 
-当前分支通过**双模式架构**完全解决了异构 tokenizer 问题。
+#### 7.1 compatible 路径
 
-#### 1. Tokenizer 隔离（基础层）
+token-level teacher 仍可用，但 trainer 会先做严格兼容性验证：
 
-每个 teacher worker 独立加载自己的 tokenizer：
+- teacher tokenizer path 与 student path 相同可直接通过
+- 否则必须显式声明 `tokenizer_compat_group`
+- 然后再比较 tokenizer signature，包括 vocab hash、special token、padding side 等
 
-- `verl/workers/fsdp_workers.py:370-371`
-- 每个 teacher 使用自己的 `pad_token_id`：`verl/workers/fsdp_workers.py:1148-1156`
+见 `verl/trainer/ppo/ray_trainer.py:1177-1244`。
 
-这消除了旧方案中多个 teacher 共享 `self.tokenizer` 被反复覆盖的结构性 bug。
+#### 7.2 sequence_reward 路径
 
-#### 2. Tokenizer Policy 机制（核心层）
+异构 tokenizer teacher 不再强行共用 student token ids，而是：
 
-`TeacherConfig` 提供 `tokenizer_policy` 字段（`verl/workers/config/teacher.py:51, 71-75`）：
+- 保留 `raw_prompt`
+- 用 student tokenizer decode `responses`
+- teacher 端重新套自己的 chat template 并 retokenize
+- 用 response span 的平均 log prob 生成 `seq_scores`
 
-- **`”compatible”`**：Token 级蒸馏，要求 teacher 与 student tokenizer 兼容
-  - Teacher 直接消费 batch 中的 `input_ids/responses`
-  - 返回 token-level `teacher_log_prob` 张量
-  - 适用于同族模型（如 Qwen 系列）
+见：
 
-- **`”sequence_reward”`**：Sequence 级蒸馏，支持异构 tokenizer
-  - Teacher 不提供 token-level log probs
-  - 返回 sequence-level reward scores
-  - 通过 `teacher_seq_reward` + `teacher_token_mask` 传递信号
-  - 适用于跨族模型（Qwen + LLaMA + Mistral）
+- `verl/trainer/ppo/ray_trainer.py:974-1042`
+- `verl/workers/teacher_workers.py:127-157`
+- `verl/workers/teacher_workers.py:212-254`
+- `verl/trainer/ppo/core_algos.py:1012-1039`
 
-#### 3. Tokenizer 兼容性验证（保护层）
+### 为什么还只是部分缓解
 
-`_validate_mopd_tokenizer_compatibility()` 在 `verl/trainer/ppo/ray_trainer.py:1178-1244` 执行 preflight 检查：
+当前分支确实支持了异构 tokenizer teacher，但不是“完全通用的 token-level 方案”：
 
-- 验证 student 与所有 “compatible” policy teachers 的 tokenizer 一致性
-- 检查 `tokenizer_compat_group` 显式分组
-- 对 “sequence_reward” policy teachers 跳过 token-level 验证
-- 验证 base model（如果启用）与 student tokenizer 兼容
+- token-level dense distillation 仍然要求 tokenizer compatible
+- heterogeneous teacher 只能走 `sequence_reward`
+- `sequence_reward` 只在 dedicated quantized teacher backend 上支持，
+  legacy ref backend 会直接报错，见
+  `verl/trainer/ppo/ray_trainer.py:1496-1501`
+- `sequence_reward` 生成的是 scalar sequence signal，不是跨 tokenizer 精确对齐的
+  token-level reverse KL
 
-#### 4. 异构 Teacher 执行路径
+### 状态
 
-训练时分两路处理（`verl/trainer/ppo/ray_trainer.py:1912-2030`）：
-
-**Token-level 路径**（`_compute_teacher_log_probs`，line 1912-1969）：
-- 过滤 `tokenizer_policy == “compatible”` 的 teachers
-- 按 `teacher_id` 路由 sub-batch
-- 返回 `[batch_size, response_len]` 的 `teacher_log_prob` 张量
-
-**Sequence-level 路径**（`_compute_teacher_sequence_rewards`，line 1971-2030）：
-- 过滤 `tokenizer_policy == “sequence_reward”` 的 teachers
-- 调用 teacher 的 sequence reward 接口
-- 返回 `teacher_seq_reward`, `teacher_seq_weight`, `teacher_token_mask`
-
-#### 5. Advantage 计算中的融合
-
-`compute_mopd_advantage()` 在 `verl/trainer/ppo/core_algos.py:1139-1157` 统一处理：
-
-```python
-# Token-level teacher advantage
-A_mopd = (teacher_log_prob - old_log_probs).detach()
-
-# Sequence-level teacher advantage
-A_seq_teacher = teacher_seq_reward.unsqueeze(-1).expand_as(response_mask)
-A_seq_teacher = A_seq_teacher * teacher_token_mask
-
-# Final advantage
-A_final = weights * (A_mopd + teacher_seq_weight * A_seq_teacher) + orm_weight * A_orm
-```
-
-### 测试覆盖
-
-- `tests/unit/test_mopd_advantage.py:test_mopd_advantage_sequence_teacher_signal_changes_result_when_orm_disabled`
-- Tokenizer 兼容性验证测试：`tests/unit/test_mopd_preflight.py`
-
-### 结论
-
-✅ **已完全解决**。当前实现支持：
-
-1. **同族 tokenizer**：通过 “compatible” policy 做 token-level 蒸馏
-2. **异构 tokenizer**：通过 “sequence_reward” policy 做 sequence-level 蒸馏
-3. **混合场景**：同一训练中可同时使用两种 policy 的 teachers
-4. **安全保障**：Preflight 验证防止 tokenizer 不兼容导致的静默错误
-
-唯一限制：异构 tokenizer teachers 必须显式配置为 `tokenizer_policy: “sequence_reward”`，系统不会自动 fallback（这是设计决策，确保用户明确意图）。
+**部分缓解**
 
 ---
 
-## 挑战 8：全局 lambda 无法适配异构教师
+## 挑战 8：全局 lambda_vals 无法适配异构教师
 
 ### 旧挑战的本质
 
-旧文档指出，不同 teacher 与 base/student 的相对距离不同，统一 `lambda` 会导致：
+旧实现只有单个全局 `lambda_vals` 标量，所有教师共享同一强度。
 
-- 某些 teacher 过强，外推过度
-- 某些 teacher 过弱，信号不足
+### 当前分支怎么处理
 
-### 当前分支的完整实现
+当前实现已经支持 per-teacher lambda：
 
-当前分支**完全实现了 per-teacher lambda 支持**，包括配置、运行时计算、测试验证三个层面。
+- 配置入口：`verl/workers/config/teacher.py:47-52`
+- 按 `teacher_id` 构造 per-sample `lambda_val` tensor：
+  `verl/trainer/ppo/ray_trainer.py:774-796`
+- dispatch 到 MOPD estimator：
+  `verl/trainer/ppo/ray_trainer.py:219-234`
+- ExOPD 公式直接消费这个 batch 级 tensor：
+  `verl/trainer/ppo/core_algos.py:1100-1107`
 
-#### 1. 配置层：Per-Teacher Lambda Override
+### 为什么这算已解决
 
-`TeacherConfig` 提供 `lambda_val` 字段（`verl/workers/config/teacher.py:48, 67-68`）：
+当前 teacher A 和 teacher B 可以在同一个 batch 中拥有不同的 lambda。
+这正是旧全局标量方案做不到的。
 
-```python
-@dataclass
-class TeacherConfig:
-    name: str
-    model_path: str
-    lambda_val: Optional[float] = None  # Per-teacher lambda override
-    # ... other fields
+### 边界
 
-    def __post_init__(self):
-        if self.lambda_val is not None and self.lambda_val <= 0:
-            raise ValueError(f”lambda_val must be positive, got {self.lambda_val}”)
-```
+当前 sequence teacher 使用的是单独的 `seq_reward_weight`，而不是 `lambda_val`。
+这不是缺陷，而是因为 sequence 路径本来就不是 ExOPD token-level 公式。
 
-配置语义：
-- `MOPDConfig.lambda_val`：全局默认值（如 1.0）
-- `TeacherConfig.lambda_val`：Per-teacher 覆盖值（如 math=1.5, code=1.0）
-- 未指定时使用全局默认
+### 状态
 
-#### 2. 运行时层：Batch Lambda Tensor 构建
-
-`_build_mopd_lambda_tensor()` 在 `verl/trainer/ppo/ray_trainer.py:774-796` 构建 per-sample lambda 值：
-
-```python
-def _build_mopd_lambda_tensor(self, batch: DataProto) -> torch.Tensor:
-    “””Build per-sample lambda tensor based on teacher_id routing.”””
-    teacher_ids = batch.non_tensor_batch[“teacher_id”]
-    batch_size = len(teacher_ids)
-
-    lambda_tensor = torch.full((batch_size,),
-                               self.config.algorithm.mopd.lambda_val,
-                               dtype=torch.float32)
-
-    # Override with per-teacher lambda if specified
-    for teacher_cfg in self.config.algorithm.mopd.teachers:
-        if teacher_cfg.lambda_val is not None:
-            mask = teacher_ids == teacher_cfg.name
-            lambda_tensor[mask] = teacher_cfg.lambda_val
-
-    return lambda_tensor
-```
-
-关键特性：
-- 返回 `[batch_size]` 张量，每个样本有独立 lambda 值
-- 按 `teacher_id` 路由到对应 teacher 的 lambda 配置
-- 支持混合 batch（不同样本使用不同 teacher 的不同 lambda）
-
-#### 3. Advantage 计算层：Lambda 应用
-
-`compute_mopd_advantage()` 在 `verl/trainer/ppo/core_algos.py:1100-1106` 使用 batch lambda tensor：
-
-```python
-if base_log_prob is not None:
-    # ExOPD with per-sample lambda
-    lambda_val_expanded = lambda_val.unsqueeze(-1).expand_as(old_log_probs)
-    A_mopd = -((old_log_probs - base_log_prob)
-               - lambda_val_expanded * (teacher_log_prob - base_log_prob))
-else:
-    # Standard MOPD (lambda implicitly = 1.0)
-    A_mopd = (teacher_log_prob - old_log_probs)
-```
-
-#### 4. Manifest 序列化
-
-`_build_mopd_manifest()` 在 `verl/trainer/ppo/ray_trainer.py:1301` 保存 per-teacher lambda 到 checkpoint manifest：
-
-```python
-“teachers”: [
-    {
-        “name”: teacher_cfg.name,
-        “model_path”: teacher_cfg.model_path,
-        “lambda_val”: teacher_cfg.lambda_val,  # Preserved in manifest
-        # ... other fields
-    }
-    for teacher_cfg in self.config.algorithm.mopd.teachers
-]
-```
-
-### 测试覆盖
-
-- `tests/unit/test_mopd_advantage.py:test_batch_lambda_overrides_config_scalar_for_exopd_dispatch`
-- `tests/integration/test_mopd_e2e.py:test_exopd_batch_lambda_overrides_config_scalar`
-
-### 实际使用示例
-
-```yaml
-# config/algorithm/mopd.yaml
-algorithm:
-  mopd:
-    enabled: true
-    lambda_val: 1.0  # Global default
-    teachers:
-      - name: math
-        model_path: ~/models/math-teacher
-        lambda_val: 1.5  # Math teacher uses stronger extrapolation
-      - name: code
-        model_path: ~/models/code-teacher
-        lambda_val: 1.0  # Code teacher uses standard MOPD
-      - name: reasoning
-        model_path: ~/models/reasoning-teacher
-        # lambda_val not specified, uses global 1.0
-```
-
-### 结论
-
-✅ **已完全解决**。当前实现支持：
-
-1. **Per-teacher lambda 配置**：每个 teacher 可独立指定 lambda 值
-2. **Per-sample lambda 计算**：混合 batch 中每个样本使用对应 teacher 的 lambda
-3. **ExOPD 公式支持**：Lambda 正确应用于 G-OPD extrapolation 公式
-4. **Checkpoint 持久化**：Lambda 值保存在 manifest 中
-5. **测试验证**：单元测试和集成测试覆盖
-
-唯一未实现的是 **per-teacher 监控指标**（如按 teacher 分开的梯度范数、loss 贡献），这属于可观测性增强而非核心功能。
+**已解决**
 
 ---
 
@@ -744,45 +732,40 @@ algorithm:
 
 ### 旧挑战的本质
 
-旧文档担心的是：
+旧实现会把教师身份字段静默带入 batch，但不做 unknown teacher / distribution / coverage 检查，
+容易产生错误训练信号而不报错。
 
-- teacher 标识可能拼错
-- 错了以后还不报错
-- 最后产生 silent wrong training
+### 当前分支怎么处理
 
-### 当前分支的改进
+当前实现补了三道防线：
 
-当前分支对这个问题做了“晚于数据集、早于 teacher forward”的 fail-fast 防线。
+1. **recipe 侧显式注入 teacher_id**
+   `recipe/mopd/prepare_data.py:53-71`
+2. **dataset 侧显式提取 teacher_id**
+   `verl/utils/dataset/rl_dataset.py:371-374`
+3. **trainer preflight fail-fast**
+   `verl/trainer/ppo/ray_trainer.py:1246-1274`
 
-第一层，数据接入显式化：
+preflight 现在会：
 
-- `teacher_id_field` 配置：`verl/utils/dataset/rl_dataset.py:139`
-- `teacher_id` 注入样本：`verl/utils/dataset/rl_dataset.py:371-374`
-- `collate_fn` 保留非 tensor teacher_id：`verl/utils/dataset/rl_dataset.py:40-68`
+- 打印 `teacher_id` 分布：`1250-1251`
+- 拒绝 unknown teacher：`1253-1260`
+- 拒绝多教师场景下全是 `default`：`1262-1266`
+- 拒绝配置里声明了但数据中完全缺失的 teacher：`1268-1272`
 
-第二层，训练时校验 teacher_id 是否在已注册教师集合中：
+### 为什么这算已解决
 
-- `verl/trainer/ppo/ray_trainer.py:1252-1260`
+旧挑战真正危险的是“数据错了但训练还能继续跑”。当前这条路径已经被 fail-fast 打断。
 
-第三层，测试覆盖：
+另外，recipe 数据准备脚本也会打印 teacher 分布：
 
-- dataset 提取与 collate：`tests/unit/test_dataset_teacher_id.py:85-144`
-- unknown teacher 直接报错：`tests/unit/test_teacher_routing.py:274-294`
+- `recipe/mopd/prepare_data.py:214-229`
 
-这已经明显优于旧文档里的“else 分支静默回退到数学教师”。
+这已经覆盖了旧文档里提到的“无数据集级教师分布统计”问题。
 
-### 为什么只能算部分解决
+### 状态
 
-因为当前数据验证还有三个缺口：
-
-1. 缺字段时会写成 `"default"`，而不是在 dataset 侧直接报错：`verl/utils/dataset/rl_dataset.py:372-374`
-2. 没有在 dataset 加载阶段就验证 teacher_id 的全集是否与 config.teacher names 一致
-3. 没有输出 teacher 分布统计，难以及早发现极端偏斜或脏数据
-
-所以当前状态是：
-
-- 已经避免 silent fallback
-- 但还没有做到“数据加载时的强验证”
+**已解决**
 
 ---
 
@@ -790,48 +773,37 @@ algorithm:
 
 ### 旧挑战的本质
 
-旧实现是：
+旧实现把 teacher 蒸馏逻辑放在 actor 侧覆盖已有优势，导致数据流分裂、计算浪费且难以混合 ORM。
 
-- trainer 先算一套 GRPO / 其他 advantage
-- actor 里再把它覆盖成 reverse-KL advantage
+### 当前分支怎么处理
 
-这样会导致：
+MOPD 现在是独立注册的 advantage estimator：
 
-- 计算浪费
-- 数据流分散
-- 行为不透明
+- 注册点：`verl/trainer/ppo/core_algos.py:1042`
+- dispatch 入口：`verl/trainer/ppo/ray_trainer.py:137-259`
 
-### 当前分支的解决方式
+并且 sequence teacher 与 ORM 都是 estimator 内的显式组成项：
 
-当前分支是把 MOPD 直接提升为一级 advantage estimator。
+- sequence teacher：`verl/trainer/ppo/core_algos.py:1139-1168`
+- ORM：`verl/trainer/ppo/core_algos.py:1170-1185`
 
-证据：
+### 为什么这算已解决
 
-- `@register_adv_est("mopd")`：`verl/trainer/ppo/core_algos.py:1012`
-- `compute_advantage()` 通用分发：`verl/trainer/ppo/ray_trainer.py:195-240`
-- actor 侧只消费已经算好的 `advantages`：`verl/workers/actor/dp_actor.py:516-544`
+现在的训练流是：
 
-这意味着当你设置：
+1. trainer 收集 teacher/base/rollout 信号
+2. `compute_advantage()` 调用 `compute_mopd_advantage()`
+3. actor 只消费标准化后的 `advantages`
 
-- `algorithm.adv_estimator=mopd`
+也就是说：
 
-trainer 就只走 MOPD estimator，不再先算一套别的再覆盖。
+- teacher 蒸馏不再“覆盖”别的优势
+- ORM 不是旁路 hack，而是同一个 estimator 的显式组成部分
+- actor 层不再承担 teacher-specific 公式逻辑
 
-### 当前实现的算法内容
+### 状态
 
-`compute_mopd_advantage()` 在 `verl/trainer/ppo/core_algos.py:1049-1105` 完成了：
-
-- 标准 MOPD：`A_mopd = (teacher_log_prob - old_log_probs).detach()`
-- ExOPD 形式：`base_log_prob` 分支
-- rollout/train IS correction
-- all-masked fallback
-- ORM mixing：`A_final = weights * (A_mopd + orm_weight * A_orm)`
-
-这已经和旧的“覆盖式副作用实现”完全是两种架构。
-
-### 结论
-
-这项挑战在当前分支里是已经解决的。
+**已解决**
 
 ---
 
@@ -839,412 +811,128 @@ trainer 就只走 MOPD estimator，不再先算一套别的再覆盖。
 
 ### 旧挑战的本质
 
-旧文档担心的是：
+旧实现 checkpoint 只保存 actor/critic，恢复训练依赖外部 CLI 参数重新把 teacher 拼回去，
+缺少自描述和 drift 检测。
 
-- teacher model 不进入 checkpoint
-- 恢复训练时缺少完整教师配置清单
-- 可复现性依赖外部命令行
+### 当前分支怎么处理
 
-### 当前分支的 Manifest 系统
+当前分支已经加入 manifest：
 
-当前分支实现了 **MOPD manifest 序列化与漂移检测机制**，显著改善了 checkpoint 可复现性。
+- 生成 manifest：`verl/trainer/ppo/ray_trainer.py:1276-1329`
+- 保存 manifest：`verl/trainer/ppo/ray_trainer.py:1663-1667`
+- 恢复时校验 manifest：`verl/trainer/ppo/ray_trainer.py:1715-1718`
+- semantic drift 直接报错，deployment drift 仅 warning：
+  `verl/trainer/ppo/ray_trainer.py:1331-1337`
 
-#### 1. Manifest 构建与序列化
+manifest 里已经记录：
 
-`_build_mopd_manifest()` 在 `verl/trainer/ppo/ray_trainer.py:1276-1329` 构建完整 MOPD 配置快照：
+- global MOPD semantic config
+- 每个 teacher 的 model path / backend / tokenizer policy / lambda / seq weight
+- deployment 侧的 resource pool 和 micro-batch 信息
 
-```python
-def _build_mopd_manifest(self) -> dict:
-    “””Build MOPD manifest for checkpoint validation.”””
-    return {
-        “enabled”: True,
-        “lambda_val”: self.config.algorithm.mopd.lambda_val,
-        “orm_weight”: self.config.algorithm.mopd.orm_weight,
-        “is_correction”: self.config.algorithm.mopd.is_correction,
-        “is_epsilon_low”: self.config.algorithm.mopd.is_epsilon_low,
-        “is_epsilon_high”: self.config.algorithm.mopd.is_epsilon_high,
-        “use_base_normalization”: self.config.algorithm.mopd.use_base_normalization,
-        “base_model_path”: self.config.algorithm.mopd.base_model_path,
-        “teachers”: [
-            {
-                “name”: teacher_cfg.name,
-                “model_path”: teacher_cfg.model_path,
-                “backend”: teacher_cfg.backend,
-                “resource_pool”: teacher_cfg.resource_pool,
-                “lambda_val”: teacher_cfg.lambda_val,
-                “tokenizer_policy”: teacher_cfg.tokenizer_policy,
-                “tokenizer_compat_group”: teacher_cfg.tokenizer_compat_group,
-                # ... all teacher config fields
-            }
-            for teacher_cfg in self.config.algorithm.mopd.teachers
-        ]
-    }
-```
+### 为什么还只是部分缓解
 
-Manifest 保存在 checkpoint 目录的 `mopd_manifest.json` 文件中。
+当前 checkpoint 仍然不是完全自包含：
 
-#### 2. 语义漂移检测
+- 实际保存的还是 actor / critic checkpoints，manifest 只是额外 JSON 元数据，
+  见 `verl/trainer/ppo/ray_trainer.py:1648-1667`
+- teacher/base worker 权重本身不随 checkpoint 打包
+- resume 仍然依赖外部模型路径在恢复时可用且内容未漂移
+- manifest 记录的是路径和值，不是 artifact hash 或 revision pin
 
-`_validate_mopd_manifest()` 在 `verl/trainer/ppo/ray_trainer.py:1331-1395` 执行两级验证：
+所以它已经从“完全不记 MOPD 上下文”进化成“能检测语义漂移”，但还没有进化成
+“拿到 checkpoint 就能完整自举恢复 teacher/base artifacts”。
 
-**语义漂移（Semantic Drift）**：影响训练正确性的配置变更
-- Teacher 数量变化
-- Teacher 名称变化
-- Lambda 值变化
-- IS correction 参数变化
-- Tokenizer policy 变化
+### 状态
 
-检测到语义漂移时 **抛出 ValueError**，阻止训练继续。
-
-**部署漂移（Deployment Drift）**：不影响训练正确性的配置变更
-- Model path 变化（如模型迁移到新路径）
-- Resource pool 变化（如资源重新分配）
-- Backend 变化（如从 legacy_ref 切换到 hf_int8）
-
-检测到部署漂移时 **记录 WARNING**，允许训练继续。
-
-#### 3. Checkpoint 工作流
-
-**保存时**（`_save_checkpoint`，line 941-1065）：
-```python
-# Save actor/critic/dataloader
-self.actor_rollout_wg.save_checkpoint(...)
-if self.use_critic:
-    self.critic_wg.save_checkpoint(...)
-torch.save(dataloader_state, ...)
-
-# Save MOPD manifest
-if self.teacher_wgs:
-    manifest = self._build_mopd_manifest()
-    with open(f”{checkpoint_dir}/mopd_manifest.json”, “w”) as f:
-        json.dump(manifest, f, indent=2)
-```
-
-**恢复时**（`_load_checkpoint`，line 1067-1145）：
-```python
-# Load actor/critic/dataloader
-self.actor_rollout_wg.load_checkpoint(...)
-if self.use_critic:
-    self.critic_wg.load_checkpoint(...)
-dataloader_state = torch.load(...)
-
-# Validate MOPD manifest
-if self.teacher_wgs:
-    saved_manifest = json.load(open(f”{checkpoint_dir}/mopd_manifest.json”))
-    self._validate_mopd_manifest(saved_manifest)
-```
-
-#### 4. Teacher Worker 重建
-
-Teacher workers 本身不保存权重（因为是冻结模型），而是在 `init_workers()` 时按当前配置重新加载：
-
-```python
-# verl/trainer/ppo/ray_trainer.py:1462-1540
-for teacher_cfg in self.config.algorithm.mopd.teachers:
-    teacher_wg = self._create_teacher_worker_group(teacher_cfg)
-    teacher_wg.init_model()  # Load from teacher_cfg.model_path
-    self.teacher_wgs[teacher_cfg.name] = teacher_wg
-```
-
-这是合理的设计，因为：
-- Teacher 模型是冻结的，不需要保存训练状态
-- 从原始路径重新加载确保使用最新版本
-- Manifest 验证确保配置一致性
-
-### 当前实现的优势
-
-✅ **语义一致性保障**：Manifest 验证防止配置漂移导致的训练错误
-✅ **可复现性追踪**：Checkpoint 记录完整 MOPD 配置快照
-✅ **灵活部署**：允许 model path/resource pool 等部署细节变更
-✅ **失败快速**：语义漂移在训练开始前就被检测并阻止
-
-### 当前实现的限制
-
-⚠️ **Manifest 不在 checkpoint 内部**：`mopd_manifest.json` 是独立文件，不在 actor checkpoint 内
-⚠️ **需要外部配置**：Resume 仍需提供 Hydra 配置（虽然会被 manifest 验证）
-⚠️ **Teacher 权重不保存**：依赖 `model_path` 可访问性
-
-### 结论
-
-⚠️ **部分解决，但已有实质性改进**：
-
-当前实现通过 manifest 系统提供了：
-1. ✅ 配置快照与验证
-2. ✅ 语义漂移检测
-3. ✅ 可复现性保障
-
-但尚未实现：
-1. ❌ Checkpoint 完全自描述（manifest 未嵌入 checkpoint 内部）
-2. ❌ Teacher 权重快照（依赖外部 model_path）
-3. ❌ 无配置恢复（仍需提供 Hydra 配置）
-
-这是一个实用的折中方案：在保持灵活性的同时提供了关键的正确性保障。
+**部分缓解**
 
 ---
 
 ## 挑战 12：测试基础设施的空白
 
-### 当前分支新增了哪些测试层
+### 旧挑战的本质
 
-这项挑战是当前分支补得最系统的一项之一。
+旧文档写这条时，多教师蒸馏几乎没有测试。
 
-#### 1. 配置层测试
+### 当前分支怎么处理
 
-- `tests/unit/test_teacher_config.py`
-- `tests/unit/test_teacher_workers.py:28-143`
+当前测试已经覆盖：
 
-覆盖点包括：
-
-- teacher 配置可访问
-- teacher 列表可迭代
-- 默认禁用行为
-- teacher worker config 会关闭 dynamic ref batching，并使用 per-teacher micro batch
-
-#### 2. 数据层测试
-
-- `tests/unit/test_dataset_teacher_id.py:85-144`
-
-覆盖点包括：
-
-- `teacher_id_field` 抽取
-- 缺字段时回退为 `"default"`
-- 不配置时保持向后兼容
-- `collate_fn` 会把 `teacher_id` 放进 non-tensor batch
-
-#### 3. 路由层测试
-
-- `tests/unit/test_teacher_routing.py:71-329`
-
-覆盖点包括：
-
-- 基本 shape
-- 正确 scatter
-- 子批大小是否正确
-- 单教师 / 空教师跳过
-- unknown teacher 是否报错
-- routed sub-batch 是否在 DP 维度重新 balance
-
-#### 4. 算法层测试
-
-- `tests/unit/test_mopd_advantage.py:20-316`
-
-覆盖点包括：
-
-- 标准 MOPD advantage
-- IS correction
-- overflow protection
-- all-masked fallback
-- ExOPD 公式单测
-- ORM mixing
-- ORM 缺 uid 时报错
-- IS metrics 输出
-
-#### 5. 轻量集成测试
-
-- `tests/integration/test_mopd_e2e.py:38-317`
-
-覆盖点包括：
-
-- config -> compute_advantage -> result 的整体流
-- deterministic behavior
-- response_mask 生效
-- ExOPD / IS correction 通过 dispatch 的通路
-- MOPDConfig / TeacherConfig 与 OmegaConf 的集成
-
-#### 6. 运行脚本与预检测试
-
-- `tests/unit/test_mopd_run_script.py:4-16`
-- `tests/unit/test_mopd_preflight.py:36-160`
-
-覆盖点包括：
-
-- 生产脚本是否使用保守的内存默认值
-- preflight 命令构造
-- first actor update 成功边界
-- 常见失败日志标记识别
-
-#### 7. 烟雾测试工作流
-
-`recipe/mopd/README.md:154-192` 和 `recipe/mopd/README_SMOKE_TEST.md` 说明了四阶段 smoke workflow：
-
-- Phase 1：同 teacher 验证代码路径
-- Phase 2：不同 teacher 验证路由
-- Phase 3：IS correction
-- Phase 4：ORM mixing
-
-### 为什么仍然说“已基本解决”而不是“彻底解决”
-
-因为当前测试主要还是：
-
-- CPU unit tests
+- teacher config
+- teacher routing
+- dataset `teacher_id`
+- tokenizer compatibility / sequence reward runtime
+- quantized teacher worker
+- resource pools
+- preflight command and failure detection
+- manifest drift
+- advantage 公式
 - lightweight integration
-- smoke scripts
+- real recipe-aligned GPU E2E
 
-而且默认自动化覆盖里，真正“带 Ray + GPU + 实际 worker 生命周期”的测试仍然是 opt-in 的。`tests/integration/test_mopd_e2e.py:324-355` 明确要求：
+代表性证据：
 
-- CUDA 可用
-- Ray 环境可用
-- 提供真实模型权重
-- `VERL_MOPD_E2E=1`
+- 路由跨 pool overlap / 同 pool 串行：
+  `tests/unit/test_teacher_routing.py:427-485`
+- sequence reward runtime：
+  `tests/unit/test_mopd_trainer_runtime.py:540-690`
+- manifest drift：
+  `tests/unit/test_mopd_trainer_runtime.py:733-768`
+- sequence teacher advantage 组合：
+  `tests/unit/test_mopd_advantage.py:328-428`
+- 当前验证结果：
+  `docs/plans/mopd-test-results.md:3-61`
 
-另外还有一些运行时 guardrail 当前没有看到对应单测，例如：
+### 为什么这算已解决
 
-- teacher `resource_pool` 非法时报错：`verl/trainer/ppo/ray_trainer.py:855-861`
-- MOPD 与 LoRA ref-in-actor 不兼容时报错：`verl/trainer/ppo/ray_trainer.py:841-845`
-- `ppo_epochs=1` 约束：`verl/trainer/ppo/ray_trainer.py:875-884`
-- teacher 输出 shape 不匹配时报错：`verl/trainer/ppo/ray_trainer.py:1305-1310`
+“测试空白”这个问题本身已经不存在了。当前当然仍然不是无限完整，但已经远远不是零覆盖状态。
 
-真正的：
+需要如实保留的剩余验证边界也已经写在 `mopd-test-results.md` 里：
 
-- 带 Ray 的完整多 worker 自动化 E2E
-- 长程 full-run 稳定性验证
-- ExOPD/base-model 真正线上链路
+- 长程稳定性
+- 多节点
+- OOM recovery / fault recovery
 
-仍然没有完全自动化覆盖。
+见 `docs/plans/mopd-test-results.md:46-61`。
 
-但与旧文档中的“几乎空白”相比，当前分支已经建立了完整的基础测试框架。
+### 状态
 
----
-
-## 一个最重要的架构判断：当前分支不是“泛化旧 G-OPD 双教师实现”，而是“替换实现重心”
-
-如果只看旧文档，很容易以为 N-teacher 的自然做法是：
-
-- 在 `fsdp_workers.py` 里把双教师模型槽位泛化成一个列表或字典
-- 在 `dp_actor.py` 里把 `"math"` / `"code"` if/elif 改成更大的 if/elif
-
-但当前分支实际上没有这么做。
-
-当前分支做的是：
-
-- 让 worker 仍然只知道“我是一个普通 RefPolicy”
-- 让 trainer 知道“我有很多教师 RefPolicy worker groups”
-- 让 dataset 提供 `teacher_id`
-- 让 trainer 在 batch 级别按 `teacher_id` 做子批路由
-- 让算法层只消费已经选好的 `teacher_log_prob`
-
-这是一种明显更干净、更符合 MOPD 论文“per-sample domain teacher routing”的实现路径。
-
-这也是为什么当前分支能在不改 `Role` 枚举、不改 actor loss 热路径、不继续增加模型插槽的情况下，把 N-teacher 主链路做通。
+**已解决**
 
 ---
 
-## 当前分支的实现完整度与剩余优化空间
+## 最终判断
 
-虽然主链路已经成型且核心功能完整，但如果站在长期可维护性和工程优化角度，仍有以下改进空间：
+如果只问“当前分支到底采用了什么架构”，答案是：
 
-### 1. Teacher 并行执行（性能优化）
+**trainer/controller 侧多教师 worker graph + dual-path teacher signal**
 
-**现状**：Teacher log prob 计算是串行的
-- `for teacher_name, teacher_wg in self.teacher_wgs.items()` 顺序遍历
-- 每个 teacher 等待前一个完成后才开始
+如果只问“和旧双教师实现相比，哪些挑战真正被打掉了”，答案是：
 
-**优化方向**：
-- 利用 resource pool 隔离实现真正并行
-- 使用 `ray.get()` 批量等待所有 teacher jobs
-- 预期收益：N 个 teachers 的 wall-clock 时间从 O(N) 降至 O(1)
+- **已解决**：1 / 4 / 5 / 6 / 8 / 9 / 10 / 12
+- **部分缓解**：2 / 3 / 7 / 11
+- **当前没有哪一项还是旧文档描述的原样问题**
 
-**当前架构已支持**：Resource pool 机制已为并行化提供基础设施
+如果只问“哪些点在当前分支里还不能说已经彻底解决”，最重要的是四个：
 
-### 2. Per-Teacher 监控指标（可观测性增强）
+1. **内存仍随教师数增长**
+   只是通过 shared base、quantization、resource pools 和 micro-batching 做了工程缓解。
+2. **teacher forward 仍不是完全并行**
+   当前只做到“跨 pool 重叠、同 pool 串行”，默认 recipe 仍然共享 `global_pool`。
+3. **异构 tokenizer 不是通用 token-level 解**
+   当前的真实解决方案是 `sequence_reward` fallback，而不是跨 tokenizer 的 token-level exact KL。
+4. **checkpoint 还不自包含**
+   当前有 manifest 和 drift detection，但 teacher/base artifacts 仍是外部依赖。
 
-**现状**：训练指标按全局聚合
-- `actor/pg_loss` 是所有 teachers 混合的平均值
-- 无法诊断某个 teacher 是否贡献了不成比例的梯度
+如果把“工程收尾”单独拿出来看，当前还有两条不能写成彻底收口：
 
-**优化方向**：
-- 按 teacher 分组计算 loss、KL divergence、gradient norm
-- 输出 per-teacher 训练曲线
-- 帮助调试异构 teacher 的梯度尺度问题
+5. **lifecycle cleanup 只是部分收口**
+   `fit()` 已新增统一的 `_finalize_fit_resources()`，但 `base_policy_wg` 仍无对称 cleanup，异常路径也还没有
+   全局 `finally` 保障。
+6. **typed config 仍未全链路接线**
+   `TeacherConfig` / `MOPDConfig` 已存在，但 `AlgoConfig` 和 `validate_config()` 还没把 `algorithm.mopd`
+   完整 typed 化。
 
-**实现难度**：中等（需要在 advantage 计算时保留 teacher 分组信息）
-
-### 3. 数据集级 Teacher 分布统计（数据质量保障）
-
-**现状**：Preflight 检查验证 teacher_id 存在性，但不输出统计
-- 无法及早发现极端偏斜（如 99% 样本属于一个 teacher）
-- 无法检测脏数据（如 teacher_id 拼写错误但恰好匹配某个 teacher）
-
-**优化方向**：
-- 在 dataset 加载时输出 teacher 分布直方图
-- 警告极端不平衡的分布
-- 提供数据质量报告
-
-**实现难度**：简单（在 `RLHFDataset.__init__` 中添加统计逻辑）
-
-### 4. Checkpoint 完全自描述化（可复现性增强）
-
-**现状**：Manifest 系统已提供语义验证，但仍需外部配置
-- `mopd_manifest.json` 是独立文件
-- Resume 需要提供 Hydra 配置（虽然会被验证）
-
-**优化方向**：
-- 将 manifest 嵌入 actor checkpoint 内部
-- 支持从 checkpoint 直接恢复（无需外部配置）
-- 可选：快照 teacher 权重到 checkpoint（增加存储成本）
-
-**实现难度**：中等（需要修改 checkpoint 格式）
-
-### 5. 量化 Teacher Backend 的生产验证（工程成熟度）
-
-**现状**：配置支持 `hf_int8`/`hf_4bit` backend，但缺少生产验证
-- `TeacherWorker` 类存在但未在主测试套件中覆盖
-- 量化精度对蒸馏质量的影响未量化
-
-**优化方向**：
-- 补充量化 backend 的集成测试
-- 量化评估：int8/4bit teacher 的蒸馏效果 vs fp16 baseline
-- 文档化内存-质量 trade-off
-
-**实现难度**：中等（需要 GPU 测试环境）
-
-### 6. 自动 Tokenizer 兼容性检测（用户体验优化）
-
-**现状**：用户必须显式配置 `tokenizer_policy`
-- 错误配置会在 preflight 时报错
-- 但系统不会自动建议正确的 policy
-
-**优化方向**：
-- 自动检测 teacher 与 student tokenizer 是否兼容
-- 不兼容时自动建议使用 `tokenizer_policy: “sequence_reward”`
-- 减少配置负担
-
-**实现难度**：简单（在 preflight 检查中添加建议逻辑）
-
----
-
-## 最终判断（基于源码深度分析）
-
-如果以 `n-teacher-extension-challenges.md` 为基线，当前分支已经成功完成了 MOPD 落地中最关键的架构转型：
-
-**架构转型**：
-- ❌ 旧方案：双教师、槽位式、actor 内硬编码
-- ✅ 新方案：多教师、配置式、trainer 路由式、算法注册式
-
-**核心功能完整度：95%**
-
-已完全实现的能力：
-- ✅ N 个 teacher 的显式配置（`MOPDConfig` + `TeacherConfig`）
-- ✅ Teacher worker 的独立初始化与生命周期管理
-- ✅ 按样本 `teacher_id` 的子批路由
-- ✅ 统一 `teacher_log_prob` 张量接口
-- ✅ 标准 MOPD advantage（MiMo 论文 Eq. 7-9）
-- ✅ ExOPD with base normalization（完整实现）
-- ✅ Per-teacher lambda overrides（batch lambda tensor）
-- ✅ 异构 tokenizer 支持（tokenizer_policy 双模式）
-- ✅ IS correction with overflow protection
-- ✅ ORM mixing
-- ✅ Resource pool management + 量化后端
-- ✅ Checkpoint manifest + 语义漂移检测
-- ✅ 综合测试覆盖（97+ 测试用例）
-
-剩余 5% 是工程优化空间：
-- ⚠️ Teacher 并行执行（性能优化）
-- ⚠️ Per-teacher 监控指标（可观测性）
-- ⚠️ 数据集统计（数据质量）
-- ⚠️ Checkpoint 完全自描述（可复现性增强）
-- ⚠️ 量化 backend 生产验证（工程成熟度）
-
-**生产就绪评估：A-（优秀，有小幅优化空间）**
-
-当前实现已经是**生产就绪**的 N-teacher MOPD 系统，核心功能完整、测试覆盖充分、错误处理健壮。剩余优化项主要是性能、可观测性、用户体验层面的增强，而非功能缺失。
+这也是为什么当前分支已经足够支撑 MOPD 主链路落地，但还没有把所有 N-teacher 工程问题做到
+“理论上完全消失”的根本原因。

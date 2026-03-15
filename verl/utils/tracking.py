@@ -17,6 +17,7 @@ A unified tracking interface that supports logging data to different backend
 
 import dataclasses
 import json
+import logging
 import os
 from enum import Enum
 from functools import partial
@@ -24,6 +25,8 @@ from pathlib import Path
 from typing import Any
 
 import orjson
+
+logger = logging.getLogger(__file__)
 
 
 class Tracking:
@@ -61,6 +64,7 @@ class Tracking:
                 assert backend in self.supported_backend, f"{backend} is not supported"
 
         self.logger = {}
+        self._finished = False
 
         if "tracking" in default_backend or "wandb" in default_backend:
             import os
@@ -164,21 +168,35 @@ class Tracking:
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)
 
+    def finish(self):
+        if getattr(self, "_finished", False):
+            return
+
+        self._finished = True
+
+        finish_specs = (
+            ("wandb", {"exit_code": 0}),
+            ("swanlab", {}),
+            ("vemlp_wandb", {"exit_code": 0}),
+            ("tensorboard", {}),
+            ("clearml", {}),
+            ("trackio", {}),
+            ("file", {}),
+        )
+        for backend, kwargs in finish_specs:
+            logger_instance = self.logger.get(backend)
+            if logger_instance is None:
+                continue
+            try:
+                logger_instance.finish(**kwargs)
+            except Exception:
+                logger.exception("Failed to finish tracking backend '%s'", backend)
+
     def __del__(self):
-        if "wandb" in self.logger:
-            self.logger["wandb"].finish(exit_code=0)
-        if "swanlab" in self.logger:
-            self.logger["swanlab"].finish()
-        if "vemlp_wandb" in self.logger:
-            self.logger["vemlp_wandb"].finish(exit_code=0)
-        if "tensorboard" in self.logger:
-            self.logger["tensorboard"].finish()
-        if "clearml" in self.logger:
-            self.logger["clearml"].finish()
-        if "trackio" in self.logger:
-            self.logger["trackio"].finish()
-        if "file" in self.logger:
-            self.logger["file"].finish()
+        try:
+            self.finish()
+        except Exception:
+            pass
 
 
 class ClearMLLogger:

@@ -2127,6 +2127,48 @@ class RayPPOTrainer:
             critic_output = self.critic_wg.update_critic(batch)
         return critic_output
 
+    def _finalize_fit_resources(self, tracking_logger=None, progress_bar=None):
+        if progress_bar is not None:
+            progress_bar.close()
+
+        self._shutdown_dataloader_workers()
+
+        async_rollout_manager = getattr(self, "async_rollout_manager", None)
+        if async_rollout_manager is not None:
+            try:
+                async_rollout_manager.shutdown()
+            except Exception:
+                logger.exception("Async rollout manager shutdown failed during trainer finalization")
+
+        try:
+            self.cleanup_teacher_workers()
+        except Exception:
+            logger.exception("Teacher worker cleanup failed during trainer finalization")
+
+        if tracking_logger is not None:
+            try:
+                tracking_logger.finish()
+            except Exception:
+                logger.exception("Tracking finalization failed during trainer finalization")
+
+    def _shutdown_dataloader_workers(self):
+        for loader_name in ("train_dataloader", "val_dataloader"):
+            dataloader = getattr(self, loader_name, None)
+            if dataloader is None:
+                continue
+
+            iterator = getattr(dataloader, "_iterator", None)
+            if iterator is None:
+                continue
+
+            shutdown_workers = getattr(iterator, "_shutdown_workers", None)
+            if callable(shutdown_workers):
+                try:
+                    shutdown_workers()
+                except Exception:
+                    logger.exception("Failed to shutdown %s workers during trainer finalization", loader_name)
+            dataloader._iterator = None
+
     def fit(self):
         """
         The training loop of PPO.
@@ -2144,6 +2186,7 @@ class RayPPOTrainer:
             default_backend=self.config.trainer.logger,
             config=OmegaConf.to_container(self.config, resolve=True),
         )
+        progress_bar = None
 
         self.global_steps = 0
 
@@ -2161,6 +2204,7 @@ class RayPPOTrainer:
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
+                self._finalize_fit_resources(tracking_logger=logger, progress_bar=progress_bar)
                 return
 
         if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
@@ -2531,8 +2575,7 @@ class RayPPOTrainer:
                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
                     pprint(f"Final validation metrics: {last_val_metrics}")
-                    progress_bar.close()
-                    self.cleanup_teacher_workers()
+                    self._finalize_fit_resources(tracking_logger=logger, progress_bar=progress_bar)
                     return
 
                 # this is experimental and may be changed/removed in the future
@@ -2541,8 +2584,7 @@ class RayPPOTrainer:
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
 
-        # Clean up teacher workers (MOPD) when training loop exits
-        self.cleanup_teacher_workers()
+        self._finalize_fit_resources(tracking_logger=logger, progress_bar=progress_bar)
 
     def cleanup_teacher_workers(self):
         """Clean up teacher worker groups for MOPD.
