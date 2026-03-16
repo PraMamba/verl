@@ -54,18 +54,19 @@
 | 8. 全局 lambda 无法适配异构教师 | 已解决 | 已支持 per-teacher `lambda_val`，并构造成 batch 级 tensor |
 | 9. 数据管道缺少验证 | 已解决 | 已有 `teacher_id` 提取、preflight 分布检查、unknown/missing teacher fail-fast |
 | 10. 优势函数覆盖式计算与浪费 | 已解决 | MOPD 已是独立 estimator，不再在 actor 中覆盖优势 |
-| 11. 检查点与恢复缺失 | 部分缓解 | 已有 `mopd_manifest.json` 与 drift detection，但 teacher/base artifacts 仍不自包含 |
-| 12. 测试基础设施空白 | 已解决 | 当前已有 config/routing/runtime/manifest/advantage/E2E 多层测试，并已 fresh 跑通单机 4 卡 preflight / GPU E2E / full recipe run / 保守 `18/18` long-run rerun |
+| 11. 检查点与恢复缺失 | 部分缓解 | 已有 `mopd_manifest.json`、`checkpoint.complete`、latest-complete resume 选择与 actor-death fallback 证据，但 teacher/base artifacts 仍不自包含 |
+| 12. 测试基础设施空白 | 已解决 | 当前已有 config/routing/runtime/manifest/advantage/E2E 多层测试，并已 fresh 跑通单机 4 卡 preflight / GPU E2E / full recipe run / 保守 `18/18` long-run rerun，以及单机 actor-death 恢复演练；但多节点、非 actor-death 故障恢复、async-save restart、重复长程质量收益和 real-weight quantized `sequence_reward` 仍未充分验证 |
 
 ### 当前仍然最值得关注的真实挑战
 
 1. teacher 内存与吞吐仍大体随 teacher 数增长，只是增长形态已经 backend-specific。
 2. teacher 调度是“per-pool pipeline with limited overlap”，不是全局 fully parallel。
 3. 异构 tokenizer 当前只有 sequence-level bridge，没有跨 tokenizer 的 token-level exact reverse KL。
-4. checkpoint 仍依赖外部 teacher/base 模型路径，manifest 只能做 drift detection，不能提供 artifact 级自包含恢复。
+4. checkpoint 仍依赖外部 teacher/base 模型路径；当前虽已有 `checkpoint.complete`、latest-complete resume 选择和 manifest drift detection，但仍不能提供 artifact 级自包含恢复。
 5. 生命周期清理主路径已经闭环：`fit()` 现在统一走 `_finalize_fit_resources()`，`cleanup_teacher_workers()`
-   也会释放 `base_policy_wg`，最新 preflight / GPU E2E / full run / `18/18` long-run rerun 都以成功退出收尾；
-   但 vLLM 关停阶段仍可见 `resource_tracker` 噪声，尚未彻底消除。
+   也会释放 `base_policy_wg`；历史上的 vLLM 关停噪声已经在 2026-03-16 的最新 full recipe rerun
+   `model_training_20260316_10.log` 上消失。若还要补更强证据，重点已变成 post-fix GPU E2E /
+   `18/18` rerun 的覆盖面，而不是 teardown 根因未修。
 6. 部分 schema 字段仍不是 runtime 能力，例如 `TeacherConfig.weight`、per-teacher `base_model_path`；
    不过它们现在会 fail-fast，而不是静默漂移。
 
@@ -237,6 +238,9 @@ A_final
 - `mopd_manifest.json`
 - semantic drift hard-fail
 - deployment drift warning
+- 同步 checkpoint 的 `checkpoint.complete`
+- `resume_mode=auto` 对 tracker 缺失/不完整时的 latest-complete fallback
+- 单机 actor-death 注入后，从 complete checkpoint 恢复到 `training/global_step:2` 的真实日志证据
 
 但仍然没有做到：
 
@@ -295,8 +299,9 @@ A_final
 3. `resource_pool` 不是自动独占 GPU；只有专用 pool + 合适 colocate budget 才会形成真实隔离
 4. 当前 manifest/drift validation 已存在，不应再写成“恢复时完全没有 teacher 语义”
 5. 生命周期清理主路径已经补齐：
-   `fit()` 现在有统一 `try/finally`，`cleanup_teacher_workers()` 也会释放 `base_policy_wg`；最新真实运行闭环里看到的
-   是完成后的 `resource_tracker` 噪声，而不是主链路清理失效
+   `fit()` 现在有统一 `try/finally`，`cleanup_teacher_workers()` 也会释放 `base_policy_wg`；而且修复后的
+   最新真实 shell rerun `model_training_20260316_10.log` 已不再出现 `resource_tracker` /
+   `KeyError` / `Traceback`，所以当前不是主链路清理失效，而是历史噪声已经被新运行覆盖
 
 ### 维度 4：推理引擎 / rollout backend
 
@@ -384,6 +389,9 @@ A_final
 
 - manifest 记录 semantic / deployment 配置
 - 恢复时检测 drift
+- 同步 checkpoint 完整性 marker
+- tracker 缺失或失真时回退到 latest complete checkpoint
+- 单机 actor-death 故障注入后的恢复闭环证据
 
 当前仍未补上的能力：
 
@@ -395,7 +403,7 @@ A_final
 
 **当前 checkpoint 更像“有自描述元数据的训练状态”，而不是“包含全部 teacher/base 依赖的完整快照”。**
 
-### 6. 生命周期主路径已闭环，但关停噪声仍需治理
+### 6. 生命周期主路径已闭环，默认 full recipe 已验证干净退出
 
 当前最容易被误判的点是：
 
@@ -407,6 +415,14 @@ A_final
 2026-03-15 的 preflight、GPU E2E、full recipe run 和更保守的 `18/18` long-run rerun 都已成功退出，
 这说明 cleanup 主路径已经不是阻塞问题。
 
+在此基础上，2026-03-16 又对修复后的默认 full recipe shell path 做了 fresh rerun，并检查了
+`model_training_20260316_10.log`：
+
+- 日志到达 `step:6 ... training/global_step:6`
+- 打印 `Final validation metrics`
+- 以最终 swanlab footer 收尾
+- 全文不再出现 `resource_tracker`、`KeyError`、`process died unexpectedly` 或 `Traceback`
+
 这次长程闭环还补上了之前缺的三条运行侧证据：
 
 - teacher 路由均值 `cell=0.4965`、`disease=0.5035`，与 `100 / 100` 数据分布对齐
@@ -414,9 +430,14 @@ A_final
 - 在 `response_length/clip_ratio` 最高到 `1.0` 的高压力下仍完成 `18/18`；至少对这次保守 rollout 配置而言，
   之前看到的 generation OOM / vLLM wake-up OOM 边界没有再次出现
 
-当前残留问题更准确地说是：
+本轮还额外补上了一条故障恢复侧证据：
 
-**vLLM / multiprocessing 关停阶段仍会出现 `resource_tracker` `KeyError` 噪声，但它们发生在成功完成之后。**
+- 单机 actor-death 注入后，初次 run 以 `ActorDiedError` 退出；强制删除 tracker 后，恢复 run 明确回退到
+  `global_step_1` 的 complete checkpoint，并完成到 `training/global_step:2`
+
+因此，当前残留问题更准确地说已不再是“关停噪声仍然存在”，而是：
+
+**默认 full recipe shell path 的 teardown noise 已被真实运行证明消失；若要补更强矩阵证据，剩下的是 post-fix GPU E2E / `18/18` rerun 是否也要重跑。**
 
 ### 7. typed config 的 runtime 闭环已补齐，但 composition-time strictness 仍偏弱
 
@@ -440,6 +461,7 @@ A_final
 - “MOPD 还需要从双教师硬编码架构重构成显式多教师 worker graph”
 - “还需要引入 per-teacher `lambda_val`”
 - “还需要新增 manifest 才能做 resume drift 检查”
+- “resume 仍然只能盲信 `latest_checkpointed_iteration.txt`”
 - “还没有 teacher routing fail-fast”
 - “还没有多教师测试基础设施”
 - “异构 tokenizer teacher 完全不能接入”
@@ -449,6 +471,7 @@ A_final
 - 多教师 worker graph 已落地
 - per-teacher lambda 已落地
 - manifest drift detection 已落地
+- complete-checkpoint 选择与 tracker-missing fallback 已落地
 - teacher preflight fail-fast 已落地
 - 测试基础设施已成体系
 - 异构 tokenizer teacher 已可通过 `sequence_reward` 接入，但不是 token-level exact KL
@@ -478,7 +501,7 @@ A_final
   - per-pool teacher 调度扩展性
   - 异构 tokenizer 的 token-level bridge
   - checkpoint self-containment
-  - 关停噪声治理
+  - 更广的 post-fix runtime 验证覆盖
   - composition-time typed strictness
 
 这才是对当前 worktree 最贴近事实、也最适合指导后续工作的 MOPD N-teacher 挑战清单。

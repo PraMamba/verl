@@ -62,8 +62,8 @@ dual-path teacher signal（token log prob / sequence reward）+ 独立的 MOPD a
 | 8. 全局 lambda 无法适配异构教师 | 已解决 | 支持 per-teacher `lambda_val`，并在 batch 内构造 per-sample lambda tensor |
 | 9. 数据管道缺少验证 | 已解决 | 增加 `teacher_id` 提取、preflight 分布统计、unknown/missing teacher fail-fast、recipe 侧 teacher_id 注入 |
 | 10. 优势函数覆盖式计算与浪费 | 已解决 | MOPD 成为独立注册 estimator，不再在 actor 侧覆盖已有优势 |
-| 11. 检查点与恢复缺失 | 部分缓解 | 有 manifest 持久化和 drift 检测，但 checkpoint 仍不自包含 teacher/base artifacts |
-| 12. 测试基础设施空白 | 已解决 | 已有 unit/integration/preflight/GPU E2E 多层覆盖，并已在 2026-03-15 fresh 跑通单机 4 卡 full recipe 闭环和保守 `18/18` long-run rerun；但多节点和故障恢复仍未充分验证 |
+| 11. 检查点与恢复缺失 | 部分缓解 | 有 manifest、`checkpoint.complete`、complete-checkpoint 选择和 actor-death fallback 恢复，但 checkpoint 仍不自包含 teacher/base artifacts |
+| 12. 测试基础设施空白 | 已解决 | 已有 unit/integration/preflight/GPU E2E 多层覆盖，并已在 2026-03-15 fresh 跑通单机 4 卡 full recipe 闭环、保守 `18/18` long-run rerun，以及单机 actor-death 恢复演练；2026-03-16 又用最新 full recipe rerun 验证了 teardown noise 已消失；但多节点和其他故障类型仍未充分验证 |
 
 严格按“彻底解决”的标准看，当前仍不能算完全收口的主要是 **2 / 3 / 7 / 11**。
 其余挑战在当前实现里已经不再是旧文档描述的那个问题。
@@ -337,6 +337,12 @@ deployment manifest 里记录：
 - per-teacher `resource_pool`
 - per-teacher `log_prob_micro_batch_size`
 
+除此之外，checkpoint / resume 语义也已经明显强于旧版文档描述：
+
+- 同步 checkpoint 会写 `checkpoint.complete`，并原子更新 `latest_checkpointed_iteration.txt`
+- `resume_mode=auto` 如果发现 tracker 缺失或指向不完整目录，会扫描并回退到最新 complete checkpoint
+- 无 marker 的 async checkpoint 只在单 async role 且 finalize artifacts 完整时才会被保守接受
+
 #### 7.4 tests
 
 当前不再是“多教师逻辑没有测试”：
@@ -352,8 +358,8 @@ deployment manifest 里记录：
 
 而且当前 worktree 的最新验证记录已经不再只是“重新执行一组 CPU-safe suite”，而是已经补齐了单机 4 卡的真实运行闭环：
 
-- core CPU-safe MOPD suite：`116 collected / 115 passed / 1 skipped / 1 warning`
-- 额外 teardown/cleanup regression：`5 passed / 3 warnings`
+- core CPU-safe MOPD suite：`124 collected / 123 passed / 1 skipped / 1 warning`
+- 额外 teardown/cleanup regression：`7 passed / 3 warnings`
 - recipe preflight shell：成功到达 `training/global_step:1`
 - 完整 GPU subprocess E2E：外层 pytest `1 passed, 1 warning in 345.91s`，内层训练日志到达 `Training Progress: 100%|...| 1/1`
 - full recipe shell run：退出码 `0`，到达 `Training Progress: 100%|...| 6/6`、`training/global_step:6`，并写出 `latest_checkpointed_iteration.txt = 6`
@@ -361,8 +367,13 @@ deployment manifest 里记录：
   `training/global_step:18`、`validation generation end` 与 `Final validation metrics`
 - 这次长程 run 的 teacher 路由均值为 `cell=0.4965` / `disease=0.5035`，IS mask 均值为
   `is_valid_fraction=0.9999998278` / `is_zeroed_fraction=1.714958e-7`
-- GPU E2E、full run 与 long-run log 末尾都可见 `resource_tracker` 相关噪声，但它们发生在成功完成之后，
-  当前更像 shutdown noise，而不是主链路失败
+- 单机 actor-death 恢复演练：初次 run 因 `ActorDiedError` 退出，删除 tracker 后仍从
+  `ckpts/global_step_1` 的 complete checkpoint 自动恢复，并到达 `Training Progress: 100%|...| 2/2`
+  与 `training/global_step:2`
+- 2026-03-15 的 GPU E2E / full run / long-run 历史日志末尾确实都出现过
+  `resource_tracker` 相关噪声；但修复后重新执行的 2026-03-16 full recipe 日志
+  `model_training_20260316_10.log` 已不再出现 `resource_tracker` / `KeyError` / `Traceback`，
+  因此 teardown noise 在默认 full recipe shell path 上已被真实运行证明收口
 
 这说明当前测试基础设施已经很强，但它证明的是：
 
@@ -372,7 +383,7 @@ deployment manifest 里记录：
 
 而不是：
 
-- multi-node / fault recovery 全部重新通过
+- multi-node / NCCL timeout / OOM / segfault / async-save restart 全部重新通过
 
 ---
 
@@ -827,16 +838,31 @@ MOPD 现在是独立注册的 advantage estimator：
 当前分支已经加入 manifest：
 
 - 生成 manifest：`verl/trainer/ppo/ray_trainer.py:1276-1329`
-- 保存 manifest：`verl/trainer/ppo/ray_trainer.py:1663-1667`
-- 恢复时校验 manifest：`verl/trainer/ppo/ray_trainer.py:1715-1718`
+- 保存 manifest 与 complete marker：`verl/trainer/ppo/ray_trainer.py:1655-1667`
+- 恢复目录选择：`verl/trainer/ppo/ray_trainer.py:1796-1843`
+- 恢复时校验 manifest：`verl/trainer/ppo/ray_trainer.py:1867-1870`
 - semantic drift 直接报错，deployment drift 仅 warning：
   `verl/trainer/ppo/ray_trainer.py:1331-1337`
+- 同步 checkpoint 会额外写 `checkpoint.complete`，并原子更新 tracker：
+  `verl/trainer/ppo/ray_trainer.py:1661-1674`
+- `resume_mode=auto` 会忽略不完整 tracker 并扫描最新 complete checkpoint：
+  `verl/trainer/ppo/ray_trainer.py:1777-1843`
+- async-save 无 marker checkpoint 只在单 async role 且 finalize artifacts 齐全时保守接受：
+  `verl/trainer/ppo/ray_trainer.py:1733-1776`
 
 manifest 里已经记录：
 
 - global MOPD semantic config
 - 每个 teacher 的 model path / backend / tokenizer policy / lambda / seq weight
 - deployment 侧的 resource pool 和 micro-batch 信息
+
+2026-03-15 的真实 actor-death 演练也补上了恢复证据：
+
+- 初次 run 因 `ray.exceptions.ActorDiedError` 退出
+- `summary.json` 记录 `checkpoint_complete_seen=true`
+- 强制删除 `latest_checkpointed_iteration.txt` 后，resume 日志明确写出
+  `falling back to latest complete checkpoint .../global_step_1`
+- 恢复 run 到达 `step:2 ... training/global_step:2`
 
 ### 为什么还只是部分缓解
 
@@ -847,6 +873,7 @@ manifest 里已经记录：
 - teacher/base worker 权重本身不随 checkpoint 打包
 - resume 仍然依赖外部模型路径在恢复时可用且内容未漂移
 - manifest 记录的是路径和值，不是 artifact hash 或 revision pin
+- 显式 `resume_path` 指向旧的 partial async checkpoint 时，当前实现仍会拒绝恢复，这是有意保守的行为
 
 所以它已经从“完全不记 MOPD 上下文”进化成“能检测语义漂移”，但还没有进化成
 “拿到 checkpoint 就能完整自举恢复 teacher/base artifacts”。
@@ -890,7 +917,7 @@ manifest 里已经记录：
 - sequence teacher advantage 组合：
   `tests/unit/test_mopd_advantage.py:328-428`
 - 当前验证结果：
-  `docs/plans/mopd-test-results.md:3-61`
+  `docs/plans/mopd-test-results.md` 的 `Executive Summary` 与 `Current Validation Boundary`
 
 ### 为什么这算已解决
 
@@ -900,9 +927,10 @@ manifest 里已经记录：
 
 - 更长 schedule 或重复长程实验下的质量收益
 - 多节点
-- OOM recovery / fault recovery
+- 除 actor-death 单机场景外的其他故障恢复，包括 OOM / NCCL timeout / segfault / async-save restart
+- real-weight quantized-teacher `sequence_reward` scoring path
 
-见 `docs/plans/mopd-test-results.md:46-61`。
+见 `docs/plans/mopd-test-results.md` 的 `Current Validation Boundary`。
 
 ### 状态
 
@@ -931,14 +959,16 @@ manifest 里已经记录：
 3. **异构 tokenizer 不是通用 token-level 解**
    当前的真实解决方案是 `sequence_reward` fallback，而不是跨 tokenizer 的 token-level exact KL。
 4. **checkpoint 还不自包含**
-   当前有 manifest 和 drift detection，但 teacher/base artifacts 仍是外部依赖。
+   当前已有 manifest、`checkpoint.complete` 和 latest-complete resume fallback，但 teacher/base artifacts 仍是外部依赖。
 
-如果把“工程收尾”单独拿出来看，当前最值得继续跟踪的是两条残余问题：
+如果把“工程收尾”单独拿出来看，当前最值得继续跟踪的是两条状态：
 
-5. **cleanup 主路径已闭环，但关停噪声还在**
+5. **cleanup 主路径已闭环，默认 full recipe 已验证干净退出**
    `fit()` 现在已有统一 `_finalize_fit_resources()` 与 `try/finally`，`cleanup_teacher_workers()` 也会释放
-   `base_policy_wg`；不过 GPU E2E / full run / `18/18` long-run rerun 结束后仍可见 `resource_tracker`
-   噪声，尚未彻底消除。
+   `base_policy_wg`；而且修复后的 2026-03-16 `run_mopd_qwen3_4b.sh` 日志
+   `model_training_20260316_10.log` 已到达 `step:6 ... training/global_step:6`、`Final validation metrics`
+   与最终 swanlab footer，并且不再出现 `resource_tracker` / `KeyError` / `Traceback`。当前剩下的只是
+   post-fix GPU E2E / `18/18` rerun 是否也要补跑，不是 cleanup 主路径还没闭环。
 6. **typed config 的 runtime 闭环已补齐，但 composition-time strictness 仍偏弱**
    `TeacherConfig` / `MOPDConfig` / `AlgoConfig.__post_init__` / `validate_config()` 已把 runtime typed validation 接通，
    但 `AlgoConfig.mopd` 仍是 `Any` 注解。

@@ -15,6 +15,7 @@
 """Unit tests for MOPD trainer runtime helpers."""
 
 import logging
+import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -24,7 +25,7 @@ from omegaconf import OmegaConf
 from tensordict import TensorDict
 
 from verl import DataProto
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+from verl.trainer.ppo.ray_trainer import CHECKPOINT_COMPLETE_FILENAME, RayPPOTrainer
 
 
 class _ListDataset:
@@ -172,6 +173,8 @@ def _make_config():
             },
             "trainer": {
                 "default_local_dir": "/tmp/mopd-runtime-tests",
+                "default_hdfs_dir": None,
+                "del_local_ckpt_after_load": False,
             },
         }
     )
@@ -185,6 +188,53 @@ def _make_trainer(config=None, train_dataset=None):
     trainer.base_policy_wg = None
     trainer.teacher_wgs = {}
     return trainer
+
+
+class _RecordingCheckpointWG:
+    def __init__(self):
+        self.calls = []
+
+    def load_checkpoint(self, local_path, del_local_after_load=False):
+        self.calls.append((local_path, del_local_after_load))
+
+
+class _RecordingDataloader:
+    def __init__(self):
+        self.loaded_state = None
+
+    def load_state_dict(self, state_dict):
+        self.loaded_state = state_dict
+
+
+class _CheckpointStateDataloader(_RecordingDataloader):
+    def __init__(self, state_dict):
+        super().__init__()
+        self._state_dict = state_dict
+
+    def state_dict(self):
+        return self._state_dict
+
+
+class _SavingCheckpointWG:
+    def __init__(self):
+        self.calls = []
+
+    def save_checkpoint(self, local_path, remote_path, global_steps, max_ckpt_to_keep=None):
+        self.calls.append((local_path, remote_path, global_steps, max_ckpt_to_keep))
+        os.makedirs(local_path, exist_ok=True)
+        with open(os.path.join(local_path, "payload.pt"), "w", encoding="utf-8") as f:
+            f.write(str(global_steps))
+
+
+def _write_mock_async_checkpoint_payload(role_dir):
+    role_dir.mkdir(parents=True, exist_ok=True)
+    dist_ckpt_dir = role_dir / "dist_ckpt"
+    huggingface_dir = role_dir / "huggingface"
+    dist_ckpt_dir.mkdir()
+    huggingface_dir.mkdir()
+    (dist_ckpt_dir / "metadata.json").write_text("{}", encoding="utf-8")
+    (huggingface_dir / "config.json").write_text("{}", encoding="utf-8")
+    (role_dir / "transformer_config.json").write_text("{}", encoding="utf-8")
 
 
 def test_compute_base_log_prob_uses_base_worker():
@@ -213,10 +263,218 @@ def test_cleanup_teacher_workers_releases_base_policy_group_and_is_idempotent():
     assert trainer.teacher_wgs == {}
     assert trainer.base_policy_wg is None
 
+
+def test_load_checkpoint_auto_uses_complete_checkpoint_when_tracker_missing(tmp_path):
+    config = _make_config()
+    config.trainer.default_local_dir = str(tmp_path)
+    config.trainer.resume_mode = "auto"
+    config.trainer.del_local_ckpt_after_load = False
+    trainer = _make_trainer(config=config)
+    trainer.use_critic = False
+    trainer.global_steps = 0
+    trainer.actor_rollout_wg = _RecordingCheckpointWG()
+    trainer.train_dataloader = _RecordingDataloader()
+
+    complete_dir = tmp_path / "global_step_3"
+    actor_dir = complete_dir / "actor"
+    actor_dir.mkdir(parents=True)
+    (actor_dir / "model.pt").write_text("ok", encoding="utf-8")
+    torch.save({"position": 7}, complete_dir / "data.pt")
+    (complete_dir / CHECKPOINT_COMPLETE_FILENAME).write_text("3", encoding="utf-8")
+
+    trainer._load_checkpoint()
+
+    assert trainer.global_steps == 3
+    assert trainer.actor_rollout_wg.calls == [(os.fspath(actor_dir), False)]
+    assert trainer.train_dataloader.loaded_state == {"position": 7}
+
+
+def test_load_checkpoint_auto_skips_incomplete_tracked_checkpoint(tmp_path):
+    config = _make_config()
+    config.trainer.default_local_dir = str(tmp_path)
+    config.trainer.resume_mode = "auto"
+    config.trainer.del_local_ckpt_after_load = False
+    trainer = _make_trainer(config=config)
+    trainer.use_critic = False
+    trainer.global_steps = 0
+    trainer.actor_rollout_wg = _RecordingCheckpointWG()
+    trainer.train_dataloader = _RecordingDataloader()
+
+    fallback_dir = tmp_path / "global_step_1"
+    fallback_actor_dir = fallback_dir / "actor"
+    fallback_actor_dir.mkdir(parents=True)
+    (fallback_actor_dir / "model.pt").write_text("ok", encoding="utf-8")
+    torch.save({"position": 3}, fallback_dir / "data.pt")
+    (fallback_dir / CHECKPOINT_COMPLETE_FILENAME).write_text("1", encoding="utf-8")
+
+    incomplete_dir = tmp_path / "global_step_2"
+    (incomplete_dir / "actor").mkdir(parents=True)
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("2", encoding="utf-8")
+
+    trainer._load_checkpoint()
+
+    assert trainer.global_steps == 1
+    assert trainer.actor_rollout_wg.calls == [(os.fspath(fallback_actor_dir), False)]
+    assert trainer.train_dataloader.loaded_state == {"position": 3}
+
+
+def test_load_checkpoint_auto_ignores_async_payload_without_marker_when_tracker_missing(tmp_path):
+    config = _make_config()
+    config.trainer.default_local_dir = str(tmp_path)
+    config.trainer.resume_mode = "auto"
+    config.trainer.del_local_ckpt_after_load = False
+    config.actor_rollout_ref.actor = OmegaConf.create({"checkpoint": {"async_save": True}})
+
+    trainer = _make_trainer(config=config)
+    trainer.use_critic = False
+    trainer.global_steps = 0
+    trainer.actor_rollout_wg = _RecordingCheckpointWG()
+    trainer.train_dataloader = _RecordingDataloader()
+
+    incomplete_dir = tmp_path / "global_step_5"
+    actor_dir = incomplete_dir / "actor"
+    actor_dir.mkdir(parents=True)
+    (actor_dir / "partial.bin").write_text("partial", encoding="utf-8")
+    torch.save({"position": 9}, incomplete_dir / "data.pt")
+
+    trainer._load_checkpoint()
+
+    assert trainer.global_steps == 0
+    assert trainer.actor_rollout_wg.calls == []
+    assert trainer.train_dataloader.loaded_state is None
+
+
+def test_load_checkpoint_auto_uses_tracked_single_async_checkpoint_without_marker(tmp_path):
+    config = _make_config()
+    config.trainer.default_local_dir = str(tmp_path)
+    config.trainer.resume_mode = "auto"
+    config.trainer.del_local_ckpt_after_load = False
+    config.actor_rollout_ref.actor = OmegaConf.create({"checkpoint": {"async_save": True}})
+
+    trainer = _make_trainer(config=config)
+    trainer.use_critic = False
+    trainer.global_steps = 0
+    trainer.actor_rollout_wg = _RecordingCheckpointWG()
+    trainer.train_dataloader = _RecordingDataloader()
+
+    complete_dir = tmp_path / "global_step_6"
+    actor_dir = complete_dir / "actor"
+    _write_mock_async_checkpoint_payload(actor_dir)
+    torch.save({"position": 12}, complete_dir / "data.pt")
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("6", encoding="utf-8")
+
+    trainer._load_checkpoint()
+
+    assert trainer.global_steps == 6
+    assert trainer.actor_rollout_wg.calls == [(os.fspath(actor_dir), False)]
+    assert trainer.train_dataloader.loaded_state == {"position": 12}
+
+
+def test_load_checkpoint_auto_rejects_tracked_multi_async_checkpoint_without_marker(tmp_path):
+    config = _make_config()
+    config.trainer.default_local_dir = str(tmp_path)
+    config.trainer.resume_mode = "auto"
+    config.trainer.del_local_ckpt_after_load = False
+    config.actor_rollout_ref.actor = OmegaConf.create({"checkpoint": {"async_save": True}})
+    config.critic = OmegaConf.create({"checkpoint": {"async_save": True}})
+
+    trainer = _make_trainer(config=config)
+    trainer.use_critic = True
+    trainer.global_steps = 0
+    trainer.actor_rollout_wg = _RecordingCheckpointWG()
+    trainer.critic_wg = _RecordingCheckpointWG()
+    trainer.train_dataloader = _RecordingDataloader()
+
+    checkpoint_dir = tmp_path / "global_step_8"
+    actor_dir = checkpoint_dir / "actor"
+    critic_dir = checkpoint_dir / "critic"
+    _write_mock_async_checkpoint_payload(actor_dir)
+    _write_mock_async_checkpoint_payload(critic_dir)
+    torch.save({"position": 15}, checkpoint_dir / "data.pt")
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("8", encoding="utf-8")
+
+    trainer._load_checkpoint()
+
+    assert trainer.global_steps == 0
+    assert trainer.actor_rollout_wg.calls == []
+    assert trainer.critic_wg.calls == []
+    assert trainer.train_dataloader.loaded_state is None
+
+
+def test_load_checkpoint_resume_path_rejects_older_partial_single_async_checkpoint_when_tracker_is_newer(tmp_path):
+    config = _make_config()
+    config.trainer.default_local_dir = str(tmp_path)
+    config.trainer.resume_mode = "resume_path"
+    config.trainer.resume_from_path = str(tmp_path / "global_step_6")
+    config.trainer.del_local_ckpt_after_load = False
+    config.actor_rollout_ref.actor = OmegaConf.create({"checkpoint": {"async_save": True}})
+
+    trainer = _make_trainer(config=config)
+    trainer.use_critic = False
+    trainer.actor_rollout_wg = _RecordingCheckpointWG()
+    trainer.train_dataloader = _RecordingDataloader()
+
+    checkpoint_dir = tmp_path / "global_step_6"
+    actor_dir = checkpoint_dir / "actor"
+    actor_dir.mkdir(parents=True)
+    (actor_dir / "partial.bin").write_text("partial", encoding="utf-8")
+    torch.save({"position": 21}, checkpoint_dir / "data.pt")
+
+    newer_checkpoint_dir = tmp_path / "global_step_8"
+    newer_actor_dir = newer_checkpoint_dir / "actor"
+    _write_mock_async_checkpoint_payload(newer_actor_dir)
+    torch.save({"position": 34}, newer_checkpoint_dir / "data.pt")
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("8", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Requested resume checkpoint is incomplete"):
+        trainer._load_checkpoint()
+
+
+def test_save_checkpoint_writes_complete_marker_and_tracker(tmp_path):
+    config = _make_config()
+    config.trainer.default_local_dir = str(tmp_path)
+    config.actor_rollout_ref.actor = OmegaConf.create({"checkpoint": {}})
+    trainer = _make_trainer(config=config)
+    trainer.use_critic = False
+    trainer.global_steps = 4
+    trainer.actor_rollout_wg = _SavingCheckpointWG()
+    trainer.train_dataloader = _CheckpointStateDataloader({"cursor": 11})
+
+    trainer._save_checkpoint()
+
+    global_step_dir = tmp_path / "global_step_4"
+    assert (global_step_dir / "actor" / "payload.pt").exists()
+    assert (global_step_dir / "data.pt").exists()
+    assert (global_step_dir / CHECKPOINT_COMPLETE_FILENAME).read_text(encoding="utf-8") == "4"
+    assert (tmp_path / "latest_checkpointed_iteration.txt").read_text(encoding="utf-8") == "4"
+
     trainer.cleanup_teacher_workers()
 
     assert trainer.teacher_wgs == {}
     assert trainer.base_policy_wg is None
+
+
+def test_save_checkpoint_skips_complete_marker_and_tracker_when_critic_async(tmp_path):
+    config = _make_config()
+    config.trainer.default_local_dir = str(tmp_path)
+    config.actor_rollout_ref.actor = OmegaConf.create({"checkpoint": {}})
+    config.critic = OmegaConf.create({"checkpoint": {"async_save": True}})
+
+    trainer = _make_trainer(config=config)
+    trainer.use_critic = True
+    trainer.global_steps = 7
+    trainer.actor_rollout_wg = _SavingCheckpointWG()
+    trainer.critic_wg = _SavingCheckpointWG()
+    trainer.train_dataloader = _CheckpointStateDataloader({"cursor": 13})
+
+    trainer._save_checkpoint()
+
+    global_step_dir = tmp_path / "global_step_7"
+    assert (global_step_dir / "actor" / "payload.pt").exists()
+    assert (global_step_dir / "critic" / "payload.pt").exists()
+    assert (global_step_dir / "data.pt").exists()
+    assert not (global_step_dir / CHECKPOINT_COMPLETE_FILENAME).exists()
+    assert not (tmp_path / "latest_checkpointed_iteration.txt").exists()
 
 
 def test_fit_finalizes_resources_when_validation_raises(monkeypatch):

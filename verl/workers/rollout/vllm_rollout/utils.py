@@ -24,6 +24,7 @@ from typing import Any, Literal, get_args
 import torch
 
 from verl.utils.device import is_npu_available
+from verl.utils.shared_memory_resource_tracker import install_shared_memory_resource_tracker_bypass
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches, is_fp8_model, load_quanted_weights
@@ -118,6 +119,9 @@ class vLLMColocateWorkerExtension:
 
     def __new__(cls, **kwargs):
         set_death_signal()
+
+        if os.environ.get("VERL_VLLM_DISABLE_SHARED_MEMORY_RESOURCE_TRACKER", "0") == "1":
+            install_shared_memory_resource_tracker_bypass()
 
         # 1. patch for Lora
         VLLMHijack.hijack()

@@ -1,4 +1,5 @@
 import asyncio
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -35,12 +36,61 @@ def test_tracking_finish_is_idempotent():
     assert tracker.logger["tensorboard"].calls == [((), {})]
 
 
+def test_install_shared_memory_resource_tracker_bypass_only_skips_shared_memory(monkeypatch):
+    from multiprocessing import resource_tracker
+
+    from verl.utils import shared_memory_resource_tracker as shm_tracker
+
+    forwarded_calls = []
+
+    def _fake_register(name, rtype):
+        forwarded_calls.append(("register", name, rtype))
+
+    def _fake_unregister(name, rtype):
+        forwarded_calls.append(("unregister", name, rtype))
+
+    monkeypatch.setattr(resource_tracker, "register", _fake_register)
+    monkeypatch.setattr(resource_tracker, "unregister", _fake_unregister)
+    monkeypatch.setattr(shm_tracker, "_PATCHED", False)
+    monkeypatch.setattr(shm_tracker, "_ORIGINAL_REGISTER", None)
+    monkeypatch.setattr(shm_tracker, "_ORIGINAL_UNREGISTER", None)
+
+    shm_tracker.install_shared_memory_resource_tracker_bypass()
+
+    resource_tracker.register("/psm_test", "shared_memory")
+    resource_tracker.unregister("/psm_test", "shared_memory")
+    resource_tracker.register("/sem_test", "semaphore")
+    resource_tracker.unregister("/sem_test", "semaphore")
+
+    assert forwarded_calls == [
+        ("register", "/sem_test", "semaphore"),
+        ("unregister", "/sem_test", "semaphore"),
+    ]
+
+
+def test_enable_vllm_shared_memory_resource_tracker_bypass_sets_env_and_installs(monkeypatch):
+    from verl.utils import shared_memory_resource_tracker as shm_tracker
+
+    install_calls = []
+    monkeypatch.delenv("VERL_VLLM_DISABLE_SHARED_MEMORY_RESOURCE_TRACKER", raising=False)
+    monkeypatch.setattr(
+        shm_tracker,
+        "install_shared_memory_resource_tracker_bypass",
+        lambda: install_calls.append("called"),
+    )
+
+    shm_tracker.enable_vllm_shared_memory_resource_tracker_bypass()
+
+    assert os.environ["VERL_VLLM_DISABLE_SHARED_MEMORY_RESOURCE_TRACKER"] == "1"
+    assert install_calls == ["called"]
+
+
 @pytest.mark.asyncio
 async def test_vllm_http_server_shutdown_stops_uvicorn_and_engine():
     try:
         from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
-    except ImportError:
-        pytest.skip("vllm or its dependencies are not installed")
+    except Exception as exc:
+        pytest.skip(f"vllm or its dependencies are not available: {exc}")
 
     engine = SimpleNamespace(shutdown_calls=0)
 
@@ -74,8 +124,8 @@ async def test_vllm_http_server_shutdown_stops_uvicorn_and_engine():
 async def test_vllm_replica_shutdown_calls_server_shutdown_and_kills_servers(monkeypatch):
     try:
         from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
-    except ImportError:
-        pytest.skip("vllm or its dependencies are not installed")
+    except Exception as exc:
+        pytest.skip(f"vllm or its dependencies are not available: {exc}")
 
     class _FakeServer:
         def __init__(self):

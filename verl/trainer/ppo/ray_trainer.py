@@ -72,6 +72,7 @@ from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_pad
 
 logger = logging.getLogger(__file__)
 MOPD_MANIFEST_FILENAME = "mopd_manifest.json"
+CHECKPOINT_COMPLETE_FILENAME = "checkpoint.complete"
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -1658,20 +1659,173 @@ class RayPPOTrainer:
                 json.dump(mopd_manifest, manifest_file, indent=2)
 
         # latest checkpointed iteration tracker (for atomic usage)
-        if (
-            hasattr(self.config.actor_rollout_ref.actor.checkpoint, "async_save")
-            and self.config.actor_rollout_ref.actor.checkpoint.async_save
-        ) or (
-            "async_save" in self.config.actor_rollout_ref.actor.checkpoint
-            and self.config.actor_rollout_ref.actor.checkpoint["async_save"]
-        ):
+        if self._checkpoint_async_save_enabled():
             print("skip write latest_checkpointed_iteration.txt when async_save is True")
             return
+
+        self._write_checkpoint_complete_marker(local_global_step_folder)
+
         local_latest_checkpointed_iteration = os.path.join(
             self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
         )
-        with open(local_latest_checkpointed_iteration, "w") as f:
+        local_latest_checkpointed_iteration_tmp = f"{local_latest_checkpointed_iteration}.tmp"
+        with open(local_latest_checkpointed_iteration_tmp, "w", encoding="utf-8") as f:
             f.write(str(self.global_steps))
+        os.replace(local_latest_checkpointed_iteration_tmp, local_latest_checkpointed_iteration)
+
+    @staticmethod
+    def _role_async_save_enabled(role_config) -> bool:
+        if role_config is None:
+            return False
+
+        checkpoint_config = role_config.get("checkpoint", None) if hasattr(role_config, "get") else None
+        if checkpoint_config is None and hasattr(role_config, "checkpoint"):
+            checkpoint_config = role_config.checkpoint
+        if checkpoint_config is None:
+            return False
+
+        if hasattr(checkpoint_config, "get"):
+            return bool(checkpoint_config.get("async_save", False))
+        if hasattr(checkpoint_config, "async_save"):
+            return bool(checkpoint_config.async_save)
+        try:
+            return bool(checkpoint_config["async_save"])
+        except (KeyError, TypeError):
+            return False
+
+    def _get_async_checkpoint_roles(self) -> tuple[str, ...]:
+        async_roles: list[str] = []
+
+        actor_config = self.config.actor_rollout_ref.get("actor", None)
+        if self._role_async_save_enabled(actor_config):
+            async_roles.append("actor")
+
+        critic_config = self.config.get("critic", None) if hasattr(self.config, "get") else None
+        if self.use_critic and self._role_async_save_enabled(critic_config):
+            async_roles.append(str(Role.Critic))
+
+        return tuple(async_roles)
+
+    def _checkpoint_async_save_enabled(self) -> bool:
+        return bool(self._get_async_checkpoint_roles())
+
+    def _get_checkpoint_complete_marker_path(self, global_step_folder: str) -> str:
+        return os.path.join(global_step_folder, CHECKPOINT_COMPLETE_FILENAME)
+
+    def _write_checkpoint_complete_marker(self, global_step_folder: str) -> None:
+        marker_path = self._get_checkpoint_complete_marker_path(global_step_folder)
+        marker_path_tmp = f"{marker_path}.tmp"
+        with open(marker_path_tmp, "w", encoding="utf-8") as marker_file:
+            marker_file.write(str(self.global_steps))
+        os.replace(marker_path_tmp, marker_path)
+
+    @staticmethod
+    def _get_checkpoint_step(global_step_folder: str) -> int:
+        return int(os.path.basename(global_step_folder).split("global_step_")[-1])
+
+    @staticmethod
+    def _checkpoint_dir_has_payload(path: str) -> bool:
+        if not os.path.isdir(path):
+            return False
+        with os.scandir(path) as entries:
+            return any(entries)
+
+    def _async_checkpoint_role_has_finalize_artifacts(self, role_path: str) -> bool:
+        # async_save is only implemented for Megatron; finalized checkpoints always materialize
+        # the distributed shard directory, HuggingFace config/tokenizer directory, and the
+        # serialized transformer config under the role checkpoint root.
+        dist_ckpt_path = os.path.join(role_path, "dist_ckpt")
+        huggingface_path = os.path.join(role_path, "huggingface")
+        transformer_config_path = os.path.join(role_path, "transformer_config.json")
+        return (
+            self._checkpoint_dir_has_payload(dist_ckpt_path)
+            and self._checkpoint_dir_has_payload(huggingface_path)
+            and os.path.isfile(transformer_config_path)
+        )
+
+    def _is_checkpoint_complete(self, global_step_folder: str, tracker_step: int | None = None) -> bool:
+        if not os.path.isdir(global_step_folder):
+            return False
+
+        if os.path.exists(self._get_checkpoint_complete_marker_path(global_step_folder)):
+            return True
+
+        actor_path = os.path.join(global_step_folder, "actor")
+        dataloader_path = os.path.join(global_step_folder, "data.pt")
+        if not (self._checkpoint_dir_has_payload(actor_path) and os.path.isfile(dataloader_path)):
+            return False
+
+        if self.use_critic:
+            critic_path = os.path.join(global_step_folder, str(Role.Critic))
+            if not self._checkpoint_dir_has_payload(critic_path):
+                return False
+
+        async_roles = self._get_async_checkpoint_roles()
+        if not async_roles:
+            return True
+
+        if "actor" in async_roles and not self._async_checkpoint_role_has_finalize_artifacts(actor_path):
+            return False
+        if self.use_critic and str(Role.Critic) in async_roles:
+            critic_path = os.path.join(global_step_folder, str(Role.Critic))
+            if not self._async_checkpoint_role_has_finalize_artifacts(critic_path):
+                return False
+
+        checkpoint_step = self._get_checkpoint_step(global_step_folder)
+        return tracker_step == checkpoint_step and len(async_roles) == 1
+
+    def _find_latest_complete_checkpoint(self, checkpoint_folder: str) -> str | None:
+        if not checkpoint_folder or not os.path.isdir(checkpoint_folder):
+            return None
+
+        step_dirs: list[tuple[int, str]] = []
+        for entry in os.scandir(checkpoint_folder):
+            if not entry.is_dir() or not entry.name.startswith("global_step_"):
+                continue
+            try:
+                step = self._get_checkpoint_step(entry.path)
+            except ValueError:
+                continue
+            step_dirs.append((step, entry.path))
+
+        for _step, path in sorted(step_dirs, reverse=True):
+            if self._is_checkpoint_complete(path):
+                return path
+        return None
+
+    def _resolve_resume_checkpoint(self, checkpoint_folder: str) -> str | None:
+        tracked_checkpoint = find_latest_ckpt_path(checkpoint_folder)
+        tracked_step = -1
+        best_checkpoint = None
+
+        if tracked_checkpoint is not None:
+            tracked_step = self._get_checkpoint_step(tracked_checkpoint)
+            if self._is_checkpoint_complete(tracked_checkpoint, tracker_step=tracked_step):
+                best_checkpoint = tracked_checkpoint
+            else:
+                logger.warning("Ignoring incomplete tracked checkpoint at %s", tracked_checkpoint)
+
+        scanned_checkpoint = self._find_latest_complete_checkpoint(checkpoint_folder)
+        if scanned_checkpoint is None:
+            return best_checkpoint
+
+        scanned_step = self._get_checkpoint_step(scanned_checkpoint)
+        if best_checkpoint is None or scanned_step > tracked_step:
+            if tracked_checkpoint is None:
+                logger.warning(
+                    "Checkpoint tracker missing under %s; falling back to latest complete checkpoint %s",
+                    checkpoint_folder,
+                    scanned_checkpoint,
+                )
+            elif tracked_checkpoint != scanned_checkpoint:
+                logger.warning(
+                    "Checkpoint tracker selected %s, but newer complete checkpoint %s was found; using the newer one",
+                    tracked_checkpoint,
+                    scanned_checkpoint,
+                )
+            best_checkpoint = scanned_checkpoint
+
+        return best_checkpoint
 
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
@@ -1685,7 +1839,7 @@ class RayPPOTrainer:
             if not os.path.isabs(checkpoint_folder):
                 working_dir = os.getcwd()
                 checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
-            global_step_folder = find_latest_ckpt_path(checkpoint_folder)  # None if no latest
+            global_step_folder = self._resolve_resume_checkpoint(checkpoint_folder)
 
         # find global_step_folder
         if self.config.trainer.resume_mode == "auto":
@@ -1702,6 +1856,13 @@ class RayPPOTrainer:
                 if not os.path.isabs(global_step_folder):
                     working_dir = os.getcwd()
                     global_step_folder = os.path.join(working_dir, global_step_folder)
+                resume_tracker_step = None
+                resume_checkpoint_root = os.path.dirname(global_step_folder)
+                tracked_resume_checkpoint = find_latest_ckpt_path(resume_checkpoint_root)
+                if tracked_resume_checkpoint == global_step_folder:
+                    resume_tracker_step = self._get_checkpoint_step(tracked_resume_checkpoint)
+                if not self._is_checkpoint_complete(global_step_folder, tracker_step=resume_tracker_step):
+                    raise ValueError(f"Requested resume checkpoint is incomplete: {global_step_folder}")
         print(f"Load from checkpoint folder: {global_step_folder}")
         manifest_path = os.path.join(global_step_folder, MOPD_MANIFEST_FILENAME)
         if os.path.exists(manifest_path):
