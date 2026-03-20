@@ -50,7 +50,7 @@
 - **实验性模块**：`verl/experimental/reward_loop/` 下的新架构
 
 **排除范围**：
-- `/home/scbjtfy/verl/docs/grpo/` 路径下的文档分析
+- `~/verl/docs/grpo/` 路径下的文档分析
 - Reward Model Workers（基于本地模型的 reward，而非外部 API）
 
 **优化技术清单**（共 12 项）：
