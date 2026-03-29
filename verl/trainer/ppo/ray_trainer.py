@@ -54,7 +54,14 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import extract_reward
-from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
+from verl.trainer.ppo.utils import (
+    Role,
+    WorkerType,
+    need_critic,
+    need_mopd_teacher_runtime,
+    need_reference_policy,
+    need_reward_model,
+)
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
@@ -233,6 +240,8 @@ def compute_advantage(
             adv_kwargs["is_correction"] = getattr(mopd_cfg, "is_correction", True)
             adv_kwargs["is_epsilon_low"] = getattr(mopd_cfg, "is_epsilon_low", 0.1)
             adv_kwargs["is_epsilon_high"] = getattr(mopd_cfg, "is_epsilon_high", 10.0)
+        if adv_estimator in ("mopd", AdvantageEstimator.MOPD_ZERO_TEACHER_ORM_ONLY):
+            adv_kwargs["norm_adv_by_std_in_grpo"] = norm_adv_by_std_in_grpo
         # Add sum_pi_squared for Optimal Token Baseline
         if adv_estimator in (AdvantageEstimator.OPTIMAL_TOKEN_BASELINE, AdvantageEstimator.TIR_OPTIMAL_TOKEN_BASELINE):
             # Check if sum_pi_squared is available
@@ -541,6 +550,15 @@ class RayPPOTrainer:
         batch_reward = self.reward_loop_manager.compute_rm_score(batch)
         return batch_reward
 
+    def _get_validation_metric_groups(self, batch: DataProto, batch_size: int) -> np.ndarray:
+        group_key = self.config.trainer.get("val_metric_group_key", None)
+        if group_key:
+            group_values = batch.non_tensor_batch.get(group_key, None)
+            if group_values is not None:
+                return np.asarray(group_values, dtype=object)
+
+        return np.asarray(batch.non_tensor_batch.get("data_source", ["unknown"] * batch_size), dtype=object)
+
     def _validate(self, merged: bool = False):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
@@ -636,7 +654,7 @@ class RayPPOTrainer:
             if "__num_turns__" in test_batch.non_tensor_batch:
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
 
-            data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+            data_source_lst.append(self._get_validation_metric_groups(test_batch, batch_size=reward_tensor.shape[0]))
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
@@ -943,12 +961,13 @@ class RayPPOTrainer:
             sub_batch.non_tensor_batch["_mopd_scatter_index"] = np.asarray(indices.tolist(), dtype=np.int64)
 
             dp_size = self._get_teacher_job_dp_size(teacher_wg)
-            self._balance_batch(
-                sub_batch,
-                metrics={},
-                logging_prefix=f"teacher/{teacher_name}/seqlen",
-                dp_size=dp_size,
-            )
+            if self._should_balance_teacher_sub_batch(sub_batch, dp_size):
+                self._balance_batch(
+                    sub_batch,
+                    metrics={},
+                    logging_prefix=f"teacher/{teacher_name}/seqlen",
+                    dp_size=dp_size,
+                )
             scatter_indices = torch.as_tensor(
                 sub_batch.non_tensor_batch.pop("_mopd_scatter_index"),
                 dtype=torch.long,
@@ -1010,7 +1029,7 @@ class RayPPOTrainer:
             sub_batch.non_tensor_batch["_mopd_scatter_index"] = np.asarray(indices, dtype=np.int64)
 
             dp_size = self._get_teacher_job_dp_size(teacher_wg)
-            if "attention_mask" in sub_batch.batch:
+            if "attention_mask" in sub_batch.batch and self._should_balance_teacher_sub_batch(sub_batch, dp_size):
                 self._balance_batch(
                     sub_batch,
                     metrics={},
@@ -1065,6 +1084,13 @@ class RayPPOTrainer:
         is_epsilon_low = float(getattr(self.config.algorithm.mopd, "is_epsilon_low", 0.1))
         is_epsilon_high = float(getattr(self.config.algorithm.mopd, "is_epsilon_high", 10.0))
         return (ratio >= is_epsilon_low) & (ratio <= is_epsilon_high)
+
+    @staticmethod
+    def _should_balance_teacher_sub_batch(sub_batch: DataProto, dp_size: int) -> bool:
+        if dp_size <= 1:
+            return True
+        batch_size = len(sub_batch)
+        return batch_size >= dp_size and batch_size % dp_size == 0
 
     def _record_mopd_teacher_metrics(self, batch: DataProto, metrics: dict[str, float]) -> None:
         if "teacher_id" not in batch.non_tensor_batch:
@@ -1174,7 +1200,7 @@ class RayPPOTrainer:
             raise ValueError(f"MOPD tokenizer compatibility check failed while loading {label} tokenizer.") from exc
 
     def _validate_mopd_tokenizer_compatibility(self) -> None:
-        if not self.config.algorithm.get("mopd", {}).get("enabled", False):
+        if not need_mopd_teacher_runtime(self.config.algorithm):
             return
 
         student_tokenizer_path = OmegaConf.select(
@@ -1240,13 +1266,15 @@ class RayPPOTrainer:
                     )
 
     def _run_mopd_preflight_checks(self) -> None:
-        if not self.config.algorithm.get("mopd", {}).get("enabled", False):
+        if not need_mopd_teacher_runtime(self.config.algorithm):
             return
 
         teacher_counts = self._get_mopd_teacher_id_counts()
         logger.info("MOPD teacher_id distribution: %s", dict(sorted(teacher_counts.items())))
 
         configured_teachers = {teacher.name for teacher in self.config.algorithm.mopd.teachers}
+        if not configured_teachers:
+            raise ValueError("MOPD teacher runtime requires at least one configured teacher in algorithm.mopd.teachers")
         observed_teachers = set(teacher_counts)
         unknown_ids = sorted(observed_teachers - configured_teachers)
         if unknown_ids:
@@ -1270,7 +1298,7 @@ class RayPPOTrainer:
         self._validate_mopd_tokenizer_compatibility()
 
     def _build_mopd_manifest(self) -> dict[str, Any]:
-        if not self.config.algorithm.get("mopd", {}).get("enabled", False):
+        if not need_mopd_teacher_runtime(self.config.algorithm):
             return {}
 
         adv_estimator = self.config.algorithm.adv_estimator
@@ -1454,7 +1482,7 @@ class RayPPOTrainer:
                 self.ref_policy_wg = all_wg[str(Role.ActorRolloutRef)]
 
         # Create teacher workers for MOPD
-        if self.config.algorithm.get("mopd", {}).get("enabled", False):
+        if need_mopd_teacher_runtime(self.config.algorithm):
             if Role.RefPolicy not in self.role_worker_mapping:
                 raise ValueError(
                     "MOPD requires Role.RefPolicy in role_worker_mapping. "

@@ -59,6 +59,32 @@
 
 ### 当前仍然最值得关注的真实挑战
 
+在 2026-03-16 的 single-teacher reduction proof 之后，原先缺的排序变化实验也已经补上：
+
+- reduced single-teacher `mopd` 已经在仓库内补上了 algorithm-level reduction proof，
+  并完成了 3-way `data.seed` runtime 对照；后者没有显示稳定单边偏移，但训练轨迹证据仍偏 mixed
+- zero-teacher ORM-only reduction 也已经在仓库内补上了 proof surface：
+  独立 `mopd_zero_teacher_orm_only` estimator、same-batch exact equivalence tests、
+  zero-teacher runtime dependency tests（前提是 `algorithm.mopd.enabled=False`），以及
+  2026-03-17 在 GPUs `0-3` 上完成的 fresh paired smoke rerun
+- 这轮 zero-teacher fresh smoke rerun 的 mean absolute score delta 为 `0.02734375`，
+  final delta 为 `-0.03515625`；结论应写成 supportive smoke evidence，而不是
+  sequential stochastic smoke 之外的长程曲线级 closure
+- 独立结果记录见 `docs/plans/2026-03-17-mopd-zero-teacher-reduction-results.md`
+- `teachers[]` order-permutation paired smoke evidence 也已经在 2026-03-17 补上：
+  同一配置只打乱 `algorithm.mopd.teachers[]` 声明顺序，在 GPUs `0-3` 上完成 paired rerun
+- 第一轮失败来自非算法性的 teacher 子批平衡约束：原始数据触发 `AssertionError: 5 % 4 != 0`，
+  因此 harness 改为准备每个 8-sample batch 都是 `4 cell + 4 disease` 的平衡数据，并关闭 shuffle
+- 平衡化 rerun 后，两侧都到达 `training/global_step=4`，并在每一步保持完全一致的
+  `0.5 / 0.5` teacher sample fraction、`mopd/is_valid_fraction=1.0`、`mopd/is_zeroed_fraction=0.0`
+- 这轮实验最强支持的是结构级顺序不变性：未见 teacher-slot swap / hardcoded slot symptom；
+  训练轨迹指标则仍只到 short-horizon sequential stochastic smoke 级别
+- 独立结果记录见 `docs/plans/2026-03-17-mopd-teacher-order-invariance-results.md`
+- 因此当前最重要的 open challenges 已不再包括
+  “单教师退化时算法语义是否已经跑偏”
+- 也不再包括“`teachers[]` 顺序是否在隐式决定 teacher 语义，而且仓库里完全没有 paired evidence”
+- 剩下真正高优先级的，是多教师 composition、routing、异构 tokenizer bridge、成本和恢复语义
+
 1. teacher 内存与吞吐仍大体随 teacher 数增长，只是增长形态已经 backend-specific。
 2. teacher 调度是“per-pool pipeline with limited overlap”，不是全局 fully parallel。
 3. 异构 tokenizer 当前只有 sequence-level bridge，没有跨 tokenizer 的 token-level exact reverse KL。
@@ -263,14 +289,17 @@ A_final
 - 难点在 teacher signal 如何进入 PPO 主链路
 - ORM、IS correction、异构 tokenizer teacher 的组合会带来数据契约复杂度
 
-但需要纠正 5 个点：
+但需要纠正 6 个点：
 
 1. 当前 estimator 不只是 `A_mopd + orm_weight * A_orm`，而是三路组合：
    token MOPD/ExOPD + optional sequence teacher + optional ORM
-2. per-teacher `lambda_val` 不是待设计项，已经存在并已参与 ExOPD 广播
-3. `uid/index` 不仅 ORM mixing 需要，`teacher_seq_reward` 也需要
-4. `teacher_id` 路由与公式选择已经不在 `dp_actor.py`，而是在 trainer 侧完成
-5. `ppo_epochs=1` 是当前真实限制，必须写出来
+2. single-teacher reduction 已不再是“缺少仓库内证明”的开放项：当前已有独立
+   `single_teacher_reverse_kl` baseline、paired harness、tensor-level reduction tests，
+   以及官方 3-way `data.seed` 结果文档
+3. per-teacher `lambda_val` 不是待设计项，已经存在并已参与 ExOPD 广播
+4. `uid/index` 不仅 ORM mixing 需要，`teacher_seq_reward` 也需要
+5. `teacher_id` 路由与公式选择已经不在 `dp_actor.py`，而是在 trainer 侧完成
+6. `ppo_epochs=1` 是当前真实限制，必须写出来
 
 ### 维度 2：分布式训练 / FSDP / 内存
 
@@ -475,6 +504,9 @@ A_final
 - teacher preflight fail-fast 已落地
 - 测试基础设施已成体系
 - 异构 tokenizer teacher 已可通过 `sequence_reward` 接入，但不是 token-level exact KL
+- single-teacher reduction proof 已完成，当前不应再把
+  “reduced MOPD 是否等于单教师 reverse-KL baseline” 写成待验证项
+  但要保留 caveat：当前 runtime 证据并不是“曲线几乎完全重合”的强经验性证明
 
 ---
 
@@ -505,3 +537,11 @@ A_final
   - composition-time typed strictness
 
 这才是对当前 worktree 最贴近事实、也最适合指导后续工作的 MOPD N-teacher 挑战清单。
+
+换句话说，下一阶段若继续做 correctness proof，优先级已经变成：
+
+1. 2-teacher composition / routing correctness
+2. heterogeneous tokenizer teacher 的 bridge 质量与稳定性
+3. N-teacher 成本、placement 和恢复矩阵
+
+而不是回头继续质疑 single-teacher reduced MOPD 的基本语义。

@@ -53,6 +53,17 @@ def test_build_training_command_uses_first_batch_overrides():
         nnodes=1,
         teacher_log_prob_micro_batch_size=4,
         nccl_timeout_seconds=180,
+        rvq_reward_root="/rvq/root",
+        reward_provider="sglang",
+        reward_api_base="http://127.0.0.1:30000/v1",
+        reward_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        reward_api_key="EMPTY",
+        reward_num_workers=2,
+        reward_max_concurrent=3,
+        reward_max_rpm_per_worker=120,
+        reward_max_tpm_per_worker=120000,
+        reward_est_tokens_per_request=18000,
+        reward_timeout=900.0,
     )
 
     command = module.build_training_command(config)
@@ -70,6 +81,24 @@ def test_build_training_command_uses_first_batch_overrides():
     assert "actor_rollout_ref.actor.ppo_mini_batch_size=8" in command
     assert "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=4224" in command
     assert "actor_rollout_ref.rollout.max_model_len=4224" in command
+    assert "reward.num_workers=2" in command
+    assert "reward.reward_model.enable=False" in command
+    assert "reward.reward_manager.name=rate_limited" in command
+    assert "+reward.max_concurrent=3" in command
+    assert "+reward.max_rpm=120" in command
+    assert "+reward.max_tpm=120000" in command
+    assert "+reward.estimated_tokens_per_request=18000" in command
+    assert "+reward.timeout=900.0" in command
+    assert f"reward.custom_reward_function.path={module.SCRIPT_DIR / 'rvq_v1_reward.py'}" in command
+    assert "reward.custom_reward_function.name=compute_score" in command
+    assert "+reward.custom_reward_function.reward_kwargs.rvq_reward_root=/rvq/root" in command
+    assert "+reward.custom_reward_function.reward_kwargs.reward_version=v1" in command
+    assert "+reward.custom_reward_function.reward_kwargs.provider=sglang" in command
+    assert "+reward.custom_reward_function.reward_kwargs.api_base=http://127.0.0.1:30000/v1" in command
+    assert "+reward.custom_reward_function.reward_kwargs.model=Qwen/Qwen3-30B-A3B-Instruct-2507" in command
+    assert "+reward.custom_reward_function.reward_kwargs.api_key=EMPTY" in command
+    assert "+reward.custom_reward_function.reward_kwargs.timeout=900.0" in command
+    assert "+reward.custom_reward_function.reward_kwargs.max_response_length=128" in command
 
     teacher_override = next(item for item in command if item.startswith("algorithm.mopd.teachers=["))
     assert "name: cell_type_teacher" in teacher_override
@@ -98,6 +127,64 @@ def test_build_training_command_allows_rollout_n_override():
     command = module.build_training_command(config)
 
     assert "actor_rollout_ref.rollout.n=8" in command
+
+
+def test_build_training_command_defaults_to_rvq_v1_reward_root():
+    module = _load_preflight_module()
+
+    config = module.PreflightConfig(
+        student_model_path="/models/student",
+        cell_type_teacher_path="/teachers/cell",
+        disease_state_teacher_path="/teachers/disease",
+        train_file="/data/mopd_train.parquet",
+        val_file="/data/mopd_test.parquet",
+        ckpt_dir="/tmp/mopd-preflight",
+        project_name="RVQ-Alpha_MOPD",
+        experiment_name="mopd-preflight",
+    )
+
+    assert config.rvq_reward_root == "/home/scbjtfy/RVQ-Alpha/rlvr"
+    assert config.reward_function_path.endswith("recipe/mopd/rvq_v1_reward.py")
+    assert config.train_batch_size == 2
+
+
+def test_validate_preflight_config_accepts_smoke_safe_minimum():
+    module = _load_preflight_module()
+
+    config = module.PreflightConfig(
+        student_model_path="/models/student",
+        cell_type_teacher_path="/teachers/cell",
+        disease_state_teacher_path="/teachers/disease",
+        train_file="/data/mopd_train.parquet",
+        val_file="/data/mopd_test.parquet",
+        ckpt_dir="/tmp/mopd-preflight",
+        project_name="RVQ-Alpha_MOPD",
+        experiment_name="mopd-preflight",
+        train_batch_size=2,
+        rollout_n=4,
+    )
+
+    module.validate_preflight_config(config)
+
+
+def test_validate_preflight_config_rejects_undersized_smoke_batch():
+    module = _load_preflight_module()
+
+    config = module.PreflightConfig(
+        student_model_path="/models/student",
+        cell_type_teacher_path="/teachers/cell",
+        disease_state_teacher_path="/teachers/disease",
+        train_file="/data/mopd_train.parquet",
+        val_file="/data/mopd_test.parquet",
+        ckpt_dir="/tmp/mopd-preflight",
+        project_name="RVQ-Alpha_MOPD",
+        experiment_name="mopd-preflight",
+        train_batch_size=1,
+        rollout_n=4,
+    )
+
+    with pytest.raises(ValueError, match="train_batch_size \\* rollout_n"):
+        module.validate_preflight_config(config)
 
 
 def test_detect_terminal_event_ignores_validation_only_logs():

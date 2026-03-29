@@ -43,6 +43,92 @@ def test_mopd_advantage_basic():
     torch.testing.assert_close(advantages, expected)
 
 
+def test_single_teacher_reverse_kl_advantage_basic():
+    """Independent baseline should compute the plain reverse-KL token signal."""
+    teacher_log_prob = torch.tensor(
+        [
+            [2.0, 3.0, 4.0],
+            [1.5, 0.5, -1.0],
+        ]
+    )
+    old_log_probs = torch.tensor(
+        [
+            [1.0, 1.5, 1.0],
+            [0.5, 1.0, -2.0],
+        ]
+    )
+    response_mask = torch.tensor(
+        [
+            [1.0, 1.0, 0.0],
+            [1.0, 0.0, 1.0],
+        ]
+    )
+    token_level_rewards = torch.tensor(
+        [
+            [0.2, 0.4, 0.6],
+            [1.0, 1.2, 1.4],
+        ]
+    )
+
+    reverse_kl_fn = get_adv_estimator_fn("single_teacher_reverse_kl")
+    advantages, returns = reverse_kl_fn(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        teacher_log_prob=teacher_log_prob,
+        old_log_probs=old_log_probs,
+    )
+
+    expected_advantages = (teacher_log_prob - old_log_probs).detach() * response_mask
+    expected_returns = token_level_rewards * response_mask
+    torch.testing.assert_close(advantages, expected_advantages)
+    torch.testing.assert_close(returns, expected_returns)
+
+
+def test_reduced_single_teacher_mopd_matches_independent_reverse_kl_baseline():
+    """Reduced single-teacher MOPD should equal the independent reverse-KL baseline exactly."""
+    teacher_log_prob = torch.tensor(
+        [
+            [1.0, 2.0, 3.0, 4.0],
+            [0.5, 1.0, 1.5, 2.0],
+        ]
+    )
+    old_log_probs = torch.tensor(
+        [
+            [0.5, 1.5, 1.0, 2.0],
+            [0.25, 0.5, 0.75, 1.0],
+        ]
+    )
+    response_mask = torch.tensor(
+        [
+            [1.0, 1.0, 1.0, 0.0],
+            [1.0, 0.0, 1.0, 1.0],
+        ]
+    )
+    token_level_rewards = torch.zeros_like(response_mask)
+
+    reverse_kl_fn = get_adv_estimator_fn("single_teacher_reverse_kl")
+    mopd_fn = get_adv_estimator_fn("mopd")
+
+    baseline_advantages, baseline_returns = reverse_kl_fn(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        teacher_log_prob=teacher_log_prob,
+        old_log_probs=old_log_probs,
+    )
+    mopd_advantages, mopd_returns, mopd_metrics = mopd_fn(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        teacher_log_prob=teacher_log_prob,
+        old_log_probs=old_log_probs,
+        orm_weight=0.0,
+        is_correction=False,
+    )
+
+    torch.testing.assert_close(mopd_advantages, baseline_advantages)
+    torch.testing.assert_close(mopd_returns, baseline_returns)
+    assert mopd_metrics == {}
+
+
 def test_mopd_advantage_with_is_correction():
     """Test IS correction masks tokens outside epsilon bounds."""
     B, T = 2, 5
@@ -176,6 +262,180 @@ def test_batch_lambda_does_not_change_standard_mopd_without_base_log_prob():
     torch.testing.assert_close(result.batch["advantages"], expected)
 
 
+def test_compute_advantage_dispatch_supports_single_teacher_reverse_kl():
+    """compute_advantage should dispatch the independent reduction baseline through the standard batch path."""
+    teacher_log_prob = torch.tensor([[2.0, 2.5], [3.0, 3.5]])
+    old_log_probs = torch.tensor([[1.0, 1.5], [2.0, 2.5]])
+
+    data = DataProto.from_single_dict(
+        {
+            "token_level_rewards": torch.zeros(2, 2),
+            "response_mask": torch.ones(2, 2),
+            "old_log_probs": old_log_probs,
+            "teacher_log_prob": teacher_log_prob,
+            "teacher_seq_reward": torch.zeros(2, dtype=torch.float32),
+            "teacher_seq_weight": torch.zeros(2, 1, dtype=torch.float32),
+            "teacher_token_mask": torch.zeros(2, 2, dtype=torch.float32),
+        }
+    )
+    data.non_tensor_batch["uid"] = np.array(["q1", "q2"])
+
+    result = compute_advantage(data, adv_estimator="single_teacher_reverse_kl", config=OmegaConf.create({}))
+
+    expected = (teacher_log_prob - old_log_probs).detach()
+    torch.testing.assert_close(result.batch["advantages"], expected)
+
+
+def test_zero_teacher_orm_only_matches_grpo_on_same_batch():
+    """The zero-teacher MOPD reduction should collapse to the ORM-only GRPO path."""
+    token_level_rewards = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],
+            [0.25, 0.25, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.25, 0.25],
+        ]
+    )
+    response_mask = torch.tensor(
+        [
+            [1.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ]
+    )
+    uids = np.array(["q1", "q1", "q2", "q2"])
+
+    zero_teacher_fn = get_adv_estimator_fn("mopd_zero_teacher_orm_only")
+    grpo_fn = get_adv_estimator_fn("grpo")
+
+    reduced_advantages, reduced_returns = zero_teacher_fn(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        old_log_probs=torch.randn_like(token_level_rewards),
+        index=uids,
+    )
+    baseline_advantages, baseline_returns = grpo_fn(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=uids,
+    )
+
+    torch.testing.assert_close(reduced_advantages, baseline_advantages)
+    torch.testing.assert_close(reduced_returns, baseline_returns)
+
+
+def test_zero_teacher_orm_only_matches_grpo_without_std_normalization():
+    """The zero-teacher reduction should also match Dr.GRPO-style normalization settings."""
+    token_level_rewards = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],
+            [0.25, 0.25, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.25, 0.25],
+        ]
+    )
+    response_mask = torch.tensor(
+        [
+            [1.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ]
+    )
+    uids = np.array(["q1", "q1", "q2", "q2"])
+
+    zero_teacher_fn = get_adv_estimator_fn("mopd_zero_teacher_orm_only")
+    grpo_fn = get_adv_estimator_fn("grpo")
+
+    reduced_advantages, reduced_returns = zero_teacher_fn(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        old_log_probs=torch.randn_like(token_level_rewards),
+        index=uids,
+        norm_adv_by_std_in_grpo=False,
+    )
+    baseline_advantages, baseline_returns = grpo_fn(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=uids,
+        norm_adv_by_std_in_grpo=False,
+    )
+
+    torch.testing.assert_close(reduced_advantages, baseline_advantages)
+    torch.testing.assert_close(reduced_returns, baseline_returns)
+
+
+def test_compute_advantage_dispatch_supports_zero_teacher_orm_only_without_teacher_fields():
+    """The zero-teacher reduction must not require teacher log-prob tensors at dispatch time."""
+    data = DataProto.from_single_dict(
+        {
+            "token_level_rewards": torch.tensor(
+                [
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                ]
+            ),
+            "response_mask": torch.tensor(
+                [
+                    [1.0, 1.0, 0.0],
+                    [1.0, 1.0, 0.0],
+                ]
+            ),
+        }
+    )
+    data.non_tensor_batch["uid"] = np.array(["q1", "q1"])
+
+    reduced = compute_advantage(data, adv_estimator="mopd_zero_teacher_orm_only", config=OmegaConf.create({}))
+    baseline = compute_advantage(data, adv_estimator="grpo", config=OmegaConf.create({}))
+
+    torch.testing.assert_close(reduced.batch["advantages"], baseline.batch["advantages"])
+    torch.testing.assert_close(reduced.batch["returns"], baseline.batch["returns"])
+
+
+def test_compute_advantage_dispatch_supports_zero_teacher_orm_only_without_std_normalization():
+    """Dispatch should preserve the GRPO normalization mode when teacher signal is disabled."""
+    batch_dict = {
+        "token_level_rewards": torch.tensor(
+            [
+                [1.0, 0.0, 0.0],
+                [0.25, 0.25, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.25, 0.25],
+            ]
+        ),
+        "response_mask": torch.tensor(
+            [
+                [1.0, 1.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [1.0, 1.0, 0.0],
+            ]
+        ),
+    }
+    reduced_data = DataProto.from_single_dict(batch_dict)
+    baseline_data = DataProto.from_single_dict(batch_dict)
+    reduced_data.non_tensor_batch["uid"] = np.array(["q1", "q1", "q2", "q2"])
+    baseline_data.non_tensor_batch["uid"] = np.array(["q1", "q1", "q2", "q2"])
+    config = OmegaConf.create({})
+
+    reduced = compute_advantage(
+        reduced_data,
+        adv_estimator="mopd_zero_teacher_orm_only",
+        norm_adv_by_std_in_grpo=False,
+        config=config,
+    )
+    baseline = compute_advantage(
+        baseline_data,
+        adv_estimator="grpo",
+        norm_adv_by_std_in_grpo=False,
+        config=config,
+    )
+
+    torch.testing.assert_close(reduced.batch["advantages"], baseline.batch["advantages"])
+    torch.testing.assert_close(reduced.batch["returns"], baseline.batch["returns"])
+
+
 def test_need_reference_policy_with_mopd():
     """Test that need_reference_policy returns True when MOPD is enabled."""
     from omegaconf import OmegaConf
@@ -192,6 +452,44 @@ def test_need_reference_policy_with_mopd():
         }
     )
     assert need_reference_policy(config) is True
+
+
+def test_need_reference_policy_with_single_teacher_reverse_kl():
+    """The reduction baseline should trigger the same teacher/reference runtime dependencies."""
+    from omegaconf import OmegaConf
+
+    from verl.trainer.ppo.utils import need_reference_policy
+
+    config = OmegaConf.create(
+        {
+            "algorithm": {
+                "adv_estimator": "single_teacher_reverse_kl",
+                "use_kl_in_reward": False,
+                "mopd": {"enabled": False},
+            },
+            "actor_rollout_ref": {"actor": {"use_kl_loss": False}},
+        }
+    )
+    assert need_reference_policy(config) is True
+
+
+def test_need_reference_policy_with_zero_teacher_orm_only():
+    """The zero-teacher ORM-only reduction should not request teacher/reference runtime."""
+    from omegaconf import OmegaConf
+
+    from verl.trainer.ppo.utils import need_reference_policy
+
+    config = OmegaConf.create(
+        {
+            "algorithm": {
+                "adv_estimator": "mopd_zero_teacher_orm_only",
+                "use_kl_in_reward": False,
+                "mopd": {"enabled": False},
+            },
+            "actor_rollout_ref": {"actor": {"use_kl_loss": False}},
+        }
+    )
+    assert need_reference_policy(config) is False
 
 
 def test_mopd_is_correction_overflow_protection():

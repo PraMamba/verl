@@ -522,6 +522,39 @@ def test_fit_finalizes_resources_when_validation_raises(monkeypatch):
     assert finalize_calls == [(tracker_instances[0], None)]
 
 
+def test_validation_metric_group_key_prefers_teacher_id_when_configured():
+    config = _make_config()
+    config.trainer.val_metric_group_key = "teacher_id"
+    trainer = _make_trainer(config=config)
+
+    batch = DataProto.from_dict(
+        tensors={"prompts": torch.ones((2, 2), dtype=torch.long)},
+        non_tensors={
+            "teacher_id": np.array(["math", "code"], dtype=object),
+            "data_source": np.array(["cell_type", "disease_state"], dtype=object),
+        },
+    )
+
+    groups = trainer._get_validation_metric_groups(batch, batch_size=2)
+
+    assert groups.tolist() == ["math", "code"]
+
+
+def test_validation_metric_group_key_falls_back_to_data_source():
+    trainer = _make_trainer()
+
+    batch = DataProto.from_dict(
+        tensors={"prompts": torch.ones((2, 2), dtype=torch.long)},
+        non_tensors={
+            "data_source": np.array(["cell_type", "disease_state"], dtype=object),
+        },
+    )
+
+    groups = trainer._get_validation_metric_groups(batch, batch_size=2)
+
+    assert groups.tolist() == ["cell_type", "disease_state"]
+
+
 def test_build_mopd_lambda_tensor_uses_teacher_overrides():
     trainer = _make_trainer()
     trainer.config.algorithm.mopd.teachers[1].lambda_val = 2.5
@@ -573,6 +606,49 @@ def test_run_mopd_preflight_rejects_missing_configured_teachers():
 
     with pytest.raises(ValueError, match="missing configured teachers"):
         trainer._run_mopd_preflight_checks()
+
+
+def test_run_mopd_preflight_supports_single_teacher_reverse_kl_runtime_without_enabled_flag():
+    config = _make_config()
+    config.algorithm.adv_estimator = "single_teacher_reverse_kl"
+    config.algorithm.mopd.enabled = False
+    config.algorithm.mopd.teachers = [config.algorithm.mopd.teachers[0]]
+    config.algorithm.mopd.teachers[0].tokenizer_path = "/tokenizers/student"
+
+    trainer = _make_trainer(
+        config=config,
+        train_dataset=_ListDataset(
+            [
+                {
+                    "teacher_id": "unknown",
+                    "raw_prompt": [{"role": "user", "content": "Route this"}],
+                }
+            ]
+        ),
+    )
+
+    with pytest.raises(ValueError, match="unknown teacher_ids"):
+        trainer._run_mopd_preflight_checks()
+
+
+def test_run_mopd_preflight_skips_zero_teacher_orm_only_runtime_without_enabled_flag():
+    config = _make_config()
+    config.algorithm.adv_estimator = "mopd_zero_teacher_orm_only"
+    config.algorithm.mopd.enabled = False
+
+    trainer = _make_trainer(
+        config=config,
+        train_dataset=_ListDataset(
+            [
+                {
+                    "teacher_id": "unknown",
+                    "raw_prompt": [{"role": "user", "content": "Route this"}],
+                }
+            ]
+        ),
+    )
+
+    trainer._run_mopd_preflight_checks()
 
 
 def test_validate_tokenizer_compatibility_rejects_mismatched_paths_without_override(monkeypatch):
@@ -810,7 +886,7 @@ def test_build_mopd_sequence_teacher_jobs_uses_raw_prompt_and_response_text():
     assert jobs[0]["raw_prompts"][0][0]["content"] == "Write a quicksort"
 
 
-def test_build_mopd_sequence_teacher_jobs_pads_to_teacher_dp_size():
+def test_build_mopd_sequence_teacher_jobs_pads_to_teacher_dp_size_without_balancing_small_subset():
     config = _make_config()
     config.algorithm.mopd.teachers[0].backend = "legacy_ref"
     config.algorithm.mopd.teachers[0].tokenizer_policy = "compatible"
@@ -852,9 +928,56 @@ def test_build_mopd_sequence_teacher_jobs_pads_to_teacher_dp_size():
 
     jobs, _device = trainer._build_mopd_sequence_teacher_jobs(batch)
 
-    assert captured["dp_size"] == 2
+    assert captured == {}
     assert len(jobs) == 1
     assert jobs[0]["pad_size"] == 1
+
+
+def test_build_mopd_sequence_teacher_jobs_balances_when_subset_is_divisible_by_teacher_dp_size():
+    config = _make_config()
+    config.algorithm.mopd.teachers[0].backend = "legacy_ref"
+    config.algorithm.mopd.teachers[0].tokenizer_policy = "compatible"
+    config.algorithm.mopd.teachers[1].backend = "hf_int8"
+    config.algorithm.mopd.teachers[1].tokenizer_policy = "sequence_reward"
+
+    trainer = _make_trainer(config=config)
+    trainer.teacher_wgs = {"math": object(), "code": object()}
+    trainer.tokenizer = _FakeTokenizer(decode_map={31: "write", 32: "code", 33: "tests"})
+
+    captured = {}
+    trainer._get_dp_size = lambda *_args, **_kwargs: 2
+
+    def _capture_balance_batch(batch, metrics, logging_prefix="global_seqlen", keep_minibatch=False, dp_size=None):
+        captured["dp_size"] = dp_size
+
+    trainer._balance_batch = _capture_balance_batch
+
+    batch = DataProto.from_single_dict(
+        {
+            "responses": torch.tensor(
+                [
+                    [31, 32, 1],
+                    [31, 33, 1],
+                ],
+                dtype=torch.long,
+            ),
+            "attention_mask": torch.ones(2, 3, dtype=torch.long),
+        }
+    )
+    batch.non_tensor_batch["teacher_id"] = np.array(["code", "code"])
+    batch.non_tensor_batch["raw_prompt"] = np.array(
+        [
+            [{"role": "user", "content": "Write a quicksort"}],
+            [{"role": "user", "content": "Write tests"}],
+        ],
+        dtype=object,
+    )
+
+    jobs, _device = trainer._build_mopd_sequence_teacher_jobs(batch)
+
+    assert captured["dp_size"] == 2
+    assert len(jobs) == 1
+    assert jobs[0]["pad_size"] == 0
 
 
 def test_compute_teacher_sequence_rewards_builds_reward_tensor_and_teacher_token_mask():

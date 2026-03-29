@@ -68,6 +68,44 @@ dual-path teacher signal（token log prob / sequence reward）+ 独立的 MOPD a
 严格按“彻底解决”的标准看，当前仍不能算完全收口的主要是 **2 / 3 / 7 / 11**。
 其余挑战在当前实现里已经不再是旧文档描述的那个问题。
 
+还需要补一个这次新出现的重要结论：
+
+- 2026-03-16 已完成 single-teacher reduction proof
+- reduced `mopd` 在单教师、compatible tokenizer、无 ORM、无 IS correction、无 base normalization、
+  zero-reward 条件下，和独立 `single_teacher_reverse_kl` baseline 做了仓库内 3-way `data.seed` 对照
+- 三组 final `mopd - baseline` deltas 为 `-0.548263`、`+0.206836`、`+0.099413`
+- mean absolute final delta 为 `0.284837`
+- 结论应写成：算法级归约已由 tensor-level tests 证明；运行轨迹级没有稳定单边偏移，但证据仍偏 mixed
+- 2026-03-17 已补上 zero-teacher ORM-only reduction proof surface
+- 当前仓库已经有独立 `mopd_zero_teacher_orm_only` estimator、paired harness、same-batch exact
+  equivalence tests、zero-teacher runtime dependency tests（前提是 `algorithm.mopd.enabled=False`），
+  以及 GPUs `0-3` 上的 fresh smoke rerun
+- 这轮 fresh smoke rerun 的 mean absolute score delta 为 `0.02734375`，final delta 为 `-0.03515625`
+- 结论应写成：algorithm-level supported；runtime smoke supportive，但它仍是 sequential
+  stochastic smoke，不是长程曲线级的最终证据
+- 独立结果记录见 `docs/plans/2026-03-17-mopd-zero-teacher-reduction-results.md`
+- 2026-03-17 还补上了 `teachers[]` order-permutation paired smoke evidence
+- 同一配置只打乱 `algorithm.mopd.teachers[]` 声明顺序，在 GPUs `0-3` 上完成了 paired rerun
+- rerun 前先修复了一个非算法性的 teacher 子批平衡问题：原始 smoke 数据会触发
+  `AssertionError: 5 % 4 != 0`，因此 harness 改为准备 `4/4` 平衡批并关闭 shuffle
+- 平衡化 rerun 后，两侧都到达 `training/global_step=4`，并在每一步保持完全一致的
+  `mopd/is_valid_fraction=1.0`、`mopd/is_zeroed_fraction=0.0` 与 `0.5 / 0.5` teacher sample fraction
+- 结论应写成：结构级顺序不变性有 paired smoke support，未见 teacher-slot swap / hardcoded slot 症状；
+  运行轨迹级证据仍只是 short-horizon sequential stochastic smoke
+- 独立结果记录见 `docs/plans/2026-03-17-mopd-teacher-order-invariance-results.md`
+
+这意味着当前 N-teacher 分析的剩余不确定性，已经不再是
+“单教师退化时会不会把 ORM / IS / routing 逻辑偷偷混进去”，而是更聚焦在：
+
+- zero-teacher 关闭 teacher path 时是否还残留 ghost teacher effect，也已经不再是“完全没有仓库内证明”的开放项；
+  当前剩下的是要不要继续补更强的长程 paired evidence
+- `teachers[]` 顺序是否隐式改变 teacher 语义，也已经不再是“完全没有仓库内证据”的开放项；
+  当前剩下的是要不要继续补更长程的 paired evidence
+
+- 多教师 composition 与 routing correctness
+- heterogeneous tokenizer 桥接路径
+- resource / checkpoint / lifecycle 的 N-teacher 扩展性
+
 ---
 
 ## 当前分支的真实架构
@@ -806,6 +844,19 @@ MOPD 现在是独立注册的 advantage estimator：
 - sequence teacher：`verl/trainer/ppo/core_algos.py:1139-1168`
 - ORM：`verl/trainer/ppo/core_algos.py:1170-1185`
 
+此外，当前分支已经补上了这条挑战最缺的一层“运行态正确性证明”：
+
+- 独立 baseline estimator：`single_teacher_reverse_kl`
+- reduction harness：`recipe/mopd/run_single_teacher_reduction.py`
+- official 3-way `data.seed` result doc：
+  `docs/plans/2026-03-16-mopd-single-teacher-reduction-results.md`
+
+该 proof 同时覆盖了：
+
+- tensor-level exact equivalence 测试
+- dispatch/reference-policy wiring 测试
+- matched-runtime 3-way `data.seed` paired run
+
 ### 为什么这算已解决
 
 现在的训练流是：
@@ -819,6 +870,8 @@ MOPD 现在是独立注册的 advantage estimator：
 - teacher 蒸馏不再“覆盖”别的优势
 - ORM 不是旁路 hack，而是同一个 estimator 的显式组成部分
 - actor 层不再承担 teacher-specific 公式逻辑
+- reduced single-teacher `mopd` 在算法层也已经通过 tensor-level tests 证明会退化成独立 reverse-KL
+  baseline；配套的 3-way `data.seed` runtime 对照未见稳定单边偏移，但轨迹级证据仍非强重合
 
 ### 状态
 
@@ -961,15 +1014,22 @@ manifest 里已经记录：
 4. **checkpoint 还不自包含**
    当前已有 manifest、`checkpoint.complete` 和 latest-complete resume fallback，但 teacher/base artifacts 仍是外部依赖。
 
+另外还要明确一个已经被排除的旧疑点：
+
+5. **单教师退化语义是否本身就不对**
+   这一点现在不再属于主开放问题。algorithm-level reduction proof 与当前 3-way `data.seed`
+   runtime 对照已经把它从 N-teacher 主挑战列表里降级；接下来需要验证的是多教师组合是否只比
+   单教师多了 routing / composition，而不是重新质疑单教师 reverse-KL 语义本身。
+
 如果把“工程收尾”单独拿出来看，当前最值得继续跟踪的是两条状态：
 
-5. **cleanup 主路径已闭环，默认 full recipe 已验证干净退出**
+6. **cleanup 主路径已闭环，默认 full recipe 已验证干净退出**
    `fit()` 现在已有统一 `_finalize_fit_resources()` 与 `try/finally`，`cleanup_teacher_workers()` 也会释放
    `base_policy_wg`；而且修复后的 2026-03-16 `run_mopd_qwen3_4b.sh` 日志
    `model_training_20260316_10.log` 已到达 `step:6 ... training/global_step:6`、`Final validation metrics`
    与最终 swanlab footer，并且不再出现 `resource_tracker` / `KeyError` / `Traceback`。当前剩下的只是
    post-fix GPU E2E / `18/18` rerun 是否也要补跑，不是 cleanup 主路径还没闭环。
-6. **typed config 的 runtime 闭环已补齐，但 composition-time strictness 仍偏弱**
+7. **typed config 的 runtime 闭环已补齐，但 composition-time strictness 仍偏弱**
    `TeacherConfig` / `MOPDConfig` / `AlgoConfig.__post_init__` / `validate_config()` 已把 runtime typed validation 接通，
    但 `AlgoConfig.mopd` 仍是 `Any` 注解。
 

@@ -21,6 +21,7 @@ from verl.single_controller.base import Worker
 from verl.trainer.ppo.core_algos import AdvantageEstimator
 
 WorkerType = type[Worker]
+MOPD_TEACHER_RUNTIME_ADV_ESTIMATORS = {"mopd", "single_teacher_reverse_kl"}
 
 
 class Role(Enum):
@@ -76,9 +77,22 @@ def need_reference_policy(
     return (
         config.algorithm.use_kl_in_reward
         or config.actor_rollout_ref.actor.use_kl_loss
-        or config.algorithm.get("mopd", {}).get("enabled", False)
-        or config.algorithm.get("adv_estimator", "") == "mopd"
+        or need_mopd_teacher_runtime(config.algorithm)
     )
+
+
+def need_mopd_teacher_runtime(algorithm_config: DictConfig) -> bool:
+    """Whether the current algorithm config requires MOPD teacher orchestration.
+
+    This is true for the native MOPD estimator and for any other estimator that
+    reuses the same trainer-side teacher routing/runtime surface, such as the
+    single-teacher reverse-KL reduction baseline.
+    """
+
+    adv_estimator = algorithm_config.get("adv_estimator", "")
+    if hasattr(adv_estimator, "value"):
+        adv_estimator = adv_estimator.value
+    return algorithm_config.get("mopd", {}).get("enabled", False) or adv_estimator in MOPD_TEACHER_RUNTIME_ADV_ESTIMATORS
 
 
 def need_reward_model(

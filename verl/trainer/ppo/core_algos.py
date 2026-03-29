@@ -110,6 +110,8 @@ class AdvantageEstimator(str, Enum):
     GRPO_VECTORIZED = "grpo_vectorized"
     OPTIMAL_TOKEN_BASELINE = "optimal_token_baseline"
     TIR_OPTIMAL_TOKEN_BASELINE = "tir_optimal_token_baseline"
+    SINGLE_TEACHER_REVERSE_KL = "single_teacher_reverse_kl"
+    MOPD_ZERO_TEACHER_ORM_ONLY = "mopd_zero_teacher_orm_only"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -1039,6 +1041,96 @@ def compute_mopd_sequence_teacher_advantage(
     return normalized_scores.unsqueeze(-1) * response_mask
 
 
+@register_adv_est(AdvantageEstimator.SINGLE_TEACHER_REVERSE_KL)
+def compute_single_teacher_reverse_kl_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    teacher_log_prob: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    rollout_log_probs: Optional[torch.Tensor] = None,
+    base_log_prob: Optional[torch.Tensor] = None,
+    teacher_seq_reward: Optional[torch.Tensor] = None,
+    teacher_seq_weight: float | torch.Tensor = 0.0,
+    teacher_token_mask: Optional[torch.Tensor] = None,
+    orm_weight: float = 0.0,
+    is_correction: bool = False,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Independent pure single-teacher reverse-KL distillation baseline.
+
+    This baseline intentionally supports only the reduced single-teacher MOPD case:
+
+    - token-compatible teacher log-prob path
+    - no ExOPD/base normalization
+    - no sequence-level teacher reward
+    - no ORM mixing
+    - no rollout importance-sampling correction
+    """
+
+    del kwargs
+
+    if base_log_prob is not None:
+        raise ValueError("single_teacher_reverse_kl does not support base normalization")
+    if orm_weight != 0.0:
+        raise ValueError("single_teacher_reverse_kl does not support ORM mixing")
+    if is_correction and rollout_log_probs is not None:
+        raise ValueError("single_teacher_reverse_kl does not support rollout IS correction")
+
+    seq_weight_tensor = torch.as_tensor(teacher_seq_weight, device=response_mask.device, dtype=torch.float32)
+    if torch.any(seq_weight_tensor != 0):
+        raise ValueError("single_teacher_reverse_kl does not support sequence-teacher weighting")
+    if teacher_token_mask is not None and torch.any(teacher_token_mask.to(device=response_mask.device) > 0):
+        raise ValueError("single_teacher_reverse_kl does not support sequence-teacher token masks")
+
+    advantages = (teacher_log_prob - old_log_probs).detach() * response_mask
+    returns = token_level_rewards * response_mask
+    return advantages, returns
+
+
+@register_adv_est(AdvantageEstimator.MOPD_ZERO_TEACHER_ORM_ONLY)
+def compute_mopd_zero_teacher_orm_only_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: Optional[np.ndarray] = None,
+    norm_adv_by_std_in_grpo: bool = True,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduced MOPD variant with teacher branches hard-disabled.
+
+    This helper intentionally reuses `compute_mopd_advantage()` instead of
+    calling GRPO directly so the reduction proof exercises the same ORM mixing
+    composition path while zeroing both token-level and sequence-level teacher
+    signals.
+    """
+
+    del kwargs
+
+    if index is None:
+        raise ValueError("mopd_zero_teacher_orm_only requires 'index' (uid) in batch.")
+
+    _, orm_returns = compute_grpo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+    )
+    zero_log_probs = torch.zeros_like(response_mask, dtype=torch.float32)
+    teacher_token_mask = torch.ones_like(response_mask, dtype=torch.float32)
+    advantages, _, _ = compute_mopd_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        teacher_log_prob=zero_log_probs,
+        old_log_probs=zero_log_probs,
+        teacher_token_mask=teacher_token_mask,
+        teacher_seq_weight=0.0,
+        orm_weight=1.0,
+        is_correction=False,
+        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        index=index,
+    )
+    return advantages, orm_returns
+
+
 @register_adv_est("mopd")
 def compute_mopd_advantage(
     token_level_rewards: torch.Tensor,
@@ -1055,6 +1147,7 @@ def compute_mopd_advantage(
     is_correction: bool = True,
     is_epsilon_low: float = 0.1,
     is_epsilon_high: float = 10.0,
+    norm_adv_by_std_in_grpo: bool = True,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
     """Multi-Teacher On-Policy Distillation (MOPD) advantage estimator.
@@ -1179,6 +1272,7 @@ def compute_mopd_advantage(
             token_level_rewards=token_level_rewards,
             response_mask=response_mask,
             index=kwargs["index"],
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
         )[0]  # returns (advantages, returns)
         A_final = weights * (A_mopd + seq_weight_tensor * A_seq_teacher + orm_weight * A_orm)
     else:

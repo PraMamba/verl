@@ -82,6 +82,18 @@ class SentinelTeacherWG(MockTeacherWG):
         )
 
 
+class CapturingSentinelTeacherWG(SentinelTeacherWG):
+    """Sentinel teacher that also records the padded sub-batch it receives."""
+
+    def __init__(self):
+        super().__init__(fill_value=0.0)
+        self.last_sub_batch = None
+
+    def compute_ref_log_prob(self, sub_batch: DataProto) -> DataProto:
+        self.last_sub_batch = sub_batch
+        return super().compute_ref_log_prob(sub_batch)
+
+
 class _FakeTeacherFuture:
     def __init__(self, event_log: list[str], teacher_name: str, output: DataProto):
         self.event_log = event_log
@@ -424,6 +436,86 @@ def test_teacher_log_prob_preserves_sample_alignment_after_balancing():
     torch.testing.assert_close(teacher_log_prob, expected)
 
 
+def test_teacher_log_prob_pads_small_teacher_sub_batch_before_forward():
+    """Teacher routing should pad a small sub-batch up to dp_size without crashing."""
+    batch = DataProto.from_single_dict(
+        {
+            "responses": torch.randint(0, 1000, (4, 4)),
+            "sample_marker": torch.tensor([[10.0], [20.0], [30.0], [40.0]], dtype=torch.float32),
+            "attention_mask": torch.tensor(
+                [
+                    [1, 1, 1, 1],
+                    [1, 1, 1, 1],
+                    [1, 0, 0, 0],
+                    [1, 0, 0, 0],
+                ],
+                dtype=torch.long,
+            ),
+        }
+    )
+    batch.non_tensor_batch["teacher_id"] = np.array(["math", "math", "math", "math"])
+
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.teacher_wgs = {"math": CapturingSentinelTeacherWG()}
+    trainer.use_prefix_grouper = False
+    trainer._get_dp_size = lambda worker_group, role: 8
+
+    teacher_log_prob = RayPPOTrainer._compute_teacher_log_probs(trainer, batch)
+
+    expected = torch.tensor(
+        [
+            [10.0, 10.0, 10.0, 10.0],
+            [20.0, 20.0, 20.0, 20.0],
+            [30.0, 30.0, 30.0, 30.0],
+            [40.0, 40.0, 40.0, 40.0],
+        ],
+        dtype=torch.float32,
+    )
+    torch.testing.assert_close(teacher_log_prob, expected)
+    assert trainer.teacher_wgs["math"].last_sub_batch is not None
+    assert len(trainer.teacher_wgs["math"].last_sub_batch) == 8
+
+
+def test_teacher_log_prob_non_divisible_teacher_sub_batch_survives_dp8():
+    """Teacher routing should tolerate teacher-local sizes that are not divisible by dp_size."""
+    batch = DataProto.from_single_dict(
+        {
+            "responses": torch.randint(0, 1000, (12, 4)),
+            "sample_marker": torch.arange(1, 13, dtype=torch.float32).unsqueeze(1),
+            "attention_mask": torch.tensor(
+                [
+                    [1, 1, 1, 1],
+                    [1, 1, 1, 1],
+                    [1, 1, 1, 0],
+                    [1, 1, 1, 0],
+                    [1, 1, 0, 0],
+                    [1, 1, 0, 0],
+                    [1, 0, 0, 0],
+                    [1, 0, 0, 0],
+                    [1, 1, 1, 1],
+                    [1, 1, 1, 0],
+                    [1, 1, 0, 0],
+                    [1, 0, 0, 0],
+                ],
+                dtype=torch.long,
+            ),
+        }
+    )
+    batch.non_tensor_batch["teacher_id"] = np.array(["math"] * 12)
+
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.teacher_wgs = {"math": CapturingSentinelTeacherWG()}
+    trainer.use_prefix_grouper = False
+    trainer._get_dp_size = lambda worker_group, role: 8
+
+    teacher_log_prob = RayPPOTrainer._compute_teacher_log_probs(trainer, batch)
+
+    expected = torch.arange(1, 13, dtype=torch.float32).unsqueeze(1).expand(12, 4)
+    torch.testing.assert_close(teacher_log_prob, expected)
+    assert trainer.teacher_wgs["math"].last_sub_batch is not None
+    assert len(trainer.teacher_wgs["math"].last_sub_batch) == 16
+
+
 def test_teacher_log_prob_async_overlaps_different_pools_but_serializes_same_pool():
     """Teacher forwards should overlap across pools while preserving same-pool sequencing."""
     batch = DataProto.from_single_dict(
@@ -505,3 +597,55 @@ def test_teacher_log_prob_uses_teacher_dispatch_mesh_for_dp_size():
 
     torch.testing.assert_close(teacher_log_prob, torch.ones(1, 4, dtype=torch.float32))
     assert requested_meshes == ["ref"]
+
+
+def test_teacher_log_prob_pads_non_divisible_teacher_subset_before_forward():
+    """Teacher subsets that are not divisible by DP size should still route correctly."""
+    batch = DataProto.from_single_dict(
+        {
+            "responses": torch.randint(0, 1000, (16, 4)),
+            "attention_mask": torch.ones(16, 4, dtype=torch.long),
+        }
+    )
+    batch.non_tensor_batch["teacher_id"] = np.array(["math"] * 12 + ["code"] * 4)
+
+    math_wg = CapturingTeacherWG(fill_value=1.0)
+    code_wg = CapturingTeacherWG(fill_value=2.0)
+
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.teacher_wgs = {"math": math_wg, "code": code_wg}
+    trainer.use_prefix_grouper = False
+    trainer._get_dp_size = lambda worker_group, role: 8
+
+    teacher_log_prob = RayPPOTrainer._compute_teacher_log_probs(trainer, batch)
+
+    torch.testing.assert_close(teacher_log_prob[:12], torch.ones(12, 4, dtype=torch.float32))
+    torch.testing.assert_close(teacher_log_prob[12:], torch.full((4, 4), 2.0, dtype=torch.float32))
+    assert math_wg.last_batch_size == 16
+    assert code_wg.last_batch_size == 8
+
+
+def test_teacher_log_prob_pads_teacher_subset_smaller_than_dp_size():
+    """Teacher subsets smaller than DP size should pad instead of asserting in balancing."""
+    batch = DataProto.from_single_dict(
+        {
+            "responses": torch.randint(0, 1000, (8, 4)),
+            "attention_mask": torch.ones(8, 4, dtype=torch.long),
+        }
+    )
+    batch.non_tensor_batch["teacher_id"] = np.array(["math"] * 4 + ["code"] * 4)
+
+    math_wg = CapturingTeacherWG(fill_value=1.0)
+    code_wg = CapturingTeacherWG(fill_value=2.0)
+
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.teacher_wgs = {"math": math_wg, "code": code_wg}
+    trainer.use_prefix_grouper = False
+    trainer._get_dp_size = lambda worker_group, role: 8
+
+    teacher_log_prob = RayPPOTrainer._compute_teacher_log_probs(trainer, batch)
+
+    torch.testing.assert_close(teacher_log_prob[:4], torch.ones(4, 4, dtype=torch.float32))
+    torch.testing.assert_close(teacher_log_prob[4:], torch.full((4, 4), 2.0, dtype=torch.float32))
+    assert math_wg.last_batch_size == 8
+    assert code_wg.last_batch_size == 8

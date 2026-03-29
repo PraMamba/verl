@@ -242,6 +242,8 @@ class TaskRunner:
             config.reward.reward_model.nnodes = config.trainer.nnodes
             config.reward.reward_model.n_gpus_per_node = config.trainer.n_gpus_per_node
 
+        from verl.trainer.ppo.utils import need_mopd_teacher_runtime
+
         mopd_cfg = config.algorithm.get("mopd", {})
         for pool_name, pool_cfg in mopd_cfg.get("resource_pools", {}).items():
             if pool_name in resource_pool_spec:
@@ -255,7 +257,7 @@ class TaskRunner:
             }
 
         required_colocate_counts = Counter(self.mapping.values())
-        if mopd_cfg.get("enabled", False):
+        if need_mopd_teacher_runtime(config.algorithm):
             for teacher_cfg in mopd_cfg.get("teachers", []):
                 required_colocate_counts[teacher_cfg.resource_pool] += 1
 

@@ -1,6 +1,6 @@
 # MOPD Implementation - Current Test Results
 
-**Date**: 2026-03-16
+**Date**: 2026-03-29
 **Branch**: `feature/mopd-implementation` (worktree: `mopd-implementation`)
 **Scope**: Current worktree source, including uncommitted follow-up changes
 
@@ -47,6 +47,9 @@ larger and materially different MOPD validation surface:
   - **123 passed**
   - **1 skipped**
   - **1 warning**
+- A fresh reduction-focused regression slice completed with:
+  - **67 passed**
+  - **1 warning**
 - A separate teardown/cleanup regression file completed with:
   - **7 passed**
   - **3 warnings**
@@ -77,13 +80,55 @@ larger and materially different MOPD validation surface:
   - `model_training_20260316_10.log` reaching `step:6 ... training/global_step:6`
   - `Final validation metrics` and the final swanlab footer
   - zero hits for `resource_tracker`, `KeyError`, `process died unexpectedly`, or `Traceback`
+- A fresh 3-way `data.seed` single-teacher reduction comparison on 2026-03-16 completed with:
+  - official artifacts under `/gpfs/Mamba/Project/Single_Cell/Training/MOPD-single-teacher-reduction-20260316-run1`
+  - all six runs reaching `training/global_step=12`
+  - final `mopd - single_teacher_reverse_kl` deltas of `-0.548263`, `+0.206836`, and `+0.099413`
+  - mean absolute final delta `0.284837`, max absolute final delta `0.548263`
+  - explicit isolation of reverse-KL semantics via the zero-reward harness
+  - no consistent one-sided offset, but still mixed training-trajectory evidence
+- A fresh paired zero-teacher ORM-only reduction smoke rerun on 2026-03-17 completed with:
+  - fresh artifacts under `/tmp/mopd-zero-teacher-smoke-run-b8-rerun-20260317`
+  - GPUs `0,1,2,3`
+  - both runs reaching `training/global_step=4`
+  - step-level `mopd_zero_teacher_orm_only - grpo` score deltas of
+    `+0.00390625`, `+0.0703125`, `+0.0`, and `-0.03515625`
+  - mean absolute score delta `0.02734375`, max absolute score delta `0.0703125`
+  - algorithm-level reduction supported for the intended config
+    (`algorithm.mopd.enabled=False`)
+  - runtime smoke evidence supportive but still short-horizon and stochastic-sequential
+  - detailed writeup in `docs/plans/2026-03-17-mopd-zero-teacher-reduction-results.md`
+- A fresh paired teacher-order invariance smoke rerun on 2026-03-17 completed with:
+  - fresh artifacts under `/tmp/mopd-teacher-order-invariance-20260317-rerun`
+  - GPUs `0,1,2,3`
+  - same config except for the declaration order of `algorithm.mopd.teachers[]`
+  - both runs reaching `training/global_step=4`
+  - exact step-level agreement on `mopd/is_valid_fraction=1.0`,
+    `mopd/is_zeroed_fraction=0.0`, and `0.5 / 0.5` teacher sample fractions
+  - no teacher-slot swap symptom in the per-teacher metrics
+  - mean absolute delta `0.00341530` for `mopd/is_ratio_mean`
+  - structure-level order invariance supported by paired smoke evidence;
+    trajectory-level evidence still short-horizon and stochastic-sequential
+  - detailed writeup in `docs/plans/2026-03-17-mopd-teacher-order-invariance-results.md`
+- A fresh validation-first main-launcher mini-run with periodic save/test on 2026-03-29 completed with:
+  - artifact root `/gpfs/Mamba/Project/Single_Cell/tmp/mopd_qwen3_4b_mini_val_save_test_gpfs/mini_val_20260329_054738`
+  - `SAVE_FREQ=2`, `TEST_FREQ=2`, `VAL_BEFORE_TRAIN=true`
+  - `Training Progress: 100%|...| 8/8`
+  - complete checkpoints at `global_step_2`, `global_step_4`, `global_step_6`, and `global_step_8`
+  - `latest_checkpointed_iteration.txt = 8`
+  - `validation generation end`, `Initial validation metrics`, and `Final validation metrics`
+  - confirmation that the earlier `/tmp` save failure was environmental disk exhaustion, not a checkpointing logic conflict
 - The newly covered areas that did not exist in the old snapshot include:
   - batch-level `lambda_val` override semantics in ExOPD
+  - independent `single_teacher_reverse_kl` estimator and reduced-MOPD equivalence checks
+  - independent `mopd_zero_teacher_orm_only` reduction estimator and same-batch GRPO equivalence checks
   - sequence-teacher advantage composition and dispatch plumbing
   - async teacher scheduling across resource pools
   - dedicated quantized teacher worker behavior
   - `TeacherResourcePoolConfig` validation
   - run-script import binding to the current worktree
+  - single-teacher reduction harness command generation and real-log step parsing
+  - zero-teacher reduction harness command generation and fresh GPU `0-3` smoke evidence
   - GPU E2E env-contract and success-contract tests
   - trainer fit finalization and dataloader-worker shutdown checks
   - checkpoint completeness markers and conservative auto-resume selection
@@ -221,6 +266,41 @@ bash recipe/mopd/run_mopd_qwen3_4b.sh
 ```
 
 Result:
+
+### 6a. Validation-first mini-run with periodic save/test
+
+Command:
+
+```bash
+CKPTS_ROOT=/gpfs/Mamba/Project/Single_Cell/tmp/mopd_qwen3_4b_mini_val_save_test_gpfs \
+SWANLAB_MODE=disabled \
+SAVE_FREQ=2 \
+TEST_FREQ=2 \
+bash recipe/mopd/run_mopd_qwen3_4b_mini_val.sh
+```
+
+Result:
+
+```text
+Training Progress: 100%|...| 8/8
+validation generation end
+Initial validation metrics: {...}
+Final validation metrics: {...}
+latest_checkpointed_iteration.txt = 8
+```
+
+Artifacts:
+
+- `/gpfs/Mamba/Project/Single_Cell/tmp/mopd_qwen3_4b_mini_val_save_test_gpfs/mini_val_20260329_054738/logs/model_training_20260329_05.log`
+- `/gpfs/Mamba/Project/Single_Cell/tmp/mopd_qwen3_4b_mini_val_save_test_gpfs/mini_val_20260329_054738/latest_checkpointed_iteration.txt`
+- `/gpfs/Mamba/Project/Single_Cell/tmp/mopd_qwen3_4b_mini_val_save_test_gpfs/mini_val_20260329_054738/global_step_8`
+
+Observed boundary:
+
+- initial save/test path succeeded at `global_step_2`
+- periodic save/test continued through `global_step_4` and `global_step_6`
+- final periodic save wrote a complete `global_step_8` checkpoint and the trainer still reached `8/8`
+- the earlier `/tmp` rehearsal failure was traced to root filesystem exhaustion, so the failure mode was environmental rather than algorithmic
 
 ```text
 exit code 0
@@ -413,6 +493,62 @@ What this does **not** prove:
 
 ---
 
+### 12. Single-teacher reduction proof
+
+Commands:
+
+```bash
+pytest -q \
+  tests/unit/test_mopd_single_teacher_reduction.py \
+  tests/unit/test_mopd_advantage.py \
+  tests/unit/test_mopd_trainer_runtime.py \
+  tests/unit/test_mopd_run_script.py
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5,6,7 \
+python recipe/mopd/run_single_teacher_reduction.py \
+  --seed <42|43|44> \
+  --output-root /gpfs/Mamba/Project/Single_Cell/Training/MOPD-single-teacher-reduction-20260316-run1/seed<seed>
+```
+
+Result:
+
+```text
+62 passed, 1 warning in 8.57s
+```
+
+Official experiment outcome:
+
+- output root:
+  `/gpfs/Mamba/Project/Single_Cell/Training/MOPD-single-teacher-reduction-20260316-run1`
+- all six runs reached `training/global_step=12`
+- final deltas on `critic/advantages/mean`:
+  - seed 42: `-0.548263`
+  - seed 43: `+0.206836`
+  - seed 44: `+0.099413`
+- aggregate:
+  - mean final delta: `-0.080671`
+  - mean absolute final delta: `0.284837`
+  - max absolute final delta: `0.548263`
+  - mean relative absolute final delta vs baseline magnitude: `11.62%`
+
+Interpretation:
+
+- tensor-level reduction is still proven locally by `tests/unit/test_mopd_advantage.py`
+- the matched 3-way `data.seed` runtime comparison does not show a stable one-sided offset,
+  but the traces are not tightly overlapping either
+- this should be read as “algorithm-level reduction proved, training-trajectory evidence mixed”
+- the experiment used `recipe/mopd/zero_reward.py`, so `critic/score/mean`
+  staying `0.0` is expected and isolates estimator semantics rather than task
+  reward
+- this is a 3-way `data.seed` sweep under the frozen harness, not a proof that every
+  stochastic source in the runtime was independently swept
+- the detailed run record lives in
+  `docs/plans/2026-03-16-mopd-single-teacher-reduction-results.md`
+
+---
+
 ## Current Suite Inventory
 
 | File | Tests Collected | Current Focus |
@@ -445,6 +581,9 @@ The extra teardown file sits outside this inventory and currently contributes:
 The algorithm layer is no longer only testing the original reverse-KL path.
 Current coverage now includes:
 
+- independent `single_teacher_reverse_kl` baseline estimator
+- exact reduced single-teacher MOPD equivalence against that independent baseline
+- dispatch and reference-policy support for `single_teacher_reverse_kl`
 - standard MOPD dispatch and output shape
 - ExOPD base-normalized path
 - batch-level `lambda_val` overriding config-level scalar in ExOPD
@@ -456,6 +595,10 @@ Current coverage now includes:
 
 Representative tests:
 
+- `test_single_teacher_reverse_kl_advantage_basic`
+- `test_reduced_single_teacher_mopd_matches_independent_reverse_kl_baseline`
+- `test_compute_advantage_dispatch_supports_single_teacher_reverse_kl`
+- `test_need_reference_policy_with_single_teacher_reverse_kl`
 - `test_batch_lambda_overrides_config_scalar_for_exopd_dispatch`
 - `test_batch_lambda_does_not_change_standard_mopd_without_base_log_prob`
 - `test_mopd_advantage_sequence_teacher_signal_changes_result_when_orm_disabled`
@@ -519,6 +662,9 @@ Covered now:
 
 - `teacher_id` extraction into `batch.non_tensor_batch`
 - default `"default"` fallback when configured field is missing
+- single-teacher reduction command generation with matched `mopd` vs `single_teacher_reverse_kl` settings
+- reduction harness parsing for both plain `step:...` lines and real prefixed `(TaskRunner pid=...) step:...` lines
+- explicit-token student default pinned to the production recipe contract
 - preflight command generation with teacher overrides and `tokenizer_compat_group`
 - success detection tied to the first real training step
 - failure-marker detection for NCCL timeout, actor death, fatal Python error, and segfault
@@ -529,6 +675,9 @@ Covered now:
 Representative tests:
 
 - `test_teacher_id_end_to_end_with_collate`
+- `test_build_reduction_commands_share_core_training_settings`
+- `test_extract_step_metrics_parses_prefixed_console_metric_lines`
+- `test_default_student_model_matches_production_explicit_token_recipe`
 - `test_build_training_command_uses_first_batch_overrides`
 - `test_detect_terminal_event_recognizes_first_actor_update_success`
 - `test_detect_terminal_event_recognizes_failure_markers[...]`
@@ -670,6 +819,7 @@ Because of that change in scope, the old per-file counts, commit callouts, and
 Freshly validated in this update:
 
 - current CPU-safe MOPD suite on the latest worktree state
+- current single-teacher / zero-teacher reduction regression slice on the latest worktree state
 - current collected test inventory and per-file counts
 - current lightweight integration and contract tests
 - current teardown/cleanup regression helpers
@@ -681,6 +831,18 @@ Freshly validated in this update:
   final validation, and `training/global_step:18`
 - real-weight quantized-teacher load / memory / first-step profiling for `hf_int8` and `hf_4bit`
 - single-node actor-death drill through forced failure, tracker deletion, and auto-resume fallback to the latest complete checkpoint
+- official 3-way `data.seed` single-teacher reduction run and result aggregation under
+  `/gpfs/Mamba/Project/Single_Cell/Training/MOPD-single-teacher-reduction-20260316-run1`
+- fresh zero-teacher ORM-only reduction smoke rerun under
+  `/tmp/mopd-zero-teacher-smoke-run-b8-rerun-20260317`
+  (sequential stochastic smoke comparison, not locked-step replay)
+- fresh teacher-order invariance smoke rerun under
+  `/tmp/mopd-teacher-order-invariance-20260317-rerun`
+  (structure-level paired order-permutation evidence, still short-horizon and
+  sequential stochastic)
+- fresh validation-first main-launcher mini-run with periodic save/test under
+  `/gpfs/Mamba/Project/Single_Cell/tmp/mopd_qwen3_4b_mini_val_save_test_gpfs/mini_val_20260329_054738`,
+  including complete `global_step_2/4/6/8` checkpoint writes and final `8/8` closure
 
 Not freshly re-executed in this update:
 
@@ -707,6 +869,10 @@ The three core recipe-aligned commands have now been run for the latest worktree
 state, and one real actor-death recovery drill has also completed successfully.
 The next validation gaps are no longer “run preflight / run GPU E2E”, but:
 
+- 2-teacher composition / routing correctness experiments now that the
+  single-teacher algorithmic reduction issue is no longer the main blocker
+- longer-horizon `teachers[]` permutation comparisons if a stronger empirical
+  order-invariance claim is required beyond the current 4-step smoke evidence
 - longer-horizon or repeated long-run quality / convergence studies beyond the current `18/18` closure run
 - multi-node teacher placement and resource-pool behavior
 - additional failure-path validation such as NCCL timeout, OOM, segfault, or async-save restart behavior beyond the already-proven actor-death case
