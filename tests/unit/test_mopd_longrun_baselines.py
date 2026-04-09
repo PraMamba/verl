@@ -14,9 +14,9 @@
 
 """Unit tests for the long-run MOPD baseline harness."""
 
+import sys
 from importlib import util
 from pathlib import Path
-import sys
 
 
 def _load_module():

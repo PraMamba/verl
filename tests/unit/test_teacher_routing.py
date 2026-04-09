@@ -195,8 +195,7 @@ def compute_teacher_log_probs_standalone(
         # Validate shape matches expected response length
         if sub_log_probs.shape[1] != response_len:
             raise ValueError(
-                f"Teacher '{teacher_name}' returned shape {sub_log_probs.shape}, "
-                f"expected (*, {response_len})"
+                f"Teacher '{teacher_name}' returned shape {sub_log_probs.shape}, expected (*, {response_len})"
             )
 
         # Scatter back to full batch (ensure dtype/device match after Ray serialization)

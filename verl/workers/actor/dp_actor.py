@@ -99,8 +99,7 @@ def _log_dynamic_bsz_diagnostics(
         )
     else:
         logger.warning(
-            "%s num_micro_batches_by_rank=%s local_batch_size_by_rank=%s "
-            "local_token_sum_by_rank=%s mismatch=%s",
+            "%s num_micro_batches_by_rank=%s local_batch_size_by_rank=%s local_token_sum_by_rank=%s mismatch=%s",
             log_name,
             num_micro_batches_by_rank,
             local_batch_size_by_rank,
@@ -124,7 +123,9 @@ def _log_dynamic_bsz_update_diagnostics(
     )
 
 
-def _log_dynamic_bsz_compute_log_prob_diagnostics(batch: DataProto, micro_batches: list[DataProto], sync_group=None) -> None:
+def _log_dynamic_bsz_compute_log_prob_diagnostics(
+    batch: DataProto, micro_batches: list[DataProto], sync_group=None
+) -> None:
     _log_dynamic_bsz_diagnostics(
         log_name="dynamic_bsz_compute_log_prob_diagnostics",
         batch=batch,

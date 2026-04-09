@@ -14,10 +14,10 @@
 
 """Unit tests for the single-teacher MOPD reduction harness."""
 
-from importlib import util
-from pathlib import Path
 import re
 import sys
+from importlib import util
+from pathlib import Path
 
 import pandas as pd
 

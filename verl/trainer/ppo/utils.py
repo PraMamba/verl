@@ -92,7 +92,9 @@ def need_mopd_teacher_runtime(algorithm_config: DictConfig) -> bool:
     adv_estimator = algorithm_config.get("adv_estimator", "")
     if hasattr(adv_estimator, "value"):
         adv_estimator = adv_estimator.value
-    return algorithm_config.get("mopd", {}).get("enabled", False) or adv_estimator in MOPD_TEACHER_RUNTIME_ADV_ESTIMATORS
+    return (
+        algorithm_config.get("mopd", {}).get("enabled", False) or adv_estimator in MOPD_TEACHER_RUNTIME_ADV_ESTIMATORS
+    )
 
 
 def need_reward_model(

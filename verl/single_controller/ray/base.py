@@ -190,9 +190,7 @@ class ResourcePoolManager:
 
     @staticmethod
     def _parse_resource_pool_spec_entry(pool_spec: list[int] | dict[str, Any]) -> tuple[list[int], int, Optional[str]]:
-        if isinstance(pool_spec, dict) or (
-            hasattr(pool_spec, "keys") and "process_on_nodes" in pool_spec
-        ):
+        if isinstance(pool_spec, dict) or (hasattr(pool_spec, "keys") and "process_on_nodes" in pool_spec):
             process_on_nodes = pool_spec["process_on_nodes"]
             max_colocate_count = pool_spec.get("max_colocate_count", 3)
             accelerator_type = pool_spec.get("accelerator_type")

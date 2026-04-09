@@ -212,8 +212,7 @@ class HFQuantizedTeacherWorker(Worker):
     def _compute_seq_scores_impl(self, data: DataProto) -> DataProto:
         if self.model is None or self.tokenizer is None:
             raise ValueError(
-                "Teacher model/tokenizer is not initialized. "
-                "Call init_model() before compute_seq_scores()."
+                "Teacher model/tokenizer is not initialized. Call init_model() before compute_seq_scores()."
             )
 
         raw_prompts = list(data.non_tensor_batch["raw_prompt"])

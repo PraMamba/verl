@@ -1212,9 +1212,7 @@ def compute_mopd_advantage(
         valid_tokens = (weights > 0) & (response_mask > 0)
         all_masked = ~valid_tokens.any(dim=-1)  # [batch]
         if all_masked.any():
-            logger.warning(
-                "IS correction masked all tokens for some samples. Using unweighted advantages as fallback."
-            )
+            logger.warning("IS correction masked all tokens for some samples. Using unweighted advantages as fallback.")
             # Use 2D indexing to set all tokens for masked samples
             weights[all_masked, :] = 1.0
 

@@ -14,9 +14,9 @@
 
 """Unit tests for the MOPD teacher-order invariance experiment harness."""
 
+import sys
 from importlib import util
 from pathlib import Path
-import sys
 
 
 def _load_order_invariance_module():

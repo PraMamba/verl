@@ -70,4 +70,3 @@ async def compute_deepseek_singlecell_reward(data_source, solution_str, ground_t
     assert result["echo_task_type_present"] == pytest.approx(1.0)
     assert result["echo_reward_version_v1"] == pytest.approx(1.0)
     assert result["pred"] == "In summary, the answer is: Cell 1: Oligodendrocyte"
-

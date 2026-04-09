@@ -14,9 +14,9 @@
 
 """Unit tests for the MOPD first-batch preflight helper."""
 
+import sys
 from importlib import util
 from pathlib import Path
-import sys
 
 import pytest
 
@@ -190,9 +190,7 @@ def test_validate_preflight_config_rejects_undersized_smoke_batch():
 def test_detect_terminal_event_ignores_validation_only_logs():
     module = _load_preflight_module()
 
-    event = module.detect_terminal_event(
-        "step:0 - val-core/population_cell_type_homogeneous_test/acc/mean@1:0.0"
-    )
+    event = module.detect_terminal_event("step:0 - val-core/population_cell_type_homogeneous_test/acc/mean@1:0.0")
 
     assert event is None
 

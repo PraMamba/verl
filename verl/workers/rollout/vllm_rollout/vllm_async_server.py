@@ -482,9 +482,7 @@ class vLLMHttpServer:
             logger.info(f"Initializing a V1 LLM engine with config: {vllm_config}")
 
         self.engine = engine_client
-        self._server_port, self._server_task, self._uvicorn_server = await run_uvicorn(
-            app, args, self._server_address
-        )
+        self._server_port, self._server_task, self._uvicorn_server = await run_uvicorn(app, args, self._server_address)
 
     async def run_headless(self, args: argparse.Namespace):
         """Run headless server in a separate thread."""

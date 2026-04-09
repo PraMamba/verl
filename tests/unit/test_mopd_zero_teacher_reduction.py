@@ -14,9 +14,9 @@
 
 """Unit tests for the zero-teacher ORM-only MOPD reduction harness."""
 
+import sys
 from importlib import util
 from pathlib import Path
-import sys
 
 
 def _load_reduction_module():
