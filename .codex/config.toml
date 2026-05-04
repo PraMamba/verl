@@ -1,0 +1,72 @@
+#:schema https://developers.openai.com/codex/config-schema.json
+
+# Project-scoped Codex configuration for verl assistance artifacts.
+# Hooks are intentionally omitted: this migration uses explicit agents and skills only.
+
+[agents]
+max_threads = 6
+max_depth = 1
+
+[agents.verl_planner]
+description = "Planning agent for multi-file verl changes, architecture decisions, and feature decomposition."
+config_file = "agents/planner.toml"
+
+[agents.verl_code_reviewer]
+description = "Read-only reviewer for common verl correctness, distributed, Ray, DataProto, and maintainability issues."
+config_file = "agents/simple-code-reviewer.toml"
+
+[agents.verl_code_verifier]
+description = "Verification agent for formatting, linting, TOML/Markdown checks, and targeted tests after changes."
+config_file = "agents/code-verifier.toml"
+
+[agents.verl_algorithm_expert]
+description = "Read-only expert on verl RL algorithms, rewards, advantages, and PPO-family losses."
+config_file = "agents/algorithm-expert.toml"
+
+[agents.verl_fsdp_expert]
+description = "Read-only expert on FSDP/FSDP2, DTensor, device meshes, and distributed training optimization in verl."
+config_file = "agents/fsdp-engine-expert.toml"
+
+[agents.verl_megatron_expert]
+description = "Read-only expert on Megatron-Core integration, tensor/pipeline/context/sequence parallelism, and large-model training."
+config_file = "agents/megatron-engine-expert.toml"
+
+[agents.verl_rollout_expert]
+description = "Read-only expert on vLLM and SGLang rollout engines, generation throughput, and multi-turn/tool interactions."
+config_file = "agents/vllm-sglang-expert.toml"
+
+[agents.verl_ray_controller_expert]
+description = "Read-only expert on Ray single-controller orchestration, workers, dispatch modes, and resource placement in verl."
+config_file = "agents/ray-controller-expert.toml"
+
+[[skills.config]]
+path = ".codex/skills/add-reward"
+enabled = true
+
+[[skills.config]]
+path = ".codex/skills/add-dataset"
+enabled = true
+
+[[skills.config]]
+path = ".codex/skills/add-worker"
+enabled = true
+
+[[skills.config]]
+path = ".codex/skills/add-unit-tests"
+enabled = true
+
+[[skills.config]]
+path = ".codex/skills/debug-distributed"
+enabled = true
+
+[[skills.config]]
+path = ".codex/skills/prepare-pr"
+enabled = true
+
+[[skills.config]]
+path = ".codex/skills/generate-commit-message"
+enabled = true
+
+[[skills.config]]
+path = ".codex/skills/review-pr"
+enabled = true
