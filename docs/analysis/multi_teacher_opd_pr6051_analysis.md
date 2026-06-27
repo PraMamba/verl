@@ -19,6 +19,8 @@
 8. [如何配置 Multi-Teacher OPD 训练](#8-如何配置-multi-teacher-opd-训练)
 9. [架构评估与代码质量审查](#9-架构评估与代码质量审查)
 10. [总结](#10-总结)
+11. [PR #6051 合并后的后续演进](#11-pr-6051-合并后的后续演进)
+12. [自定义数据集与模型实战指南](#12-自定义数据集与模型实战指南)
 
 ---
 
@@ -826,16 +828,20 @@ distillation.teacher_models.teacher_model.key=openai/gsm8k
 
 ### 9.3 代码质量发现
 
-| 严重度 | 发现 | 位置 |
-|--------|------|------|
-| HIGH | `_resolve_teacher_models` 使用 `assert` 做用户输入校验（优化模式下被跳过） | `distillation.py:278` |
-| HIGH | `_postprocess` 仅检查 `inputs[0]` 的 `teacher_logprobs`，混合批次可能静默丢数据或崩溃 | `agent_loop.py:932-938` |
-| MEDIUM | `DistillationLossConfig.__post_init__` 用 `print()` 而非 `logger.warning()` | `distillation.py:101-106` |
-| MEDIUM | `_get_teacher_sampling_params` 错误信息硬编码 "vLLM" 但函数与引擎无关 | `teacher_manager.py:37` |
-| MEDIUM | `_run_all` 使用 `asyncio.gather` 只传播第一个异常 | `teacher_model.py:33` |
-| MEDIUM | routing_key 的 `.item()` 可能返回 `numpy.str_` 而非 `str` | `agent_loop.py:907-908` |
-| LOW | `num_replicas: Optional[int] = 0` 类型注解与默认值语义不一致 | `distillation.py:138` |
-| LOW | 访问 RolloutReplica 的私有属性 `_server_handle` / `_server_address` | `teacher_model.py:99-100` |
+| 严重度 | 发现 | 位置 | 状态 |
+|--------|------|------|------|
+| HIGH | `_resolve_teacher_models` 使用 `assert` 做用户输入校验（优化模式下被跳过） | `distillation.py:278` | 未修复 |
+| HIGH | `_postprocess` 仅检查 `inputs[0]` 的 `teacher_logprobs`，混合批次可能静默丢数据或崩溃 | `agent_loop.py:932-938` | 未修复 |
+| MEDIUM | `DistillationLossConfig.__post_init__` 用 `print()` 而非 `logger.warning()` | `distillation.py:101-106` | 未修复 |
+| MEDIUM | `_get_teacher_sampling_params` 错误信息硬编码 "vLLM" 但函数与引擎无关 | `teacher_manager.py:37` | 未修复 |
+| MEDIUM | `_run_all` 使用 `asyncio.gather` 只传播第一个异常 | `teacher_model.py:33` | 未修复 |
+| MEDIUM | routing_key 的 `.item()` 可能返回 `numpy.str_` 而非 `str` | `agent_loop.py:907-908` | 未修复 |
+| MEDIUM | Fused path 硬编码提取 3 个字段，eager path 动态遍历——扩展性不对等 | `fsdp/transformer_impl.py:1106` | **#6511 新增** |
+| MEDIUM | Overlap 指标在 FSDP/Megatron 路径重复实现 (DRY violation) | `fsdp/losses.py:79-93` vs `megatron/losses.py:202-213` | **#6469 新增** |
+| LOW | `num_replicas: Optional[int] = 0` 类型注解与默认值语义不一致 | `distillation.py:138` | 未修复 |
+| LOW | 访问 RolloutReplica 的私有属性 `_server_handle` / `_server_address` | `teacher_model.py:99-100` | 未修复 |
+| LOW | Fused kernel path 静默丢弃 overlap 指标无日志提示 | `fsdp/transformer_impl.py:1106` | **#6511 新增** |
+| LOW | 无学生-教师 tokenizer 一致性校验 | 全局 | 长期存在 |
 
 ---
 
@@ -849,3 +855,477 @@ PR #6051 通过以下核心设计实现了 Multi-Teacher OPD：
 4. **隔离层**：通过 `name_suffix` 机制确保多教师 Ray actor 名称唯一，通过 `_validate_replica_node_alignment` 确保 GPU 拓扑正确
 
 该设计对其主要用例（已知固定教师集合、均衡负载分布）架构合理、扩展性良好，但在运行时容错、动态资源调度和配置安全性方面存在改进空间。
+
+---
+
+## 11. PR #6051 合并后的后续演进
+
+> PR #6051 于 2026-04-20 合并。以下记录截至 2026-06-07 的全部后续 OPD/蒸馏相关变更。
+
+### 11.1 变更时间线
+
+| PR/Issue | 日期 | 性质 | 标题 | 影响文件 |
+|----------|------|------|------|----------|
+| #6303 | 05-11 | 🐛 Bugfix (closed) | fix: add distillation top-k for `use_remove_padding=False` | 被 #6350 取代 |
+| #6350 | 05-14 | 🐛 Bugfix | fix: emit distillation outputs in `use_remove_padding=False` path | `fsdp/transformer_impl.py`, 新测试 |
+| #6360 | 05-15 | ⏪ Revert | Revert #6350 | CI 回归 (Triton CPU tensor 错误) |
+| #6386 | 05-18 | 🐛 Bugfix (最终) | fix: emit distillation outputs (re-apply + test fix) | `fsdp/transformer_impl.py:1218-1230` |
+| #6469 | 05-26 | ✨ Feature | feat: add top-k distillation overlap metrics | `fsdp/losses.py`, `losses.py`, `megatron/losses.py`, 测试 |
+| #6492 | 05-28 | 🐛 Issue (closed) | OPD losses error for Megatron | BSHD 形状错误报告 |
+| #6506 | 05-28 | 🐛 Bugfix | fix: preserve BSHD top-k distillation shape | `models/mcore/util.py`, 测试 |
+| #6511 | 05-29 | ✨ Feature | feat: enable fused top-K distillation kernel for OPD | `veomni/transformer_impl.py`, `fsdp/transformer_impl.py`, 2 个新脚本 |
+| #6552 | 06-01 | 📋 RFC (OPEN) | TCOD: Temporal Curriculum for Multi-turn Agent OPD | 无代码变更 |
+| #6638 | 06-06 | 📝 Recipe | feat: add Qwen3.5-4B on-policy distillation FSDP script | 新 `run_qwen3_5_4b_fsdp.sh` |
+
+### 11.2 Top-K 重叠度诊断指标 (#6469)
+
+基于论文 [Rethinking On-Policy Distillation of Large Language Models](https://arxiv.org/abs/2604.13016)，新增两个 token 级诊断指标：
+
+**FSDP 路径** (`verl/trainer/distillation/fsdp/losses.py:67-94`)：
+
+```python
+student_topk_ids = torch.topk(student_log_probs, k=teacher_topk_ids.shape[-1], dim=-1).indices
+overlap_mask = (teacher_topk_ids.unsqueeze(-1) == student_topk_ids.unsqueeze(-2)).any(dim=-1)
+overlap_count = overlap_mask.sum(dim=-1)
+token_kl = teacher_topk_log_probs.exp() * (teacher_topk_log_probs - student_topk_log_probs)
+overlap_token_advantage_sum = (-token_kl * overlap_mask).sum(dim=-1)
+overlap_token_advantage = overlap_token_advantage_sum / overlap_count.clamp_min(1)
+```
+
+返回值从 3 个字段扩展为 5 个：`distillation_losses`, `student_mass`, `teacher_mass`, **`overlap_count`**, **`overlap_token_advantage`**。
+
+**Megatron 路径** (`verl/trainer/distillation/megatron/losses.py:176-216`)：
+- 在 `_VocabParallelKLDivergence.forward` 中实现 TP 分片的 student global top-k 计算（all_gather + global topk）
+- `overlap_count` 和 `overlap_token_advantage` 通过 `ctx.mark_non_differentiable` 标记为不参与反向传播
+- backward 方法对应扩展为接受（但忽略）两个额外梯度参数
+
+**指标聚合** (`verl/trainer/distillation/losses.py:322-338`)：
+
+| 指标名 | 计算公式 | 含义 |
+|--------|---------|------|
+| `distillation/overlap_ratio` | `mean(overlap_count) / topk` | 教师 top-k 中有多少比例出现在学生 top-k 中 |
+| `distillation/overlap_token_advantage` | `mean(token_advantage[overlap > 0])` | 重叠 token 上的平均 KL 贡献 |
+
+⚠️ **注意**：`overlap_count` 和 `overlap_token_advantage` 仅在 eager path 下可用。使用 `use_fused_kernels=True`（VeOmni fused kernel 路径）时，这两个指标**不会被计算和记录**，但不会报错——`losses.py:311-312` 使用 `model_output.get()` 安全降级。
+
+### 11.3 Megatron BSHD 形状修复 (#6506)
+
+**问题**：`preprocess_bshd_engine` (`verl/models/mcore/util.py:564`) 假设输入为 `[batch, seq]`，但 OPD top-k 蒸馏的 `teacher_topk_log_probs` 形状为 `[batch, seq, topk]`，导致 padding 后丢失 topk 维度。
+
+**修复** (`util.py:578-607`)：
+
+```python
+dense_shape = tuple(input_ids.shape[2:])  # 捕获 [topk] 等尾部维度
+input_ids_bshd = torch.zeros(
+    (batch_size, local_max_seqlen, *dense_shape), ...  # 保留尾部维度
+)
+# position_ids 保持 2D [batch, seq]，不继承 topk 维度
+position_ids = position_ids.unsqueeze(0).expand_as(attention_mask)  # 而非 expand_as(input_ids_bshd)
+```
+
+### 11.4 VeOmni Fused Top-K 蒸馏 (#6511)
+
+**架构**：将 VeOmni 的 `chunk_topk_distill_function` 接入 verl actor pipeline，避免物化完整 `[B, L, V]` logits tensor。
+
+**VeOmni Engine 输入注入** (`veomni/transformer_impl.py:865-884`)：
+
+```python
+if distillation_use_topk and "teacher_ids" in micro_batch.keys():
+    teacher_topk_ids = micro_batch["teacher_ids"].values().unsqueeze(0)
+    teacher_topk_log_probs = micro_batch["teacher_logprobs"].values().unsqueeze(0)
+    if self.use_ulysses_sp:
+        teacher_topk_ids = slice_input_tensor(teacher_topk_ids, dim=1, padding=True)
+        teacher_topk_log_probs = slice_input_tensor(teacher_topk_log_probs, dim=1, padding=True)
+    model_inputs["teacher_topk_ids"] = teacher_topk_ids
+    model_inputs["teacher_topk_log_probs"] = teacher_topk_log_probs
+```
+
+**FSDP Engine 输出提取** (`fsdp/transformer_impl.py:1098-1111`)：
+
+```python
+if distillation_use_topk:
+    aux_outputs = getattr(output, "fused_linear_aux", None)
+    if aux_outputs is not None and aux_outputs.distillation_losses is not None:
+        for field_name in ("distillation_losses", "student_mass", "teacher_mass"):
+            v = getattr(aux_outputs, field_name).squeeze(0)
+            model_output[field_name] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
+```
+
+⚠️ **注意**：fused path 硬编码提取 3 个字段（不含 `overlap_count`/`overlap_token_advantage`），而 eager path 使用 `outputs.items()` 动态提取。如果未来 fused kernel 也输出 overlap 指标，需修改 `transformer_impl.py:1106` 的硬编码列表。
+
+### 11.5 `use_remove_padding=False` 路径修复 (#6386)
+
+**问题**：`use_remove_padding=False` 分支（`fsdp/transformer_impl.py` 的 `else` 块）在准备 model_output 时未填充蒸馏相关键。
+
+**修复** (`fsdp/transformer_impl.py:1218-1230`)：
+
+```python
+if distillation_use_topk:
+    outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
+    for k, v in outputs.items():
+        v = v.squeeze(0)
+        assert v.shape == log_probs.shape, (...)
+        model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
+```
+
+此路径不包含 Ulysses SP gather（因为 SP 要求 `use_remove_padding=True`，在 `transformer_impl.py:127-131` 中强制检查）。
+
+### 11.6 新增示例脚本
+
+| 脚本 | PR | 学生模型 | 教师模型 | 引擎 | 特点 |
+|------|-----|---------|---------|------|------|
+| `run_qwen3_0.6b_opd_veomni.sh` | #6511 | Qwen3-0.6B | Qwen3-1.7B | VeOmni | `use_fused_kernels=True` |
+| `run_qwen3_8b_mopd_veomni.sh` | #6511 | Qwen3-VL-8B | Qwen3-32B + Qwen3-VL-32B | VeOmni | Multi-teacher + fused kernel |
+| `run_qwen3_5_4b_fsdp.sh` | #6638 | Qwen3.5-4B | Qwen3.5-35B-A3B (MoE) | FSDP2 | 视觉 OPD, EP=8, CPU offload |
+
+### 11.7 新增测试
+
+| 测试文件 | PR | 内容 |
+|----------|-----|------|
+| `tests/workers/test_distillation_topk_symmetry_on_cpu.py` | #6386/#6469 | 验证 `use_remove_padding=True/False` 两路径均产生蒸馏输出；验证 overlap metrics 计算正确性 |
+| `tests/utils/test_megatron_bshd_preprocess.py` | #6506 | 验证 `preprocess_bshd_engine` 保留 `[B,L,topk]` 尾部维度 |
+| `tests/utils/test_special_megatron_kl_loss_tp.py` | #6469/#6506 | 扩展：TP 环境下 overlap 指标一致性 + BSHD 路径数值验证 |
+
+### 11.8 未合并的 RFC
+
+**Issue #6552 — TCOD: Temporal Curriculum for Multi-turn Agent On-Policy Distillation**
+
+- 作者：@kokolerk (TCOD 论文作者, arXiv:2604.24005)
+- 状态：**OPEN**，0 条评论，尚无 maintainer 回应
+- 建立在 #6051 (multi-teacher) 之上
+- 提出两种变体：TCOD-F2B（无需 demo）和 TCOD-B2F（利用教师 trajectory 前缀）
+- 通过 `TCODAgentLoop`（基于 `AgentLoopBase.run()` hook）和 `curriculum` config 块实现
+- 不修改 OPD core，属于上层扩展
+
+### 11.9 架构评估更新
+
+**#6051 核心架构保持稳定**：配置层 (`DistillationConfig`)、管理器层 (`MultiTeacherModelManager` / `TeacherModelManager`)、路由层 (`AsyncTeacherLLMServerManager`) 和 agent loop 中的蒸馏路径**均未被后续 PR 修改**。所有变更都发生在 engine 集成层和 loss 计算层，符合 verl "后端集成局部化" 的设计哲学。
+
+**新增技术债务**：
+
+| 严重度 | 发现 | 位置 |
+|--------|------|------|
+| MEDIUM | Fused path 硬编码 3 个字段名，而 eager path 动态遍历 `outputs.items()`——扩展性不对等 | `fsdp/transformer_impl.py:1106` |
+| MEDIUM | Overlap 指标计算在 FSDP 和 Megatron 路径中重复实现（DRY violation） | `fsdp/losses.py:79-93` vs `megatron/losses.py:202-213` |
+| LOW | Fused kernel path 静默丢弃 `overlap_count`/`overlap_token_advantage`，无日志提示 | `fsdp/transformer_impl.py:1106` |
+
+---
+
+## 12. 自定义数据集与模型实战指南
+
+### 12.1 数据集格式要求
+
+MOPD 训练数据使用 **Parquet 格式**。以下是完整的列定义：
+
+#### 必需列
+
+| 列名 | 类型 | 说明 | 示例 |
+|------|------|------|------|
+| `prompt` | `list[dict]` | Chat 消息列表，每条包含 `role` 和 `content` | `[{"role": "user", "content": "..."}]` |
+| `data_source` | `str` | **MOPD 路由键**——值必须与教师配置中的 `key` 精确匹配 | `"openai/gsm8k"` |
+| `reward_model` | `dict` | 奖励函数参数 | `{"style": "rule", "ground_truth": "42"}` |
+
+#### 推荐列
+
+| 列名 | 类型 | 说明 | 示例 |
+|------|------|------|------|
+| `extra_info` | `dict` | 包含 `index`（用于去重追踪）等元数据 | `{"split": "train", "index": 0}` |
+| `ability` | `str` | 任务类别标注（仅信息用途） | `"math"` |
+
+#### 多模态列（视觉/音频任务时必需）
+
+| 列名 | 类型 | 配置参数 | 说明 |
+|------|------|---------|------|
+| `images` | `list[PIL.Image]` | `data.image_key=images` | 图像列表 |
+| `videos` | `list` | `data.video_key=videos` | 视频数据 |
+| `audios` | `list` | `data.audio_key=audios` | 音频数据 |
+
+### 12.2 数据准备参考
+
+以下是从 verl 官方示例中提取的数据准备模板：
+
+#### 纯文本数据集 (参考 `examples/data_preprocess/gsm8k.py`)
+
+```python
+import pandas as pd
+
+records = []
+for idx, sample in enumerate(raw_dataset):
+    records.append({
+        "data_source": "my_org/my_text_dataset",   # ← 必须与教师 key 精确匹配
+        "prompt": [{"role": "user", "content": sample["question"]}],
+        "ability": "math",
+        "reward_model": {
+            "style": "rule",
+            "ground_truth": sample["answer"],
+        },
+        "extra_info": {
+            "split": "train",
+            "index": idx,
+        },
+    })
+
+df = pd.DataFrame(records)
+df.to_parquet("train.parquet")
+```
+
+#### 视觉多模态数据集 (参考 `examples/data_preprocess/geo3k.py`)
+
+```python
+records = []
+for idx, sample in enumerate(raw_dataset):
+    records.append({
+        "data_source": "my_org/my_vision_dataset",  # ← 视觉教师的 key
+        "prompt": [{"role": "user", "content": build_prompt_with_image(sample)}],
+        "images": [sample["image"]],                 # PIL Image 列表
+        "ability": "math",
+        "reward_model": {
+            "style": "rule",
+            "ground_truth": sample["answer"],
+        },
+        "extra_info": {
+            "split": "train",
+            "index": idx,
+        },
+    })
+```
+
+#### 多数据源合并
+
+多个 Parquet 文件直接通过 `data.train_files` 传入，verl 在内部使用 `datasets.concatenate_datasets()` 合并（`rl_dataset.py:179`）：
+
+```bash
+data.train_files="['path/to/gsm8k_train.parquet','path/to/geo3k_train.parquet']"
+```
+
+**关键要求**：所有文件共享相同的 schema（列名和类型）。当文本数据集不含 `images` 列时，缺失列返回 `None`，在 `rl_dataset.py:315` 中被安全处理为空列表。
+
+### 12.3 data_source 路由全链路追踪
+
+```
+Parquet 文件
+  │ row["data_source"] = "openai/gsm8k"         (Python str)
+  ▼
+RLHFDataset.__getitem__()                         [rl_dataset.py:373]
+  │ row_dict["data_source"] → 保留原始字符串
+  ▼
+collate_fn → DataProto.non_tensor_batch            [rl_dataset.py:40-68]
+  │ non_tensor_batch["data_source"] = np.array(["openai/gsm8k", ...], dtype=object)
+  ▼
+AgentLoopWorker.generate_sequences()               [agent_loop.py:552]
+  │ kwargs["data_source"] = np_array[i]  (0-d numpy object scalar)
+  ▼
+_compute_teacher_logprobs()                        [agent_loop.py:914-919]
+  │ routing_value = sample_kwargs.get(self.teacher_key)
+  │ routing_key = routing_value.item()   (Python str)
+  ▼
+AsyncTeacherLLMServerManager._resolve_teacher_key() [teacher_manager.py:86-100]
+  │ 单教师: 忽略 routing_key，返回唯一教师
+  │ 多教师: 在 self.teacher_model_configs 中查找 routing_key
+  ▼
+选中对应教师 → 调用 server_manager.generate()
+```
+
+### 12.4 模型兼容性要求
+
+#### 12.4.1 Tokenizer 必须兼容
+
+**这是最重要的约束**：学生和所有教师模型**必须共享相同的 tokenizer 词表**。
+
+原因：教师接收的 token ID 序列直接来自学生的 tokenizer (`sequence_ids = prompt_ids + response_ids`)。代码中**没有 tokenizer 一致性校验**——如果词表不匹配，教师会静默产生错误的 log probabilities，不会报任何错误。
+
+**安全组合示例**：
+- ✅ Qwen3-VL-2B + Qwen3-4B + Qwen3-VL-4B (同一 Qwen 词表族)
+- ✅ Qwen3.5-4B + Qwen3.5-35B-A3B (同一 Qwen3.5 词表)
+- ❌ Qwen3-2B + Llama-3-8B (不同词表，静默错误)
+
+#### 12.4.2 支持的教师推理引擎
+
+| 引擎 | 支持状态 | 验证位置 |
+|------|---------|---------|
+| `vllm` | ✅ 完全支持 | `distillation.py:187-196` |
+| `sglang` | ✅ 完全支持 | `distillation.py:198-202` |
+| `trtllm` | ❌ 不支持 | `distillation.py:204` 抛出 `NotImplementedError` |
+
+#### 12.4.3 教师温度约束
+
+教师模型的温度**必须为 1.0**。`_get_teacher_sampling_params` (`teacher_manager.py:35-36`) 在 `temperature != 1.0` 时抛出：
+
+```
+NotImplementedError: vLLM does not support temperature for prompt_logprobs.
+```
+
+#### 12.4.4 上下文长度约束
+
+教师的 `max_model_len` 必须满足：
+
+```
+max_model_len >= student_prompt_length + student_response_length + 1
+```
+
+在 `validate_and_prepare_for_distillation()` (`distillation.py:160-174`) 中检查。违反时报错：
+
+```
+ValueError: Distillation teacher inference requires room for the student prompt,
+the full student response, and one generated token...
+```
+
+### 12.5 GPU 资源计算
+
+#### 12.5.1 公式
+
+```
+学生 GPU = trainer.n_gpus_per_node × trainer.nnodes
+教师 GPU = distillation.n_gpus_per_node × distillation.nnodes
+总 GPU   = 学生 GPU + 教师 GPU
+
+约束: Σ (num_replicas_i × TP_i × DP_i × PP_i) = 教师 GPU
+```
+
+#### 12.5.2 计算示例
+
+**场景 A：单教师，8 GPU 节点**
+
+```
+学生: 6 GPU (TP=2, 3 个角色共享)
+教师: 2 GPU (TP=1, 自动计算 num_replicas=2)
+总计: 8 GPU
+```
+
+**场景 B：双教师，8 GPU 节点**
+
+```
+学生: 4 GPU (TP=2)
+教师 1 (gsm8k): 2 GPU (TP=1, num_replicas=2)
+教师 2 (geo3k): 2 GPU (TP=1, num_replicas=2)
+总计: 8 GPU
+
+校验: 2×1 + 2×1 = 4 = n_gpus_per_node(4) × nnodes(1) ✓
+```
+
+**场景 C：MoE 教师，16 GPU**
+
+```
+学生: 8 GPU (TP=2)
+教师 (MoE): 8 GPU (TP=8, EP=8, num_replicas=1)
+总计: 16 GPU
+```
+
+### 12.6 完整配置模板
+
+#### 12.6.1 单教师 + 自定义数据集
+
+```bash
+python3 -m verl.trainer.main_ppo \
+    --config-name='ppo_trainer.yaml' \
+    # === 数据 ===
+    data.train_files="['path/to/my_train.parquet']" \
+    data.val_files="['path/to/my_val.parquet']" \
+    data.train_batch_size=128 \
+    data.max_prompt_length=1024 \
+    data.max_response_length=2048 \
+    # === 学生模型 ===
+    actor_rollout_ref.model.path="Qwen/Qwen3-2B" \
+    actor_rollout_ref.actor.strategy=fsdp2 \
+    actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
+    # === 蒸馏 ===
+    distillation.enabled=True \
+    distillation.n_gpus_per_node=2 \
+    distillation.nnodes=1 \
+    distillation.teacher_models.teacher_model.model_path="Qwen/Qwen3-8B" \
+    distillation.teacher_models.teacher_model.inference.name=vllm \
+    distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size=1 \
+    distillation.teacher_models.teacher_model.inference.gpu_memory_utilization=0.5 \
+    distillation.teacher_models.teacher_model.inference.max_model_len=3073 \
+    # === 蒸馏损失 ===
+    distillation.distillation_loss.loss_mode=k1 \
+    distillation.distillation_loss.topk=64 \
+    distillation.distillation_loss.use_policy_gradient=True \
+    distillation.distillation_loss.loss_max_clamp=10.0 \
+    distillation.distillation_loss.log_prob_min_clamp=-10.0
+```
+
+#### 12.6.2 多教师 + 多数据源
+
+```bash
+python3 -m verl.trainer.main_ppo \
+    --config-name='ppo_trainer.yaml' \
+    # === 多源数据 ===
+    data.train_files="['path/to/gsm8k_train.parquet','path/to/geo3k_train.parquet']" \
+    data.max_prompt_length=1024 \
+    data.max_response_length=2048 \
+    data.image_key=images \
+    # === 学生模型 ===
+    actor_rollout_ref.model.path="Qwen/Qwen3-VL-2B-Instruct" \
+    # === 蒸馏全局设置 ===
+    distillation.enabled=True \
+    distillation.teacher_key=data_source \
+    distillation.n_gpus_per_node=4 \
+    distillation.nnodes=1 \
+    # === 教师 1: 纯文本数学 ===
+    +distillation.teacher_models.gsm8k._target_=verl.workers.config.DistillationTeacherModelConfig \
+    +distillation.teacher_models.gsm8k.key="openai/gsm8k" \
+    +distillation.teacher_models.gsm8k.model_path="Qwen/Qwen3-4B-Instruct-2507" \
+    +distillation.teacher_models.gsm8k.num_replicas=2 \
+    +distillation.teacher_models.gsm8k.inference._target_=verl.workers.config.RolloutConfig \
+    +distillation.teacher_models.gsm8k.inference.name=vllm \
+    +distillation.teacher_models.gsm8k.inference.tensor_model_parallel_size=1 \
+    +distillation.teacher_models.gsm8k.inference.gpu_memory_utilization=0.8 \
+    # === 教师 2: 视觉数学 ===
+    +distillation.teacher_models.geo3k._target_=verl.workers.config.DistillationTeacherModelConfig \
+    +distillation.teacher_models.geo3k.key="hiyouga/geometry3k" \
+    +distillation.teacher_models.geo3k.model_path="Qwen/Qwen3-VL-4B-Instruct" \
+    +distillation.teacher_models.geo3k.num_replicas=2 \
+    +distillation.teacher_models.geo3k.inference._target_=verl.workers.config.RolloutConfig \
+    +distillation.teacher_models.geo3k.inference.name=vllm \
+    +distillation.teacher_models.geo3k.inference.tensor_model_parallel_size=1 \
+    +distillation.teacher_models.geo3k.inference.gpu_memory_utilization=0.8 \
+    # === 蒸馏损失 ===
+    distillation.distillation_loss.loss_mode=k1 \
+    distillation.distillation_loss.topk=64 \
+    distillation.distillation_loss.use_policy_gradient=True
+```
+
+### 12.7 常见错误与排查
+
+#### 12.7.1 配置阶段错误
+
+| 错误信息 | 原因 | 解决方案 |
+|----------|------|---------|
+| `Sum of teacher (num_replicas * per_replica_world_size) (X) must match the distillation resource pool size (Y)` | GPU 分配不均 | 调整 `num_replicas` 或 `n_gpus_per_node` |
+| `Single teacher's per_replica_world_size (X) must divide the distillation resource pool size (Y)` | 单教师 TP 不整除池大小 | 调整 `tensor_model_parallel_size` 或 `n_gpus_per_node` |
+| `Duplicate teacher key "xxx"` | 多教师 key 重复 | 确保每个教师的 `key` 唯一 |
+| `VLLM max_logprobs (X) must be >= distillation_loss topk (Y)` | topk 超过 vLLM 限制 | 增大 `engine_kwargs.vllm.max_logprobs` 或减小 `topk` |
+| `DistillationTeacherModelConfig does not support inference engine "trtllm"` | TRT-LLM 不支持教师角色 | 改用 `vllm` 或 `sglang` |
+| `Distillation teacher inference requires room for...` | 教师 `max_model_len` 太小 | 设置 `max_model_len >= prompt_length + response_length + 1` |
+
+#### 12.7.2 运行时错误
+
+| 错误信息 | 原因 | 解决方案 |
+|----------|------|---------|
+| `Routing key is required for multi-teacher distillation` | 样本缺少 `data_source` 字段 | 确保 Parquet 中所有行都有 `data_source` 列 |
+| `No teacher configured for routing key "xxx"` | `data_source` 值与教师 `key` 不匹配 | 检查大小写和斜杠，确保精确匹配 |
+| `teacher_ids present without teacher_logprobs` | Fused path 数据不完整 | 内部错误，检查教师推理是否正常 |
+| 教师 replica 跨节点边界错误 | GPU 拓扑不对齐 | 重新排列教师顺序或调整 `num_replicas` |
+
+#### 12.7.3 静默失败（最危险）
+
+| 场景 | 后果 | 预防措施 |
+|------|------|---------|
+| 学生与教师使用不同 tokenizer | 教师 logprobs 语义错误，训练方向完全错误 | 人工确认模型使用同一 tokenizer 族 |
+| 多教师配置中命名一个教师为 `teacher_model` | 该教师被 `_resolve_teacher_models()` 中的 `pop()` 静默删除 | 所有教师使用自定义名称 |
+| 单教师配置中 `data_source` 值与 `key` 不匹配 | 单教师快捷路径忽略 routing_key，不报错 | 仅在多教师时暴露路由问题 |
+| `use_fused_kernels=True` 下查看 overlap 指标 | 指标不存在但不报错，日志中静默缺失 | 使用 eager path 进行诊断 |
+
+### 12.8 Checklist: 上线前验证清单
+
+- [ ] **Tokenizer 一致性**：确认学生与所有教师模型使用相同 tokenizer (`tokenizer.vocab_size` 一致)
+- [ ] **data_source 匹配**：Parquet 中 `data_source` 列的值与教师配置中 `key` 字段精确匹配（大小写、斜杠敏感）
+- [ ] **GPU 算术**：`Σ(num_replicas × TP × DP × PP) == n_gpus_per_node × nnodes`
+- [ ] **上下文长度**：教师 `max_model_len >= max_prompt_length + max_response_length + 1`
+- [ ] **教师命名**：多教师配置中不使用 `teacher_model` 作为教师名称
+- [ ] **推理引擎**：教师使用 `vllm` 或 `sglang`（不支持 `trtllm`）
+- [ ] **温度设置**：教师温度默认 1.0（不可更改）
+- [ ] **多模态一致性**：如有视觉教师，配置 `data.image_key` 且 Parquet 包含对应图像列
+- [ ] **Hydra `+` 前缀**：多教师新增条目使用 `+distillation.teacher_models.<name>.*` 语法
