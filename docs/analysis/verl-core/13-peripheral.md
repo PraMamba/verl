@@ -1,8 +1,10 @@
 # 13 - 外围子模块架构文档（plugin / model_merger / tools / third_party）
 
-> **源码位置**: `verl/plugin/`(6 文件, 841 行) + `verl/model_merger/`(5 文件, 1,359 行) + `verl/tools/`(5 文件, 593 行) + `verl/third_party/`(7 文件, 2,671 行)
+> **源码位置**: `verl/plugin/`(7 文件, 922 行) + `verl/model_merger/`(6 文件, 1,460 行) + `verl/tools/`(5 文件, 593 行) + `verl/third_party/`(7 文件, 2,667 行)
 >
-> **总计**: 23 文件, 5,464 行
+> **总计**: 25 文件, 5,642 行
+>
+> **最后更新**: 2026-08-02 | **基准源码**: 上游 `e3573545`
 
 ---
 
@@ -25,10 +27,11 @@
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| `platform_base.py` | 268 | `PlatformBase`（L20）：抽象基类，定义 25+ 个抽象方法 |
-| `platform_cuda.py` | 182 | `PlatformCUDA`：NVIDIA GPU 实现 |
+| `platform_base.py` | 268 | `PlatformBase`（L20）：抽象基类，定义完整的平台操作接口 |
+| `platform_cuda.py` | 186 | `PlatformCUDA`：NVIDIA GPU 实现 |
 | `platform_npu.py` | 198 | `PlatformNPU`：华为 Ascend NPU 实现 |
-| `platform_manager.py` | 173 | `PlatformRegistry`（L29）：注册表 + 自动检测逻辑；`get_platform()` 单例入口 |
+| `platform_rocm.py` | 76 | `PlatformROCm`（L21）：AMD ROCm/HIP GPU 实现，注册键 `amd`，继承 `PlatformCUDA` |
+| `platform_manager.py` | 174 | `PlatformRegistry`（L29）：注册表 + 自动检测逻辑；`get_platform()` 单例入口 |
 | `__init__.py` | 19 | 导出 `get_platform` |
 | `../plugin/__init__.py` | 1 | 空 |
 
@@ -92,23 +95,26 @@ Rollout 引擎:
 `PlatformRegistry`（platform_manager.py, L29）使用装饰器注册模式：
 
 ```python
-@PlatformRegistry.register(platform="cuda")
+@PlatformRegistry.register(platform="nvidia")
 class PlatformCUDA(PlatformBase): ...
 
-@PlatformRegistry.register(platform="npu")
+@PlatformRegistry.register(platform="huawei")
 class PlatformNPU(PlatformBase): ...
+
+@PlatformRegistry.register(platform="amd")
+class PlatformROCm(PlatformCUDA): ...
 ```
 
 `get_platform()` 的检测优先级：
 1. 环境变量 `VERL_PLATFORM` 显式指定
 2. 遍历已注册平台，调用 `is_platform_available()` 自动检测
-3. 回退到 CPU 平台
+3. 检测失败时回退到已注册键 `nvidia`（`platform_manager.py:83-117`）；这不是 CPU 平台回退，CPU-only Ray actor 仍由平台实例的 `is_available()` 结果单独处理。
 
 检测结果缓存在模块级全局变量 `_current_platform` 中，整个进程生命周期只解析一次。
 
 ### 2.4 与 device.py 的关系
 
-`verl/utils/device.py` 是面向调用者的兼容层（80+ 导入站点），所有函数内部委托给 `get_platform()`：
+`verl/utils/device.py` 是面向调用者的兼容层（多个导入站点），所有函数内部委托给 `get_platform()`：
 
 ```
 调用者代码                     device.py                PlatformBase
@@ -128,16 +134,17 @@ manual_seed(seed)         -->  get_platform().manual_seed(seed)
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| `base_model_merger.py` | 462 | `ModelMergerConfig`（L82）：合并配置 dataclass；`BaseModelMerger`（L175）：抽象基类 |
+| `base_model_merger.py` | 466 | `ModelMergerConfig`（L84）：合并配置 dataclass；`BaseModelMerger`（L177）：抽象基类 |
 | `fsdp_model_merger.py` | 265 | `FSDPModelMerger`：FSDP 分片检查点合并实现 |
-| `megatron_model_merger.py` | 546 | `MegatronModelMerger`：Megatron dist_ckpt 格式合并实现 |
+| `megatron_model_merger.py` | 549 | `MegatronModelMerger`：Megatron dist_ckpt 格式合并实现 |
+| `output_validation.py` | 94 | `validate_hf_model_output`（L34）：结构与文件完整性门禁（config.json 为 JSON object、权重文件/分片索引存在且非空、路径安全）；不验证模型可加载性、tensor key 完整性或 tokenizer |
 | `__main__.py` | 73 | CLI 入口：`python -m verl.model_merger merge --backend fsdp ...` |
 | `__init__.py` | 13 | 导出 |
 
 ### 3.2 BaseModelMerger 架构
 
 ```
-BaseModelMerger (base_model_merger.py, L175)
+BaseModelMerger (base_model_merger.py, L177)
   │  抽象方法：merge_and_save(), cleanup()
   │
   │  通用功能：
@@ -191,7 +198,7 @@ python -m verl.model_merger test \
 
 ### 3.4 LoRA 适配器处理
 
-`save_lora_adapter()`（base_model_merger.py, L291）的处理流程：
+`save_lora_adapter()`（base_model_merger.py, L293）的处理流程：
 1. 从 state_dict 中过滤 `lora_` 前缀的参数
 2. 从 `lora_train_meta.json` 读取训练元数据（rank, alpha, task_type）
 3. 如无元数据，从权重形状推断 rank
@@ -208,8 +215,8 @@ python -m verl.model_merger test \
 |------|------|------|
 | `base_tool.py` | 93 | `BaseTool`（L24）：有状态工具抽象基类（create/execute/release 生命周期） |
 | `function_tool.py` | 258 | `FunctionTool`（L45）：无状态函数工具；`@function_tool` 装饰器 |
-| `schemas.py` | 127 | OpenAI 函数调用 schema 定义：`OpenAIFunctionToolSchema`、`ToolResponse`（L98） |
-| `tool_registry.py` | 101 | `load_all_tools()`：从配置文件和 Python 模块加载工具 |
+| `schemas.py` | 127 | OpenAI 函数调用 schema 定义：`OpenAIFunctionToolSchema`、`OpenAIFunctionParsedSchema`（L59）、`OpenAIFunctionCallSchema`（L66）、`OpenAIFunctionToolCall`（L90）、`ToolResponse`（L98） |
+| `tool_registry.py` | 101 | `ToolType`（L36）与 `load_all_tools()`：从配置文件和 Python 模块加载工具 |
 | `__init__.py` | 14 | 导出 |
 
 ### 4.2 双轨工具模型
@@ -257,6 +264,19 @@ OpenAIFunctionToolSchema (schemas.py)
         │     └── required: list[str]
         └── strict: bool
 
+OpenAIFunctionParsedSchema (schemas.py:59)
+  ├── name: str
+  └── arguments: str  # JSON 字符串
+
+OpenAIFunctionCallSchema (schemas.py:66)
+  ├── name: str
+  └── arguments: dict[str, Any]
+
+OpenAIFunctionToolCall (schemas.py:90)
+  ├── id: str
+  ├── type: Literal["function"]
+  └── function: OpenAIFunctionCallSchema
+
 ToolResponse (schemas.py, L98)
   ├── text: str | None
   ├── image: list[Any] | None    # 多模态图像
@@ -264,6 +284,8 @@ ToolResponse (schemas.py, L98)
 ```
 
 `ToolResponse` 使用 Pydantic `@model_validator` 确保 image/video 字段必须是列表格式。
+
+`ToolType`（`tool_registry.py:36`）当前仅包含 `NATIVE` 类型，用于配置文件加载时选择原生 `BaseTool` 路径。
 
 ### 4.4 工具加载
 
@@ -281,11 +303,11 @@ ToolResponse (schemas.py, L98)
 |------|------|------|
 | `torch/distributed/_state_dict_utils.py` | 840 | PyTorch FSDP state_dict 工具函数补丁 |
 | `torch/distributed/checkpoint/state_dict.py` | 1,493 | PyTorch 2.7.0 的 `set_model_state_dict` 回移 |
-| `torch/distributed/checkpoint/__init__.py` | 19 | 导出 |
-| `torch/distributed/__init__.py` | 1 | 空 |
-| `torch/__init__.py` | 1 | 空 |
-| `vllm/__init__.py` | 1 | 空（预留 vLLM 补丁位置） |
-| `__init__.py` | 1 | 空 |
+| `torch/distributed/checkpoint/__init__.py` | 87 | 仅版权头注释 |
+| `torch/distributed/__init__.py` | 87 | 仅版权头注释 |
+| `torch/__init__.py` | 87 | 仅版权头注释 |
+| `vllm/__init__.py` | 60 | vLLM 版本探测：`get_version` + `VLLM_SLEEP_LEVEL`，按 vllm/sglang 条件导入 `LLM`/`parallel_state` |
+| `__init__.py` | 13 | 仅版权头注释 |
 
 ### 5.2 补丁动机
 
@@ -294,7 +316,7 @@ ToolResponse (schemas.py, L98)
 **解决方案**：从 PyTorch 2.7.0 回移（backport）修复后的 `set_model_state_dict` 实现：
 
 ```python
-# fsdp_utils.py, L484-489
+# fsdp_utils.py, L486-492
 if version.parse(torch.__version__) >= version.parse("2.7.0"):
     from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 else:
@@ -330,11 +352,11 @@ PyTorch 版本      兼容处理
 
 ### 6.1 策略模式（Platform）
 
-`PlatformBase` 定义策略接口，`PlatformCUDA`/`PlatformNPU` 提供具体实现。`PlatformRegistry` 管理策略注册和选择。这使得新硬件（MetaX、XPU、MLU 等）只需实现 `PlatformBase` 子类并注册即可。
+`PlatformBase` 定义策略接口，`PlatformCUDA`/`PlatformNPU`/`PlatformROCm`（AMD，注册键 `amd`，继承 `PlatformCUDA`）提供具体实现。`PlatformRegistry` 管理策略注册和选择。AMD ROCm 已落地实现；其余新硬件（MetaX、XPU、MLU 等）只需实现 `PlatformBase` 子类并注册即可。
 
-### 6.2 模板方法模式（ModelMerger）
+### 6.2 抽象基类与后端特化（ModelMerger）
 
-`BaseModelMerger` 定义合并流程骨架（加载配置 -> 合并 state_dict -> 保存 LoRA -> 保存模型），子类只覆写 `merge_and_save()` 中的检查点加载逻辑。
+`BaseModelMerger` 是抽象基类，提供共享的配置/加载/保存辅助方法；`merge_and_save()` 与 `cleanup()` 本身是抽象契约，实际合并流程由各后端实现（FSDP：`fsdp_model_merger.py:203-227`；Megatron：`megatron_model_merger.py:494-512`），CLI 在 `__main__.py:68-69` 顺序调用二者。子类扩展面不只是在 `merge_and_save()` 中加载 checkpoint：FSDP 还覆写 `_validate_state_dict` 与 `cleanup`（`fsdp_model_merger.py:229,262`），Megatron 还覆写 `save_hf_model_and_tokenizer` 与 `cleanup`（`megatron_model_merger.py:423,548`）。
 
 ### 6.3 装饰器注册模式（Tools）
 
@@ -354,7 +376,7 @@ def calculate(expression: str) -> str:
 ### 6.4 Vendoring 策略（Third Party）
 
 verl 选择 vendor（内嵌）而非 monkey-patch PyTorch 代码，原因：
-- 补丁代码量大（2,300+ 行），monkey-patch 容易遗漏
+- 补丁代码量大（`verl/third_party/` 当前 2,667 行），monkey-patch 容易遗漏
 - 版本检测 + 条件导入确保只在需要时使用 vendor 版本
 - 当 PyTorch 版本升级后自动切换到官方实现
 
@@ -364,13 +386,14 @@ verl 选择 vendor（内嵌）而非 monkey-patch PyTorch 代码，原因：
 
 ```
                             ┌──────────────────────┐
-                            │  verl/utils/device.py │ <── 80+ 调用站点
+                            │  verl/utils/device.py │ <── 多个调用站点
                             └──────────┬───────────┘
                                        │ 委托
                                        v
                           ┌────────────────────────────┐
                           │  verl/plugin/platform/     │
                           │  PlatformBase -> CUDA/NPU  │
+                          │                 -> ROCm    │
                           └────────────────────────────┘
 
 ┌──────────────────────┐        ┌───────────────────────┐
@@ -398,7 +421,7 @@ verl 选择 vendor（内嵌）而非 monkey-patch PyTorch 代码，原因：
 
 ```
 verl/plugin/platform/
-  被依赖：verl/utils/device.py（唯一入口）
+  主要被依赖：verl/utils/device.py；注册表/平台类也可由插件直接导入扩展
   无外部依赖（纯 Python + torch）
 
 verl/model_merger/

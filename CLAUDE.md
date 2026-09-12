@@ -17,11 +17,9 @@ backends and inference engines.
     - `base/` - `Worker` base class, `@register` decorator, `Dispatch` modes
     - `ray/` - `RayWorkerGroup`, `create_colocated_worker_cls` for hybrid engine
   - `workers/` - Distributed worker implementations
-    - `fsdp_workers.py` - FSDP2-based Actor, Critic, Reference workers
-    - `megatron_workers.py` - Megatron-LM-based workers
-    - `engine_workers.py` - Generic engine-based workers (TorchTitan, etc.)
+    - `engine_workers.py` - `ActorRolloutRefWorker` and `TrainingWorker` (Critic)
+    - `engine/` - Pluggable training backends (FSDP2, Megatron, TorchTitan, VeOmni, MindSpeed, AutoModel)
     - `rollout/` - Inference engine adapters (vLLM, SGLang, TRT-LLM, HF)
-    - `sharding_manager/` - Hybrid engine memory management (FSDP/Megatron)
     - `reward_manager/` - Reward computation orchestration
   - `trainer/` - Training orchestration
     - `ppo/ray_trainer.py` - `RayPPOTrainer`: main training loop (10-step cycle)
@@ -140,7 +138,7 @@ cd docs && pip install -r requirements-docs.txt && make html
 | Algorithm Details       | `verl/trainer/ppo/core_algos.py`, `docs/algo/`                        |
 | Architecture Overview   | `docs/`, `verl/single_controller/`                                    |
 | Hydra Configuration     | `verl/trainer/config/`, `.claude/rules/api-config.md`                 |
-| FSDP2 Training          | `verl/utils/fsdp_utils.py`, `verl/workers/fsdp_workers.py`           |
+| FSDP2 Training          | `verl/utils/fsdp_utils.py`, `verl/workers/engine/fsdp/`              |
 | Megatron Integration    | `verl/models/mcore/`, `verl/utils/megatron_utils/`                    |
 | Inference Engines       | `verl/workers/rollout/vllm_rollout/`, `verl/workers/rollout/sglang_rollout/` |
 | Hybrid Engine           | `verl/single_controller/ray/base.py` (`create_colocated_worker_cls`) |

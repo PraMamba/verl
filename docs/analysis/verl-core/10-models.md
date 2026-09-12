@@ -1,8 +1,8 @@
 # 10 - 模型层子模块 (verl/models/)
 
-> 源码位置: `verl/models/` | 31 个文件 | 9,478 行
+> 源码位置: `verl/models/` | 31 个文件 | 10,128 行
 >
-> 版本基线: 2025-06 main 分支
+> 版本基线: 上游 e3573545 | 最后更新: 2026-08-02
 
 ---
 
@@ -11,54 +11,65 @@
 `verl/models/` 是 verl 框架的模型适配层,解决一个核心问题: **如何让 HuggingFace 生态的模型无缝运行在 Megatron-Core 分布式训练引擎和 verl 的 RL 训练管线中**。
 
 核心职责:
-- **MCore 集成** (`mcore/`): 17 个文件,5,238 行——HF 与 Megatron-Core 之间的双向桥接,包括配置转换、权重转换、模型初始化和前向传播
-- **HF Transformers 补丁** (`transformers/`): 12 个文件,3,992 行——通过 Monkey Patch 注入 Ulysses 序列并行、融合 kernel、VLM 适配等能力
+- **MCore 集成** (`mcore/`): 15 个文件,5,507 行——HF 与 Megatron-Core 之间的双向桥接,包括配置转换、权重转换、模型初始化和前向传播
+- **HF Transformers 补丁** (`transformers/`): 13 个文件,4,488 行——通过 Monkey Patch 注入 Ulysses 序列并行、融合 kernel、VLM 适配等能力
 
-两个子目录互不依赖,分别服务于 Megatron 后端和 FSDP 后端的训练场景。
+根级 registry 与两个子目录共同组成模型适配层：根级 registry 提供模型类和权重 loader/saver 的公共分发；`mcore/` 与 `transformers/` 分别服务于 Megatron 后端和 FSDP 后端的训练场景。
 
 ---
 
 ## 2. 文件清单与行数
 
-### mcore/ 子目录 (17 文件, 5,238 行)
+### 根级 models/ 文件 (3 文件, 133 行)
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| `registry.py` | 299 | `SupportedModel` 枚举(17 种架构), 4 个并行注册表 |
-| `config_converter.py` | 422 | HF `PretrainedConfig` --> MCore `TransformerConfig`(6 种转换器) |
+| `__init__.py` | 13 | 包级导出 |
+| `registry.py` | 62 | `ModelRegistry`（L43）：模型类注册与 `load_model_cls()`（L45）/`get_supported_archs()`（L60）分发 |
+| `weight_loader_registry.py` | 58 | `get_weight_loader()`（L16）与 `get_weight_saver()`（L32）公共权重 I/O 注册 |
+
+### mcore/ 子目录 (15 文件, 5,507 行)
+
+| 文件 | 行数 | 职责 |
+|------|------|------|
+| `__init__.py` | 38 | MCore 包级导出 7 个 registry 分发 API，并应用 Megatron patch |
+| `bridge.py` | 29 | 当前 Megatron-Bridge API 重导出：`AutoBridge`、`LinearForLastLayer`、`freeze_moe_router`、`make_value_model` |
+| `mbridge.py` | 27 | legacy mbridge API 重导出，供兼容路径使用 |
+| `registry.py` | 299 | `SupportedModel` 枚举(17 种架构), 5 个并行注册表 |
+| `config_converter.py` | 422 | HF `PretrainedConfig` --> MCore `TransformerConfig`(7 种转换器) |
 | `model_initializer.py` | 203 | 模型初始化(5 种初始化器: Dense/Qwen2MoE/Mixtral/Qwen3MoE/DeepseekV3) |
 | `loader.py` | 495 | HF 权重 --> MCore 分片加载 |
 | `saver.py` | 497 | MCore 分片 --> HF 格式合并保存 |
 | `weight_converter.py` | 479 | 在线权重名称转换(6 种转换器) |
-| `model_forward.py` | 449 | 标准前向传播(THD/BSHD 两种数据格式) |
-| `model_forward_fused.py` | 317 | 融合 kernel 前向(linear_cross_entropy) |
+| `model_forward.py` | 474 | 标准前向传播(THD/BSHD 两种数据格式) |
+| `model_forward_fused.py` | 346 | 融合 kernel 前向(linear_cross_entropy) |
 | `model_forward_1f1b_overlap.py` | 252 | 1F1B 流水线并行重叠前向 |
-| `mtp_patch.py` | 467 | Multi-Token Prediction 补丁 |
+| `mtp_patch.py` | 518 | Multi-Token Prediction 补丁 |
 | `patch.py` | 573 | MCore 兼容性补丁 |
-| `util.py` | 785 | 数据格式转换工具(preprocess/postprocess) |
+| `util.py` | 855 | 数据格式转换工具(preprocess/postprocess) |
 
-### transformers/ 子目录 (12 文件, 3,992 行)
+### transformers/ 子目录 (13 文件, 4,488 行)
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| `monkey_patch.py` | 539 | 统一补丁入口 `apply_monkey_patch()` |
+| `monkey_patch.py` | 551 | 统一补丁入口 `apply_monkey_patch()` |
 | `dense_common.py` | 203 | 通用 Dense 模型前向(Llama/Qwen2 等) |
 | `llama.py` | 241 | Llama 模型特定补丁 |
 | `qwen2.py` | 243 | Qwen2 模型特定补丁 |
 | `qwen2_vl.py` | 563 | Qwen2-VL 多模态补丁 |
-| `qwen3_vl.py` | 455 | Qwen3-VL 多模态补丁 |
-| `qwen3_5.py` | 296 | Qwen3.5 多模态补丁 |
+| `qwen3_vl.py` | 460 | Qwen3-VL 多模态补丁 |
+| `qwen3_5.py` | 661 | Qwen3.5 多模态补丁 + 门控 delta-net / 上下文并行(`qwen3_5_gated_delta_net_forward`, 第 193 行) |
 | `glm4v.py` | 548 | GLM-4V 多模态补丁 |
 | `kimi_vl.py` | 192 | Kimi-VL 多模态补丁 |
 | `apertus.py` | 118 | Apertus 模型补丁 |
 | `tiled_mlp.py` | 236 | MLP 分块优化(降低峰值显存) |
-| `npu_patch.py` | 358 | NPU(华为昇腾)优化补丁 |
+| `npu_patch.py` | 451 | NPU(华为昇腾)优化补丁 |
 
 ---
 
 ## 3. MCore 三层注册表模式
 
-`registry.py`（299 行）是整个 MCore 集成的入口和索引。
+MCore 代码有三条职责边界：`bridge.py`（29 行）是当前 Megatron-Bridge 的公开重导出入口；`mbridge.py`（27 行）是 legacy mbridge 兼容入口；`registry.py`（299 行）及其五个注册表属于 deprecated 的旧模型/转换器索引，仍供 model-merger/legacy utility 使用，但不是当前 Megatron Engine 的唯一入口。
 
 ### 3.1 SupportedModel 枚举
 
@@ -84,21 +95,22 @@
 | `GPT_OSS` | `GptOssForCausalLM` | — |
 | `MIMO` | `MiMoForCausalLM` | — |
 
-### 3.2 四个并行注册表
+### 3.2 五个并行注册表
 
-每种模型在以下 4 个注册表中各有一个条目:
+以下 5 个并行注册表均以 `SupportedModel` 为 key,各注册表条目数不等(并非每种模型都在每个注册表中出现):
 
 **1. MODEL_CONFIG_CONVERTER_REGISTRY** (第 140 行)
 ```
 SupportedModel --> Callable[[PretrainedConfig, dtype], TransformerConfig]
 ```
-将 HF 配置转换为 MCore TransformerConfig。6 种转换函数:
+将 HF 配置转换为 MCore TransformerConfig。7 种转换函数:
 - `hf_to_mcore_config_dense`: Llama, Qwen2, Qwen3 等 Dense 模型
 - `hf_to_mcore_config_qwen2moe`: Qwen2-MoE
 - `hf_to_mcore_config_qwen3moe`: Qwen3-MoE, Qwen3.5-MoE
 - `hf_to_mcore_config_mixtral`: Mixtral
 - `hf_to_mcore_config_dpskv3`: DeepSeekV3 (MLA 注意力)
 - `hf_to_mcore_config_qwen2_5_vl`: Qwen2.5-VL
+- `hf_to_mcore_config_llama4`: Llama4
 
 **2. MODEL_INITIALIZER_REGISTRY** (第 156 行)
 ```
@@ -117,7 +129,13 @@ SupportedModel --> Callable (前向函数)
 ```
 标准前向传播,由 `model_forward_gen()` 工厂函数生成。VLM 模型传入 `vision_model=True`。
 
-**4. MODEL_WEIGHT_CONVERTER_REGISTRY** (第 211 行)
+**4. MODEL_FORWARD_FUSED_REGISTRY** (第 192 行)
+```
+SupportedModel --> Callable (融合前向函数)
+```
+融合 kernel 前向,由 `fused_forward_model_gen()` 工厂函数生成(15 条目,与标准前向注册表各自独立)。
+
+**5. MODEL_WEIGHT_CONVERTER_REGISTRY** (第 211 行)
 ```
 SupportedModel --> type[McoreToHFWeightConverterBase]
 ```
@@ -132,7 +150,8 @@ SupportedModel --> type[McoreToHFWeightConverterBase]
 2. MODEL_CONFIG_CONVERTER_REGISTRY: 选择或新建配置转换函数
 3. MODEL_INITIALIZER_REGISTRY: 选择或新建初始化器
 4. MODEL_FORWARD_REGISTRY: 通常使用 model_forward_gen()
-5. MODEL_WEIGHT_CONVERTER_REGISTRY: 新建权重转换器(如有特殊权重融合)
+5. MODEL_FORWARD_FUSED_REGISTRY: 通常使用 fused_forward_model_gen()
+6. MODEL_WEIGHT_CONVERTER_REGISTRY: 新建权重转换器(如有特殊权重融合)
 ```
 
 ---
@@ -176,7 +195,7 @@ McoreToHFWeightConverterBase (第 25 行)
 
 ### 4.3 Dense 模型转换示例
 
-`McoreToHFWeightConverterDense` 的核心名称映射（第 87 行 `convert_param`）:
+`McoreToHFWeightConverterDense` 的核心名称映射（第 86 行 `convert_param`）:
 
 | MCore 参数名 | HF 参数名 |
 |-------------|----------|
@@ -200,7 +219,7 @@ MoE 模型（Qwen2-MoE, Mixtral, Qwen3-MoE, DeepSeekV3）额外需要处理:
 
 ## 5. 三种前向传播路径
 
-### 5.1 标准前向 (model_forward.py, 449 行)
+### 5.1 标准前向 (model_forward.py, 474 行)
 
 `model_forward_gen()`（第 38 行）是一个工厂函数,返回支持两种数据格式的前向函数:
 
@@ -220,7 +239,7 @@ input_ids_rmpad, packed_seq_params = preprocess_packed_seqs(
 
 `gptmodel_forward_model_engine()`（第 264 行）是用于 model engine 的特化版本,也支持 THD 和 BSHD。
 
-### 5.2 融合前向 (model_forward_fused.py, 317 行)
+### 5.2 融合前向 (model_forward_fused.py, 346 行)
 
 `fused_forward_model_gen()`（第 68 行）和 `fused_forward_model_engine()`（第 140 行）将 lm_head 线性层和交叉熵损失融合到单个 kernel 调用:
 
@@ -285,7 +304,7 @@ base_config = {
 
 ## 7. Monkey Patch 补丁链
 
-`monkey_patch.py`（539 行）中的 `apply_monkey_patch()`（第 291 行）是 HF Transformers 模型的统一补丁入口。
+`monkey_patch.py`（551 行）中的 `apply_monkey_patch()`（第 291 行）是 HF Transformers 模型的统一补丁入口。
 
 ### 7.1 补丁流程
 
@@ -298,7 +317,7 @@ apply_monkey_patch(model, ulysses_sp_size, use_fused_kernels, ...)
 ├── [2] PrefixGrouper 补丁 (可选, 第 324-325 行)
 │     └── apply_prefix_grouper_patch(): 包装 ALL_ATTENTION_FUNCTIONS
 │
-├── [3] VLM 模型补丁 (按 model_type 分发, 第 360-528 行)
+├── [3] VLM 模型补丁 (按 model_type 分发, 第 362-540 行)
 │     ├── qwen2_5_vl / qwen2_vl:
 │     │   ├── Step 1: 替换 forward (forward_with_normal_backend)
 │     │   ├── Step 2: 替换 attention (qwen2_vl_attn_forward)
@@ -321,10 +340,10 @@ apply_monkey_patch(model, ulysses_sp_size, use_fused_kernels, ...)
 │         ├── Step 1: 替换 forward + fast_pos_embed_interpolate
 │         └── Step 2: patch_vlm_for_ulysses_input_slicing
 │
-├── [4] Ulysses SP 全局补丁 (第 529-537 行)
+├── [4] Ulysses SP 全局补丁 (第 542-549 行)
 │     └── 替换 _flash_attention_forward --> _ulysses_flash_attention_forward
 │
-└── [5] 融合 kernel 补丁 (第 539 行)
+└── [5] 融合 kernel 补丁 (第 551 行)
       └── patch_forward_with_backends(model, use_fused_kernels, fused_kernels_backend)
 ```
 
@@ -411,7 +430,7 @@ VLM（视觉语言模型）需要特殊处理,因为 vision encoder 和 language
 
 **Step 1: 模型前向替换**
 ```python
-# 以 Qwen2.5-VL 为例 (monkey_patch.py 第 384-387 行)
+# 以 Qwen2.5-VL 为例 (monkey_patch.py 第 388 行)
 Qwen2_5_VLModel.forward = qwen2_vl_base_forward
 Qwen2_5_VLForConditionalGeneration.forward = forward_with_normal_backend
 ```
@@ -419,14 +438,14 @@ Qwen2_5_VLForConditionalGeneration.forward = forward_with_normal_backend
 
 **Step 2: 注意力替换 (用于 Ulysses SP)**
 ```python
-# 第 405-406 行
+# 第 407 行
 Qwen2_5_VLAttention.forward = qwen2_vl_attn_forward
 ```
 注入 Ulysses All-to-All 通信到注意力层。
 
 **Step 3: 输入切片 (用于 Ulysses SP)**
 ```python
-# 第 411 行
+# 第 413 行
 patch_vlm_for_ulysses_input_slicing(Qwen2_5_VLTextModel)
 ```
 `patch_vlm_for_ulysses_input_slicing()`（第 158 行）包装 decoder 的 forward,在首次调用时沿序列维度切片 `inputs_embeds` 和 `position_ids`。对于 Qwen3-VL 等模型,还需要切片 `visual_pos_masks` 和 `deepstack_visual_embeds`。
@@ -446,7 +465,7 @@ TiledMLP:  分 num_shards 块计算,每块只处理 1/num_shards 的隐藏维度
 
 ## 10. 数据格式工具 (util.py)
 
-`util.py`（785 行）提供前向传播所需的数据格式转换函数:
+`util.py`（855 行）提供前向传播所需的数据格式转换函数:
 
 ### 预处理函数族
 | 函数 | 用途 |
@@ -455,6 +474,7 @@ TiledMLP:  分 num_shards 块计算,每块只处理 1/num_shards 的隐藏维度
 | `preprocess_bshd()` | Padded --> BSHD (标准 padding 格式) |
 | `preprocess_thd_engine()` | Engine 模式的 THD 预处理 |
 | `preprocess_bshd_engine()` | Engine 模式的 BSHD 预处理 |
+| `preprocess_for_mindspeed()` | MindSpeed 后端序列预处理(第 296 行) |
 
 ### 后处理函数族
 | 函数 | 用途 |
@@ -463,6 +483,7 @@ TiledMLP:  分 num_shards 块计算,每块只处理 1/num_shards 的隐藏维度
 | `postprocess_bshd()` | BSHD 后处理 |
 | `postprocess_thd_engine()` | Engine 模式 THD 后处理 |
 | `postprocess_bshd_engine()` | Engine 模式 BSHD 后处理 |
+| `postprocess_packed_seqs_for_dict_output()` | THD 字典输出后处理(第 261 行) |
 
 ### VLM 注意力掩码构建
 | 函数 | 用途 |
@@ -505,8 +526,13 @@ fused_engine_fn = get_mcore_forward_fused_model_engine_fn(hf_config)
 4. Monkey Patch 必须兼容 transformers 4.52+ 的 API 变更（多个版本兼容分支）
 
 ### 扩展点
-1. **新模型架构**: 在 `SupportedModel` 枚举和 4 个注册表中添加条目
+
+以下第 2–5 项描述的是 MCore registry、转换器与 utility/model-merger 兼容面；当前 Megatron Engine 的主路径以第 1 项的 Megatron-Bridge/provider 接入为准。
+
+1. **当前 Megatron Engine 新模型路径**: `MegatronEngine` 要求 `use_mbridge=True`（`transformer_impl.py:105`），默认通过 Megatron-Bridge 的 `AutoBridge.from_hf_pretrained()`（`transformer_impl.py:211-227`）构建 provider；新模型应先按 Bridge/provider 的支持路径接入并验证，而不是把 deprecated 注册表当作唯一入口
 2. **新前向路径**: 通过 `model_forward_gen()` 工厂或自定义前向函数
 3. **新 VLM 补丁**: 在 `monkey_patch.py` 中添加新的 `model_type` 分支
 4. **新融合 kernel**: 在 `transformers/` 子目录中添加 `forward_with_{torch,triton}_backend`
 5. **新权重转换器**: 继承 `McoreToHFWeightConverterBase` 并实现 `convert_param()`
+
+`mcore/registry.py:84-88` 以下的 `SupportedModel` 与五个旧注册表仍保留给 model-merger/legacy utility 等兼容路径（文档中的“旧接口”）；它们已标记 deprecated，不能代表当前 Megatron Engine 的主扩展契约。

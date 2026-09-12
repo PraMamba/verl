@@ -1,6 +1,8 @@
 # 12 - verl/experimental/ 实验性子模块架构文档
 
-> **源码位置**: `verl/experimental/` | **文件数**: 39（含 unittest） | **生产文件**: 36 | **总行数**: 8,939
+> **源码位置**: `verl/experimental/` | **文件数**: 45（含 unittest） | **生产文件**: 43 | **总行数**: 11,147
+>
+> **最后更新**: 2026-08-02 | **基准源码**: 上游 `e3573545`
 >
 > 实验性模块，包含 6 个子系统：agent_loop（多轮工具调用）、fully_async_policy（全异步训练）、one_step_off_policy（一步前瞻）、separation（训推分离基础设施）、reward_loop（异步奖励计算）、teacher_loop（多教师蒸馏）。
 
@@ -20,68 +22,88 @@
 
 ## 2. 文件清单与行数
 
-### 2.1 agent_loop/（6 文件，2,306 行）
+### 2.1 agent_loop/（6 文件，2,907 行）
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| `agent_loop.py` | 1,162 | `AgentLoopBase`（L195）：协程抽象基类；`AgentLoopWorker`（L394）：批量并发执行；`AgentLoopManager`（L1045）：Ray 分布式调度 |
-| `tool_agent_loop.py` | 482 | `ToolAgentLoop`（L100）：ReAct 模式的多轮工具调用状态机；`AgentState` 枚举（L49） |
-| `tool_parser.py` | 约 380 | `ToolParser`（L44）：抽象解析器基类；Hermes/GPT-OSS/Qwen3XML/Gemma4 四种格式实现 |
-| `single_turn_agent_loop.py` | - | 单轮 agent loop 实现 |
-| `utils.py` | - | 辅助函数（配置路径解析、GPT-OSS 工具响应格式化） |
-| `__init__.py` | - | 模块入口 |
+| `agent_loop.py` | 1,283 | `AgentLoopBase`（L206）：协程抽象基类；`AgentLoopWorker`（L497）：批量并发执行；`AgentLoopManager`（L1161）：Ray 分布式调度 |
+| `tool_agent_loop.py` | 552 | `ToolAgentLoop`（L100）：ReAct 模式的多轮工具调用状态机；`AgentState` 枚举（L49） |
+| `tool_parser.py` | 816 | `ToolParser`（L48）：抽象解析器基类；9 种格式实现（hermes/gpt-oss/qwen3_coder/glm/seed/minimax/kimi/deepseek_v4/gemma4）|
+| `single_turn_agent_loop.py` | 115 | 单轮 agent loop 实现 |
+| `utils.py` | 108 | 辅助函数（配置路径解析、GPT-OSS 工具响应格式化） |
+| `__init__.py` | 33 | 模块入口 |
 
-### 2.2 fully_async_policy/（6 文件，2,796 行）
-
-| 文件 | 行数 | 职责 |
-|------|------|------|
-| `fully_async_trainer.py` | 约 1,200 | `FullyAsyncTrainer`（L53）：全异步训练器，从 MessageQueue 获取样本，支持 staleness 管理 |
-| `fully_async_rollouter.py` | 约 800 | `FullyAsyncRollouter`：异步 rollout 产生器，向 MessageQueue 发送样本 |
-| `message_queue.py` | 235 | `MessageQueue`（L27）：Ray actor 消息队列；`MessageQueueClient`（L180）：异步客户端 |
-| `detach_utils.py` | 约 400 | `MetricsAggregator`、`assemble_batch_from_rollout_samples` |
-| `fully_async_main.py` | - | 全异步训练入口脚本 |
-| `__init__.py` | - | 模块入口 |
-
-### 2.3 one_step_off_policy/（3 文件，554 行）
+### 2.2 fully_async_policy/（14 文件，4,335 行）
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| `ray_trainer.py` | 约 480 | `OneStepOffRayTrainer`（L49）：一步前瞻异步 rollout 训练器 |
-| `main_ppo.py` | 约 60 | Hydra 入口 |
-| `__init__.py` | - | 模块入口 |
+| `fully_async_trainer.py` | 1,049 | `FullyAsyncTrainer`（L54）：全异步训练器，从 MessageQueue 获取样本，支持 staleness 管理 |
+| `fully_async_rollouter.py` | 1,392 | `FullyAsyncRollouter`：异步 rollout 产生器，向 MessageQueue 发送样本 |
+| `message_queue.py` | 242 | `MessageQueue`（L27）：Ray actor 消息队列；`MessageQueueClient`（L180）：异步客户端 |
+| `detach_utils.py` | 466 | `MetricsAggregator`、`assemble_batch_from_rollout_samples` |
+| `fully_async_main.py` | 243 | 全异步训练入口脚本 |
+| `dynamic_schedule/` | 740 | 动态调度子包（6 文件），详见 §2.2.1 |
+| `unittest/` | 190 | 流式测试（2 文件）：`simple_streaming_demo.py` 等 |
+| `__init__.py` | 13 | 模块入口 |
 
-### 2.4 separation/（4 文件，1,015 行）
+#### 2.2.1 dynamic_schedule/ 动态调度子包（6 文件，740 行）
+
+动态调度子系统，控制全异步训练中 hybrid rollout 副本的激活/停用与资源分配（另含 `README.md` / `README_zh.md`）。
+
+| 文件 | 行数 | 公开类 / 职责 |
+|------|------|------|
+| `base.py` | 174 | `DynamicScheduleContext`（L57）：调度决策统一上下文；`DynamicSchedulePolicyBase`（L109）：策略抽象基类 + 注册表 |
+| `default_policy.py` | 235 | `DefaultDynamicSchedulePolicy`（L37）：默认策略，hybrid 激活时停用，自适应比例 |
+| `fixed_ratio_policy.py` | 89 | `FixedRatioDynamicSchedulePolicy`（L23）：固定比例策略，`deactivate_ratio` 不更新 |
+| `static_fully_async_policy.py` | 54 | `StaticFullyAsyncPolicy`（L21）：静态全异步策略 |
+| `dynamic_resource_controller.py` | 160 | `DynamicResourceController`（L51）：hybrid 副本生命周期管理（STANDALONE_ONLY <-> HYBRID_ACTIVE） |
+| `__init__.py` | 28 | 导出已导入的策略类与注册表（不含 `FixedRatioDynamicSchedulePolicy`） |
+
+`DynamicSchedulePolicyBase` 的 `build_policy()`（`dynamic_schedule/base.py:49-53`）只实例化已导入并触发 `@register_policy` 的策略。当前默认 `dynamic_schedule/__init__.py:15-18` 导入 `default` 与 `static_fully_async`，但没有导入 `fixed_ratio_policy.py`；全仓也没有其他默认导入，因此配置写入 `fixed_ratio` 时会在 `build_policy()` 处触发 `KeyError`，除非入口先手动导入该模块。动态调度控制器本身由 `FullyAsyncTrainer._setup_dynamic_resource_controller()`（`fully_async_trainer.py:302-327`）在 `use_dynamic_resource_scheduling=True` 时创建。
+
+### 2.3 one_step_off_policy/（3 文件，553 行）
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| `ray_trainer.py` | 约 700 | `SeparateRayPPOTrainer`（L52）：训推分离基类，定义模板方法 |
-| `engine_workers.py` | 约 200 | 引擎 worker 初始化 |
-| `utils.py` | 约 100 | 分离模式工具函数 |
-| `__init__.py` | - | 模块入口 |
+| `ray_trainer.py` | 408 | `OneStepOffRayTrainer`（L49）：一步前瞻异步 rollout 训练器 |
+| `main_ppo.py` | 129 | Hydra 入口 |
+| `__init__.py` | 16 | 模块入口 |
 
-### 2.5 reward_loop/（14 文件，1,919 行）
-
-| 文件 | 行数 | 职责 |
-|------|------|------|
-| `reward_loop.py` | 约 350 | `RewardLoopWorker`（L93）：奖励计算 worker |
-| `reward_model.py` | 约 200 | `RewardModelManager`：奖励模型路由管理 |
-| `reward_manager/base.py` | 83 | `RewardManagerBase`（L34）：奖励管理器抽象基类 |
-| `reward_manager/naive.py` | 约 120 | `NaiveRewardManager`：规则奖励 |
-| `reward_manager/dapo.py` | 约 150 | `DAPORewardManager`：DAPO 算法奖励 |
-| `reward_manager/gdpo.py` | 约 150 | `GDPORewardManager`：GDPO 算法奖励 |
-| `reward_manager/limited.py` | 约 100 | `RateLimitedRewardManager`：限速奖励 |
-| `reward_manager/remote.py` | 约 120 | `RemoteRewardManager`：远程奖励模型 |
-| `reward_manager/registry.py` | 约 30 | 注册表（`@register` 装饰器） |
-| `router/naive_router.py` | 约 100 | `NaiveRouter`：简单奖励路由 |
-| `router/inner_sglang_router.py` | 约 150 | SGLang 内部路由 |
-
-### 2.6 teacher_loop/（3 文件，349 行）
+### 2.4 separation/（4 文件，1,030 行）
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| `teacher_manager.py` | 约 250 | `AsyncTeacherLLMServerManager`（L65）：异步教师模型 logprob 计算 |
-| `teacher_model.py` | 约 80 | `MultiTeacherModelManager`：多教师模型管理，按 teacher_key 路由 |
-| `__init__.py` | - | 模块入口 |
+| `ray_trainer.py` | 763 | `SeparateRayPPOTrainer`（L52）：训推分离基类，定义模板方法 |
+| `engine_workers.py` | 159 | 引擎 worker 初始化 |
+| `utils.py` | 95 | 分离模式工具函数 |
+| `__init__.py` | 13 | 模块入口 |
+
+### 2.5 reward_loop/（14 文件，1,938 行）
+
+| 文件 | 行数 | 职责 |
+|------|------|------|
+| `reward_loop.py` | 362 | `RewardLoopWorker`（L93）：奖励计算 worker |
+| `reward_model.py` | 139 | `RewardModelManager`：奖励模型路由管理 |
+| `reward_manager/base.py` | 82 | `RewardManagerBase`（L34）：奖励管理器抽象基类 |
+| `reward_manager/naive.py` | 99 | `NaiveRewardManager`：规则奖励 |
+| `reward_manager/dapo.py` | 119 | `DAPORewardManager`：DAPO 算法奖励 |
+| `reward_manager/gdpo.py` | 92 | `GDPORewardManager`：GDPO 算法奖励 |
+| `reward_manager/limited.py` | 540 | `RateLimitedRewardManager`：限速奖励 |
+| `reward_manager/remote.py` | 130 | `RemoteRewardManager`：远程奖励模型 |
+| `reward_manager/registry.py` | 53 | 注册表（`@register` 装饰器） |
+| `router/naive_router.py` | 188 | `NaiveRouter`：简单奖励路由 |
+| `router/inner_sglang_router.py` | 73 | SGLang 内部路由：`launch_router_process`（L30）启动函数（无类定义） |
+| `reward_manager/__init__.py` | 30 | RewardManager 导出 |
+| `router/__init__.py` | 13 | 路由器导出 |
+| `__init__.py` | 18 | reward_loop 模块入口 |
+
+### 2.6 teacher_loop/（3 文件，371 行）
+
+| 文件 | 行数 | 职责 |
+|------|------|------|
+| `teacher_manager.py` | 141 | `AsyncTeacherLLMServerManager`（L78）：异步教师模型 logprob 计算 |
+| `teacher_model.py` | 213 | `MultiTeacherModelManager`：多教师模型管理，按 teacher_key 路由 |
+| `__init__.py` | 17 | 模块入口 |
 
 ---
 
@@ -100,7 +122,7 @@ RayPPOTrainer (verl/trainer/ppo/ray_trainer.py)
   │      ├─── OneStepOffRayTrainer (one_step_off_policy/ray_trainer.py, L49)
   │      │      一步前瞻：训练使用上一步 rollout 结果，当前步同时生成新 rollout
   │      │
-  │      └─── FullyAsyncTrainer (fully_async_policy/fully_async_trainer.py, L53)
+  │      └─── FullyAsyncTrainer (fully_async_policy/fully_async_trainer.py, L54)
   │             全异步：训练从 MessageQueue 拉取样本，rollout 独立推送
   │             @ray.remote(num_cpus=10) 作为独立 Ray actor 运行
 ```
@@ -139,7 +161,7 @@ FullyAsyncRollouter (Ray actor)           MessageQueue (Ray actor)         Fully
 `MessageQueue`（L27，`message_queue.py`）是核心解耦组件：
 - **底层容器**：`collections.deque(maxlen=max_queue_size)`
 - **并发控制**：`asyncio.Lock` + `asyncio.Condition`
-- **背压机制**：队列满时丢弃最旧样本（FIFO 溢出）
+- **有界丢弃/过载降级**：队列满时不阻塞生产者，而是丢弃最旧样本（FIFO 溢出）
 - **验证队列**：独立的 `val_queue` 用于验证数据
 
 ---
@@ -149,7 +171,7 @@ FullyAsyncRollouter (Ray actor)           MessageQueue (Ray actor)         Fully
 ### 4.1 核心类关系
 
 ```
-AgentLoopBase (agent_loop.py, L195)
+AgentLoopBase (agent_loop.py, L206)
   │  抽象基类：定义 run() 协程接口
   │  提供：apply_chat_template(), process_multi_modal_info()
   │
@@ -160,11 +182,11 @@ AgentLoopBase (agent_loop.py, L195)
          @register("tool_agent")
          多轮 ReAct 模式：生成 -> 解析工具调用 -> 执行工具 -> 拼接响应 -> 继续生成
 
-AgentLoopWorker (agent_loop.py, L394)
+AgentLoopWorker (agent_loop.py, L497)
   │  批量并发：asyncio.gather() 同时执行多个 agent loop
   │  后处理：_pad_token_ids(), _compute_multi_modal_inputs(), _compute_score()
   │
-AgentLoopManager (agent_loop.py, L1045)
+AgentLoopManager (agent_loop.py, L1161)
   │  分布式调度：多个 AgentLoopWorker 作为 Ray actor
   │  输入拆分 -> 并发执行 -> 结果合并 -> 性能指标
 ```
@@ -202,16 +224,23 @@ AgentState.GENERATING
 - `response_mask`：LLM 生成 token 为 1，工具响应 token 为 0
 - `response_logprobs`：仅 LLM 生成部分有值，工具响应部分填 0.0
 
+`AgentData`（`tool_agent_loop.py:56-96`）承载该状态机的可变会话状态：消息与多模态输入、`prompt_ids`/`response_ids`、`response_mask`/`response_logprobs`、turn 计数、`tool_calls`、路由专家信息和可扩展的 `extra_fields`。工具执行可通过它读取完整历史并写入会话级附加数据。
+
 ### 4.3 ToolParser 注册表
 
-`ToolParser`（tool_parser.py, L44）使用类级别 `_registry` 字典管理解析器：
+`ToolParser`（tool_parser.py, L48）使用类级别 `_registry` 字典管理解析器：
 
-| 格式名称 | 适用模型 | 特点 |
+| 格式名称（注册键） | 适用模型 | 特点 |
 |----------|----------|------|
 | `hermes` | Hermes/通用 | 标准 XML 标签 |
 | `gpt-oss` | GPT 开源变体 | 手动格式化响应 |
-| `qwen3xml` | Qwen3 | XML 格式，依赖 EOS 停止 |
-| `gemma4` | Gemma4 | 自定义标签，需显式 stop_token_ids |
+| `qwen3_coder` | Qwen3-Coder/Qwen3.5（类 `Qwen3XMLToolParser`） | XML 格式，依赖 EOS 停止 |
+| `glm` | GLM | GLM XML 风格函数调用 |
+| `seed` | ByteDance Seed | Seed XML 风格函数调用 |
+| `minimax` | MiniMax | MiniMax XML 风格函数调用 |
+| `kimi` | Kimi K2 系列 | 特殊 token 函数调用 |
+| `deepseek_v4` | DeepSeek-V4 | DSML 函数调用格式 |
+| `gemma4` | Google Gemma 4 | 自定义标签，需显式 stop_token_ids |
 
 ---
 
@@ -235,7 +264,7 @@ RewardLoopManager
   └── RewardModelManager
         │  管理奖励模型推理引擎
         │  通过 NaiveRouter 路由请求
-        └── NaiveRouter / InnerSGLangRouter
+        └── NaiveRouter / launch_router_process（inner_sglang_router.py:30 函数，无类定义）
 ```
 
 ### 5.2 RewardManager 层次
@@ -263,7 +292,7 @@ RewardManagerBase (reward_manager/base.py, L34)
 ### 6.1 核心类
 
 ```
-AsyncTeacherLLMServerManager (teacher_manager.py, L65)
+AsyncTeacherLLMServerManager (teacher_manager.py, L78)
   │  初始化：从 DistillationConfig 获取 teacher_models 配置
   │  路由：按 teacher_key（如 "model_name"）选择对应教师模型
   │  核心方法：compute_teacher_logprobs_single()
@@ -323,9 +352,21 @@ Agent Loop 使用两层并发：
 `MessageQueue` 作为 Ray actor 独立运行，使用 `asyncio.Lock` + `asyncio.Condition` 实现线程安全的异步等待：
 - 生产者（Rollouter）无需等待训练完成
 - 消费者（Trainer）无需等待 rollout 完成
-- 背压通过 `deque(maxlen=N)` 自然实现
+- 使用有界 `deque(maxlen=N)` 做丢弃式过载降级：队列满时丢弃最旧样本，不阻塞生产者
 
-### 7.4 注册表模式
+### 7.4 动态资源调度的状态机与安全顺序
+
+当 `async_training.use_dynamic_resource_scheduling=True` 时，`FullyAsyncTrainer` 在 `_setup_dynamic_resource_controller()`（`fully_async_trainer.py:302-327`）按配置名调用 `build_policy()`；每个训练 step 在 `fully_async_trainer.py:560-595` 先询问策略 `should_deactivate()`，必要时等待样本阈值，再执行停用。
+
+`DynamicResourceController` 的状态为 `STANDALONE_ONLY ↔ HYBRID_ACTIVE`：
+
+1. **停用**（`dynamic_resource_controller.py:135-155`）：先从 load balancer 移除 hybrid replicas，阻止重试重新路由；再 abort 在途请求；最后 sleep/release KV cache 与权重，归还训练显存。
+2. **权重同步**（`:97-110`）：先 abort，调用 hybrid checkpoint manager 的 naive backend 更新权重，再恢复 generation。
+3. **激活**（`:118-133`）：权重同步完成后把 hybrid replicas 加回 load balancer，再恢复 generation；成功后切换为 `HYBRID_ACTIVE`。
+
+若没有 hybrid replicas，控制器会跳过相应转换；策略名未注册（例如当前默认导入遗漏的 `fixed_ratio`）则在 `build_policy()` 处 fail-fast 为 `KeyError`，不是静默回退。
+
+### 7.5 注册表模式
 
 三处使用注册表：
 1. `_agent_loop_registry`（agent_loop.py）：`@register("tool_agent")` 注册 agent loop

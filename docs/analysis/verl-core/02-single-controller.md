@@ -1,7 +1,7 @@
 # verl 单控制器子模块架构文档
 
 > 源码路径: `verl/single_controller/`  
-> 总计: 6 个源文件, 2,225 行代码  
+> 总计: 7 个源文件, 2,251 行代码（含包级 `__init__.py`）
 > 最后验证: 2026-06-13 (通过 `wc -l` 确认行数, `grep -n` 确认行号)
 
 ---
@@ -27,6 +27,7 @@
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
+| `__init__.py` | 26 | 包级导出与版本兼容入口 |
 | `base/__init__.py` | 18 | 导出 `Worker`, `WorkerGroup`, `ClassWithInitArgs`, `ResourcePool` |
 | `base/decorator.py` | 444 | `Dispatch`/`Execute` 枚举, `@register` 装饰器, 8 种分发/收集函数 |
 | `base/worker.py` | 348 | `Worker` 基类, `DistRankInfo`, `DistGlobalInfo`, `WorkerHelper` |
@@ -103,6 +104,8 @@ class DistGlobalInfo:
 
 类属性 `fused_worker_attr_name = "fused_worker_dict"` (第 84 行) 是 FusedWorker 注入共享字典的键名。
 
+`WorkerHelper`（`worker.py:50`）是 `Worker` 之前的公共辅助基类，集中提供设备/环境初始化和 fused-worker 辅助状态；它也是对外可见的公共类，不应与具体 `Worker` 实现混为一谈。
+
 ### 3.6 ResourcePool (worker_group.py 第 27 行)
 
 管理跨节点的进程和 GPU 分配:
@@ -121,6 +124,8 @@ class ResourcePool:
 ### 3.7 ClassWithInitArgs (worker_group.py 第 76 行)
 
 延迟实例化包装器: 存储类和构造参数, 在 `__call__` 时才真正实例化。用于 Ray 远程 actor 的延迟创建。
+
+`RayClassWithInitArgs`（`ray/base.py:339`）是 Ray 层的扩展包装器，在上述延迟实例化基础上保存 actor 的额外资源选项，供 placement group 调度和 Ray actor 创建使用。
 
 ### 3.8 WorkerGroup (worker_group.py 第 123 行)
 
@@ -141,6 +146,8 @@ Ray 层的资源池实现, 扩展了 `ResourcePool`:
 - `get_placement_groups()`: 创建 Ray placement group, 按 `STRICT_PACK` 策略将进程绑定到同一节点
 - `sort_placement_group_by_node_ip()` (第 70 行): 按节点 IP 排序, 确保 RANK 在跨 job 间一致 (用于 FSDP checkpoint resume)
 - `max_colocate_count` 控制每个 bundle 的 GPU 分配: 实际分配 `num_gpus = 1 / max_colocate_count`
+
+`SubRayResourcePool`（`ray/base.py:166`）在既有 placement groups 上按 bundle 区间建立子资源池，用于从完整资源池切出 Worker 子组；它复用父池的调度拓扑而不重新创建 placement group。
 
 ### 3.10 ResourcePoolManager (ray/base.py 第 185 行)
 
@@ -366,13 +373,13 @@ ActorWorker.update_policy(data) 执行
 
 `Dispatch` 和 `Execute` 继承自 `DynamicEnum` 而非标准 `enum.Enum`, 因为需要支持运行时动态注册新模式。`register_dispatch_mode()` (第 338 行) 和 `update_dispatch_mode()` (第 348 行) 允许下游代码扩展分发模式, 无需修改核心代码。
 
-### 6.2 为什么不让 Worker 之间直接通信
+### 6.2 为什么业务 RPC 由 Controller 集中编排
 
-verl 严格禁止 Worker 之间直接通信 (所有通信必须经过 Controller)。原因:
+`single_controller` 将业务 RPC、数据分发和结果收集集中到 Controller/WorkerGroup；这不是对 Worker 内部通信的绝对禁止。Engine、FSDP、Megatron 等后端仍可在 Worker 内部直接使用分布式 collective 或其他数据面通信。这样划分的原因:
 
-- 简化状态管理: Controller 是唯一的状态持有者
-- 避免分布式死锁: 如果允许 Worker 之间通信, 容易出现循环等待
-- 便于调试: 所有数据流都可以在 Controller 端观察
+- 简化业务状态管理: Controller 是业务编排和 RPC 状态的集中持有者
+- 降低业务层死锁风险: 统一 dispatch/collect 生命周期, 避免业务 RPC 形成循环等待
+- 便于调试: 业务数据流可在 Controller 端观察, 同时保留后端 collective 的必要数据面路径
 
 ### 6.3 MAGIC_ATTR 的设计意图
 

@@ -5,13 +5,15 @@
 | 属性 | 值 |
 |------|------|
 | 文件路径 | `verl/trainer/ppo/core_algos.py` |
-| 总行数 | 2,487 |
+| 总行数 | 2,508 |
 | 优势估计器数量 | 14 种 |
 | 策略损失函数数量 | 11 种 |
 | 注册表 | `ADV_ESTIMATOR_REGISTRY`, `POLICY_LOSS_REGISTRY` |
 | KL 控制器 | `AdaptiveKLController`, `FixedKLController` |
+| 最后更新 | 2026-08-02 |
+| 基准源码 | 上游 `e3573545` |
 
-`core_algos.py` 是 verl 的算法核心文件，集中实现了所有 RL 后训练算法的数学计算——优势估计、策略梯度损失、价值损失、KL 惩罚和损失聚合。它以纯函数 + 注册表的方式组织，与分布式训练后端（FSDP/Megatron）完全解耦。
+`core_algos.py` 是 verl 的算法核心文件，集中实现了所有 RL 后训练算法的数学计算——优势估计、策略梯度损失、价值损失、KL 惩罚和损失聚合。多数 advantage/policy-loss 入口采用函数式接口 + 注册表组织，并与分布式训练后端（FSDP/Megatron）解耦；但 `AdaptiveKLController` 会更新内部状态（`core_algos.py:153-174`），部分路径还使用随机采样（如 `torch.multinomial`，`core_algos.py:2257-2264`），不能概括为全部无状态纯函数。
 
 ## 2. 注册表架构
 
@@ -45,7 +47,7 @@ PolicyLossFn = Callable[
      torch.Tensor,  # response_mask
      str,           # loss_agg_mode
      Optional[DictConfig | ActorConfig],  # config
-     torch.Tensor | None],  # rollout_is_weights
+     torch.Tensor | None],  # rollout_log_probs
     tuple[torch.Tensor, dict[str, Any]],
 ]
 ```
@@ -423,7 +425,7 @@ clipped_ratio_sg = clipped_ratio.detach()  # stop gradient
 pg_losses = -clipped_ratio_sg * advantages * log_prob
 ```
 
-### 4.11 bypass_mode -- 旁路模式 (第 2352-2487 行)
+### 4.11 bypass_mode -- 旁路模式 (第 2373-2508 行, `def compute_policy_loss_bypass_mode`)
 
 注册名：`"bypass_mode"`
 
@@ -432,13 +434,13 @@ pg_losses = -clipped_ratio_sg * advantages * log_prob
 - **`loss_type="ppo_clip"`**（默认）：调用 `compute_policy_loss_vanilla`，不额外应用 IS 权重（PPO 的 ratio 已隐含 IS 修正）
 - **`loss_type="reinforce"`**：调用 `compute_policy_loss_reinforce`，显式应用 IS 权重 `w = pi_current / pi_rollout`
 
-使用 `compute_rollout_correction_and_rejection_mask` 计算 IS 权重和拒绝采样掩码。配置项（第 2422-2427 行）：
+使用 `compute_rollout_correction_and_rejection_mask` 计算 IS 权重和拒绝采样掩码。配置项（第 2443-2448 行）：
 - `rollout_is`：IS 聚合级别（`"token"` / `"sequence"` / `None`）
 - `rollout_is_threshold`：截断阈值（默认 `2.0`）
 - `rollout_rs`：拒绝采样模式
 - `rollout_is_batch_normalize`：是否对 IS 权重做批次归一化
 
-### 4.12 compute_policy_loss_reinforce (第 2271-2348 行)
+### 4.12 compute_policy_loss_reinforce (第 2292-2369 行)
 
 未注册到 POLICY_LOSS_REGISTRY 的辅助函数，被 bypass_mode 调用：
 
@@ -479,9 +481,9 @@ self.value *= mult
 
 **工厂函数 `get_kl_controller`**（第 193-212 行）：根据 `kl_ctrl.type` 创建对应控制器，adaptive 模式要求 `horizon > 0`。
 
-### 6.2 KL 惩罚 (第 2126-2189 行)
+### 6.2 KL 惩罚 (第 2147-2210 行)
 
-`kl_penalty` 函数（第 2126 行）支持多种 KL 散度估计器：
+`kl_penalty` 函数（第 2147 行, `def kl_penalty`）支持多种 KL 散度估计器：
 
 | 名称 | 公式 | 说明 |
 |------|------|------|
@@ -490,14 +492,14 @@ self.value *= mult
 | `"mse"` / `"k2"` | `0.5 * (logprob - ref_logprob)^2` | 均方差 |
 | `"low_var_kl"` / `"k3"` | `exp(ref-log) - (ref-log) - 1`，裁剪到 `[-10, 10]` | 低方差估计器 |
 
-带 `"+"` 后缀（如 `"k3+"`）时使用 **straight-through trick**（第 2144-2151 行）：前向用指定估计器，反向用 k2 估计器的梯度，确保无偏梯度估计：
+带 `"+"` 后缀（如 `"k3+"`）时使用 **straight-through trick**（第 2165-2172 行）：前向用指定估计器，反向用 k2 估计器的梯度，确保无偏梯度估计：
 
 ```python
 backward_score = 0.5 * (logprob - ref_logprob).square()
 return backward_score - backward_score.detach() + forward_score.detach()
 ```
 
-### 6.3 价值损失 (第 2084-2123 行)
+### 6.3 价值损失 (第 2084-2145 行)
 
 `compute_value_loss` 实现 PPO 的裁剪价值损失：
 
@@ -508,6 +510,8 @@ vf_losses2 = (vpredclipped - returns)^2
 vf_loss = 0.5 * agg_loss(max(vf_losses1, vf_losses2))
 ```
 
+**行为变更**：`compute_value_loss` 新增 4 个参数 `dp_size` / `batch_num_tokens` / `global_batch_size` / `loss_scale_factor`，并全部转发给 `agg_loss`（第 2138-2141 行），因此价值损失现已支持 DP / global-batch 归一化，与策略损失保持一致的分布式不变性。
+
 ### 6.4 compute_rewards (第 1122-1135 行)
 
 计算带 KL 惩罚的 token 级奖励：
@@ -516,7 +520,7 @@ kl = old_log_prob - ref_log_prob
 return token_level_scores - kl * kl_ratio
 ```
 
-### 6.5 PF-PPO 重加权 (第 2192-2268 行)
+### 6.5 PF-PPO 重加权 (第 2213-2289 行)
 
 `compute_pf_ppo_reweight_data` 实现基于奖励的数据重采样：
 
@@ -567,9 +571,9 @@ return token_level_scores - kl * kl_ratio
 
 ## 8. 设计要点与扩展指南
 
-### 8.1 纯函数 + 注册表
+### 8.1 函数式接口 + 注册表
 
-所有算法实现为**无状态纯函数**（输入张量，输出张量和指标字典），通过注册表装饰器自动发现。用户扩展只需：
+注册的多数算法实现采用**函数式接口**（输入张量，输出张量和指标字典），通过注册表装饰器自动发现；状态控制器与 RNG 路径是例外。用户扩展只需：
 
 ```python
 from verl.trainer.ppo.core_algos import register_adv_est, register_policy_loss
@@ -588,7 +592,7 @@ def compute_my_loss(old_log_prob, log_prob, advantages, response_mask,
 
 ### 8.2 与 Trainer 的接口
 
-Trainer（`RayPPOTrainer`）通过 `get_adv_estimator_fn` 和 `get_policy_loss_fn` 获取具体实现，算法切换仅需修改配置文件中的 `algorithm.adv_estimator` 和 `actor.policy_loss` 字段。
+Trainer 负责根据 `algorithm.adv_estimator` 选择/计算 advantage；policy loss 名称则由 Worker 侧的 loss adapter（`verl/workers/utils/losses.py:101-104`）解析 `get_policy_loss_fn`。算法切换仍主要通过配置文件中的 `algorithm.adv_estimator` 和 `actor.policy_loss` 字段完成。
 
 ### 8.3 agg_loss 的分布式不变性
 

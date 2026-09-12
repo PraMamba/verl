@@ -1,7 +1,8 @@
 # 06 - Rollout Engines 子模块架构文档
 
 > verl/workers/rollout/ -- 推理引擎封装与三级服务架构
-> 25 个 Python 文件, 8,333 行 (wc -l 验证)
+> 28 个 Python 文件, 9,618 行 (wc -l 验证)
+> 最后更新: 2026-08-02 | 基准源码: 上游 e3573545
 
 ---
 
@@ -9,18 +10,20 @@
 
 Rollout Engines 子模块封装了 verl 的推理侧能力。它将 vLLM、SGLang、TensorRT-LLM 三大推理引擎统一为 HTTP 服务器形态, 通过三级架构 (Replica -> ServerManager -> AgentLoopManager) 管理生成请求的生命周期。
 
-**上游依赖**: `verl/workers/engine_workers.py` 的 `ActorRolloutRefWorker` 在 `init_model()` 中创建 rollout 实例; `verl/trainer/ppo/ray_trainer.py` 的 `RayPPOTrainer` 通过 `LLMServerManager` 管理推理服务器集群。
+**上游依赖**: `verl/workers/engine_workers.py` 的 `ActorRolloutRefWorker` 在 `init_model()` 中创建 rollout 实例; 默认 V1 `verl/trainer/ppo/v1/trainer_base.py` 与 legacy `verl/trainer/ppo/ray_trainer.py` 均通过各自训练编排路径使用 `LLMServerManager` 管理推理服务器集群。
 
-**下游消费者**: `verl/trainer/ppo/agent_loop_manager.py` 的 `AgentLoopManager` 通过 `LLMServerClient` 发送生成请求。
+**下游消费者**: `verl/experimental/agent_loop/agent_loop.py:1161` 的 `AgentLoopManager`（V1 还通过 `verl/trainer/ppo/v1/agent_loop_tq.py:230` 的 `AgentLoopManagerTQ` 适配 TransferQueue）通过 `LLMServerClient` 发送生成请求。
 
 **不包含**: 训练引擎 (属 04-engine-backends); 权重同步机制的训练侧 (属 05-engine-workers 的 `update_weights()`)。
+
+**非 HTTP 传统 rollout**: 除上述三大 HTTP 引擎外, 子模块还保留 `HFRollout` (`hf_rollout.py:39`) 与 `NaiveRollout` (`naive/naive_rollout.py:36`) —— 二者尝试在 worker 进程内用 HuggingFace 逐 batch 生成，但未实现 `BaseRollout` 要求的 `resume`/`update_weights`/`release` 抽象方法，且不在 `_ROLLOUT_REGISTRY` 注册，因此当前不能作为标准 rollout 类直接实例化或通过工厂选择。
 
 ---
 
 ## 2. 架构总览
 
 ```
-                    LLMServerManager (llm_server.py:223)
+                    LLMServerManager (llm_server.py:453)
                          |
                     管理 N 个 RolloutReplica
                          |
@@ -28,12 +31,12 @@ Rollout Engines 子模块封装了 verl 的推理侧能力。它将 vLLM、SGLan
           |              |              |
      vLLMReplica    SGLangReplica   TRTLLMReplica
      (vllm_async_    (async_sglang_  (trtllm_async_
-      server.py:958)  server.py:721)  server.py:485)
+      server.py:1102) server.py:745)  server.py:485)
           |              |              |
      每个 Replica 管理 1..N 个 HttpServer 进程 (每节点一个)
           |              |              |
      vLLMHttpServer SGLangHttpServer TRTLLMHttpServer
-     (:85)          (:111)           (:80)
+     (:77)          (:113)           (:80)
           |
      通过 FastAPI/uvicorn 暴露 HTTP 接口
           |
@@ -46,11 +49,11 @@ AgentLoopManager
       |
       | generate(request_id, prompt_ids, sampling_params)
       |
-LLMServerClient (llm_server.py:146)
+LLMServerClient (llm_server.py:194)
       |
       | acquire_server(request_id)  -- sticky session + least-loaded
       |
-GlobalRequestLoadBalancer (llm_server.py:44, Ray Actor)
+GlobalRequestLoadBalancer (llm_server.py:47, Ray Actor)
       |
       | -> (server_id, server_handle)
       |
@@ -61,7 +64,7 @@ HttpServer.generate.remote()  -- Ray 远程调用
 
 ## 3. 核心数据结构
 
-### 3.1 BaseRollout (base.py:29-80)
+### 3.1 BaseRollout (base.py:29-85)
 
 推理引擎的抽象基类, 定义了 `ServerAdapter` 的接口:
 
@@ -69,10 +72,10 @@ HttpServer.generate.remote()  -- Ray 远程调用
 |------|------|------|
 | `resume(tags)` | 45 | 恢复 GPU 权重/kv_cache |
 | `update_weights(weights)` | 54 | 更新模型权重 |
-| `release()` | 67 | 释放 GPU 内存 |
-| `generate_sequences(prompts)` | 71 | 同步批量生成 (可选) |
+| `release()` | 72 | 释放 GPU 内存 |
+| `generate_sequences(prompts)` | 76 | 同步批量生成 (可选) |
 
-**注册表** `_ROLLOUT_REGISTRY` (base.py:83):
+**注册表** `_ROLLOUT_REGISTRY` (base.py:88):
 ```python
 _ROLLOUT_REGISTRY = {
     ("vllm", "async"): "verl.workers.rollout.vllm_rollout.ServerAdapter",
@@ -81,7 +84,7 @@ _ROLLOUT_REGISTRY = {
 }
 ```
 
-`get_rollout_class()` (base.py:90) 按 `(rollout_name, mode)` 查找并动态导入。
+`get_rollout_class()` (base.py:95) 按 `(rollout_name, mode)` 查找并动态导入。
 
 ### 3.2 RolloutReplica (replica.py:70-300)
 
@@ -94,6 +97,7 @@ _ROLLOUT_REGISTRY = {
 
 **初始化方法**:
 - `init_hybrid(worker_group)` (第131行): 从 worker_group 切片出本 replica 的 workers, 调用 `launch_servers()`
+- `init_hybrid_colocated(worker_group, resource_pool)` (第143行): hybrid + colocated 混合模式, 复用 worker_group 但在独立 resource_pool 中调度 (TRT-LLM `launch_servers()` 依赖此路径)
 - `init_colocated(resource_pool)` (第160行): 在 resource_pool 中创建新 worker, 调用 `launch_servers()`
 - `init_standalone()` (第189行): 创建新 resource_pool + worker_group, 调用 `launch_servers()`
 
@@ -109,7 +113,7 @@ Replica 类的工厂注册表, 内置三种加载器:
 - `_load_sglang()` (第327行): 先 mock vllm 依赖 (SGLang 编译时需要), 再导入 `SGLangReplica`
 - `_load_trtllm()` (第371行): 导入 `TRTLLMReplica`
 
-`get_rollout_replica_class()` (第383行) 还处理 PD 分离模式: `disaggregation_enabled=True` 时加载 `SGLangPDReplica`。
+`get_rollout_replica_class()` (第383行) 还处理 PD 分离模式: `disaggregation_enabled=True` 时，`sglang` 加载 `SGLangPDReplica`，`vllm` 加载 `vLLMPDReplica`；配置校验只允许这两个后端启用 PD。
 
 ### 3.4 TokenOutput (replica.py:39-52)
 
@@ -121,7 +125,11 @@ Replica 类的工厂注册表, 内置三种加载器:
 - `num_preempted: Optional[int]` -- 被抢占次数 (性能指标)
 - `extra_fields: dict[str, Any]` -- 动态扩展字段
 
-### 3.5 AsyncRolloutRequest (schemas.py:81-713)
+### 3.5 FinishReasonTypeEnum (schemas.py:38-54)
+
+生成请求完成原因枚举：`LENGTH`（达到长度上限）、`STOP`（正常停止）和 `TOOL_CALL`（需要继续执行工具调用）。`from_str()` 将服务端字符串映射为枚举，未支持的值抛出 `ValueError`。
+
+### 3.6 AsyncRolloutRequest (schemas.py:81-713)
 
 异步 rollout 请求的完整数据模型, 管理多轮对话的状态:
 
@@ -158,7 +166,7 @@ PENDING -> RUNNING -> COMPLETED
 
 ## 4. 关键流程
 
-### 4.1 LLMServerManager 初始化流程 (llm_server.py:223-373)
+### 4.1 LLMServerManager 初始化流程 (llm_server.py:453-618)
 
 ```
 LLMServerManager.create(config, worker_group)
@@ -175,7 +183,7 @@ LLMServerManager.create(config, worker_group)
      -> 传入 {address: handle} 映射
 ```
 
-### 4.2 GlobalRequestLoadBalancer 请求路由 (llm_server.py:44-143)
+### 4.2 GlobalRequestLoadBalancer 请求路由 (llm_server.py:47-192)
 
 LRU Cache + 最小在途请求数负载均衡:
 
@@ -229,39 +237,48 @@ wake_up(tags=["kv_cache"]):
 
 ## 5. 三大推理引擎实现
 
-### 5.1 vLLM 异步服务器 (vllm_rollout/, 约 2,700 行)
+### 5.1 vLLM 异步服务器 (vllm_rollout/, 7 文件，2,772 行)
 
-**vLLMHttpServer** (vllm_async_server.py:85): 单节点 vLLM HTTP 服务器
+**vLLMHttpServer** (vllm_async_server.py:77): 单节点 vLLM HTTP 服务器
 - 基于 vLLM 的 `AsyncLLM` + `build_app()` + uvicorn 构建
-- `generate()` (第457行): 创建 `TokensPrompt` + `SamplingParams`, 调用 `engine.generate()`, 收集 `RequestOutput`
-- `wake_up()` / `sleep()` (第605/626行): 通过 vLLM 的内存管理 API 释放/恢复 GPU 资源
+- `generate()` (第511行): 创建 `TokensPrompt` + `SamplingParams`, 调用 `engine.generate()`, 收集 `RequestOutput`
+- `wake_up()` / `sleep()` (第770/791行): 通过 vLLM 的内存管理 API 释放/恢复 GPU 资源
+- Partial-rollout 支持: `clear_kv_cache()` / `release_kv_cache()` / `resume_kv_cache()` (第802/813/820行) 分级管理 KV cache; `set_global_steps()` (第845行) 同步训练步; `abort_all_requests()` (第852行) 中止在途请求
 - 支持 LoRA: 通过 `LoRARequest` 传入 adapter 配置
 
-**vLLMReplica** (vllm_async_server.py:958): vLLM 副本管理器
-- `launch_servers()` (第974行): 为每个节点创建一个 `vLLMHttpServer` Ray Actor
+**vLLMReplica** (vllm_async_server.py:1102): vLLM 副本管理器
+- `launch_servers()` (第1118行): 为每个节点创建一个 `vLLMHttpServer` Ray Actor
 - Hybrid 模式: 在已有的 worker 进程中启动 HTTP 服务器 (通过 Ray Actor scheduling)
 - Standalone 模式: 创建独立 Ray Actor
 
-**bucketed_weight_transfer.py** (333行): 高性能权重传输
+**vLLM PD 分离** (vllm_pd_replica.py, 305 行): Prefill-Decode 分离部署
+- `vLLMPDReplica(vLLMReplica)` (vllm_pd_replica.py:36): 分别拉起 prefill / decode 两组 HTTP 服务器 (`launch_servers()` @ vllm_pd_replica.py:104)
+- `vLLMHttpServer.set_pd_peer()` (vllm_async_server.py:226): 在 prefill 侧登记 decode peer, 建立 KV 传输路由 (注: 该方法定义在 vllm_async_server.py, 非 vllm_pd_replica.py)
+- `vLLMHttpServer._pd_dispatch()` (vllm_async_server.py:704): 将请求按 prefill -> decode 顺序分派
+
+**bucketed_weight_transfer.py** (337行): 高性能权重传输
 - `BucketedWeightSender` (第74行): 将模型参数打包为固定大小的 bucket, 通过 ZMQ IPC socket 发送
-- `BucketedWeightReceiver` (第233行): 接收 bucket, 解包参数写入模型
+- `BucketedWeightReceiver` (第236行): 接收 bucket, 解包参数写入模型
 - 传输介质: 优先使用 CUDA IPC (GPU 直连, 零拷贝), 回退到 POSIX shared memory
 - `rebuild_ipc()` (第45行): 从 IPC handle 重建 CUDA tensor, 关键在于替换 `device_id` 以适应不同进程的 `CUDA_VISIBLE_DEVICES` 映射
 
-### 5.2 SGLang 异步服务器 (sglang_rollout/, 约 2,200 行)
+**weight_update_utils.py** (65行): vLLM buffer 权重更新辅助 —— `split_buffer_updates()` (第20行) / `apply_buffer_updates()` (第39行) 处理非持久 buffer 的增量更新
 
-**SGLangHttpServer** (async_sglang_server.py:111): 单节点 SGLang HTTP 服务器
+### 5.2 SGLang 异步服务器 (sglang_rollout/, 7 文件，2,892 行)
+
+**SGLangHttpServer** (async_sglang_server.py:113): 单节点 SGLang HTTP 服务器
 - 基于 SGLang 的 `ServerArgs` + `_GlobalState` + `app` (FastAPI) 构建
-- `generate()` (第508行): 构造 `GenerateReqInput`, 通过 SGLang tokenizer_manager 提交请求
-- `wake_up()` / `sleep()` (第442/466行): 使用 `ResumeMemoryOccupationReqInput` / `ReleaseMemoryOccupationReqInput`
-- 支持 prompt logprobs: `_extract_prompt_logprobs_sglang()` (第61行) 对齐 SGLang 和 vLLM 的输出格式
+- `generate()` (第527行): 构造 `GenerateReqInput`, 通过 SGLang tokenizer_manager 提交请求
+- `wake_up()` / `sleep()` (第461/485行): 使用 `ResumeMemoryOccupationReqInput` / `ReleaseMemoryOccupationReqInput`
+- Partial-rollout 支持: `clear_kv_cache()` / `release_kv_cache()` / `resume_kv_cache()` (第508/512/519行); `set_global_steps()` (第705行); `abort_all_requests()` (第709行) —— 与 vLLM 侧一一对应
+- 支持 prompt logprobs: `_extract_prompt_logprobs_sglang()` (第63行) 对齐 SGLang 和 vLLM 的输出格式
 
-**SGLangReplica** (async_sglang_server.py:721): SGLang 副本管理器
-- `launch_servers()` (第737行): 与 vLLM 类似, 每节点一个 HttpServer
+**SGLangReplica** (async_sglang_server.py:745): SGLang 副本管理器
+- `launch_servers()` (第761行): 与 vLLM 类似, 每节点一个 HttpServer
 
 **PD 分离模式**: `sglang_pd_replica.py` 提供 `SGLangPDReplica`, 支持 Prefill-Decode 分离部署。
 
-### 5.3 TensorRT-LLM 异步服务器 (trtllm_rollout/, 约 1,300 行)
+### 5.3 TensorRT-LLM 异步服务器 (trtllm_rollout/, 4 文件，1,386 行)
 
 **TRTLLMHttpServer** (trtllm_async_server.py:80): 单节点 TRT-LLM HTTP 服务器
 - 基于 TRT-LLM 的 `ExecutorBindingsWorker` 构建
@@ -304,7 +321,7 @@ wake_up(tags=["kv_cache"]):
 HTTP 服务器架构有三个优势:
 1. **与推理引擎原生集成**: vLLM/SGLang 本身就是 HTTP 服务器, 复用其内置的请求调度、KV cache 管理、continuous batching
 2. **OpenAI 兼容 API**: 支持外部工具 (如 judge 模型) 直接通过 HTTP 调用
-3. **进程隔离**: 推理引擎运行在独立进程, GPU 内存管理不受训练进程影响
+3. **进程状态隔离**: 推理引擎运行在独立进程, 降低 Python/引擎状态相互污染；但 hybrid/colocated 部署仍可能共享同一 GPU 容量，显存释放与恢复必须由 sleep/wake 生命周期协调
 
 ### 7.2 为何需要 GlobalRequestLoadBalancer?
 
@@ -370,6 +387,8 @@ class MyClient(LLMServerClient):
 
 client = server_manager.get_client(client_cls=MyClient)
 ```
+
+verl 已内置 `FullyAsyncLLMServerClient(LLMServerClient)` (`llm_server.py:281`): 面向全异步 (fully-async / off-policy) 训练的客户端变体, 覆写 `_acquire_server()` (第307行) 以支持非阻塞的服务器获取, 可作为自定义 client 的参考实现。
 
 ### 8.3 Replica 部署模式选择
 

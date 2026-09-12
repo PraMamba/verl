@@ -1,7 +1,8 @@
 # 05 - Engine Workers 子模块架构文档
 
-> verl/workers/engine_workers.py (758行) + verl/workers/utils/ (430行)
+> verl/workers/engine_workers.py (816行) + verl/workers/utils/ (449行)
 > 训练 Worker 层: 连接 Engine 引擎与 Ray 单控制器调度
+> 最后更新: 2026-08-02 | 基准源码版本: 上游 e3573545
 
 ---
 
@@ -11,7 +12,7 @@ Engine Workers 是 verl 训练架构中"Worker 层"的核心实现。它位于 E
 
 **上游依赖**: `verl/workers/engine/` (BaseEngine, EngineRegistry); `verl/single_controller/` (Worker, Dispatch, register 装饰器)
 
-**下游消费者**: `verl/trainer/ppo/ray_trainer.py` 中的 `RayPPOTrainer` 通过 `RayWorkerGroup` 调用 Worker 方法 (如 `update_actor()`, `compute_log_prob()`)
+**下游消费者**: 默认 V1 `verl/trainer/ppo/v1/trainer_base.py` 中的 `PPOTrainer` 与 legacy `verl/trainer/ppo/ray_trainer.py` 中的 `RayPPOTrainer` 都通过 `RayWorkerGroup` 调用 Worker 方法 (如 `update_actor()`, `compute_log_prob()`)。
 
 **不包含**: 引擎内部的前向/反向实现 (属 04-engine-backends); Rollout 推理引擎 (属 06-rollout-engines)
 
@@ -20,11 +21,11 @@ Engine Workers 是 verl 训练架构中"Worker 层"的核心实现。它位于 E
 ## 2. 架构总览
 
 ```
-RayPPOTrainer (单控制器)
+PPOTrainer V1 / RayPPOTrainer legacy (单控制器)
       |
       | Ray RPC (DataProto / TensorDict)
       |
-ActorRolloutRefWorker (engine_workers.py:434)
+ActorRolloutRefWorker (engine_workers.py:446)
       |
       +-- actor: TrainingWorker  (engine_workers.py:76)
       |       |
@@ -54,7 +55,7 @@ TensorDict(left-right padding)
 
 ## 3. 核心数据结构
 
-### 3.1 TrainingWorker (engine_workers.py:76-431)
+### 3.1 TrainingWorker (engine_workers.py:76-443)
 
 通用训练 Worker, 可独立部署也可作为 ActorRolloutRefWorker 的组件。
 
@@ -67,7 +68,7 @@ TensorDict(left-right padding)
 - `auto_select_engine_optim_fn`: 可选的自动后端选择函数
 
 **关键属性**:
-- `self.engine`: BaseEngine 实例, 通过 `EngineRegistry.new()` 创建 (第127行)
+- `self.engine`: BaseEngine 实例, 通过 `EngineRegistry.new()` 创建 (第135行)
 - `self.loss_fn`: 可替换的损失函数, 通过 `set_loss_fn()` 注入
 - `self.flops_counter`: MFU 计算器
 
@@ -75,26 +76,27 @@ TensorDict(left-right padding)
 
 | 方法 | dispatch 模式 | 行号 | 职责 |
 |------|--------------|------|------|
-| `reset()` | ONE_TO_ALL | 160 | 调用 `engine.initialize()` |
-| `set_loss_fn()` | ONE_TO_ALL | 161 | 注入损失函数 |
-| `train_batch()` | nd_compute | 323 | 单个 mini-batch 训练步 |
-| `train_mini_batch()` | nd_compute | 233 | 多 epoch 多 mini-batch 训练 |
-| `infer_batch()` | nd_compute | 379 | 推理计算 (compute_log_prob / compute_ref_log_prob) |
-| `save_checkpoint()` | ONE_TO_ALL | 425 | 保存检查点 |
-| `load_checkpoint()` | ONE_TO_ALL | 429 | 加载检查点 |
+| `to()` | ONE_TO_ALL | 159 | 在 CPU/GPU 之间移动模型和优化器 |
+| `set_loss_fn()` | ONE_TO_ALL | 169 | 注入损失函数 |
+| `reset()` | ONE_TO_ALL | 173 | 调用 `engine.initialize()` |
+| `train_batch()` | nd_compute | 337 | 单个 mini-batch 训练步 |
+| `train_mini_batch()` | nd_compute | 242 | 多 epoch 多 mini-batch 训练 |
+| `infer_batch()` | nd_compute | 392 | 推理计算 (compute_log_prob / compute_ref_log_prob) |
+| `save_checkpoint()` | ONE_TO_ALL | 438 | 保存检查点 |
+| `load_checkpoint()` | ONE_TO_ALL | 442 | 加载检查点 |
 
-### 3.2 ActorRolloutRefWorker (engine_workers.py:434-758)
+### 3.2 ActorRolloutRefWorker (engine_workers.py:446-816)
 
 核心融合 Worker, 在同一进程中集成 Actor 训练、Rollout 推理和 Reference 策略三种角色。
 
-**角色组合** (第452行):
+**角色组合** (第467行):
 - `"actor"`: 仅 Actor 训练
 - `"rollout"`: 仅 Rollout 推理
 - `"ref"`: 仅 Reference 策略
 - `"actor_rollout"`: Actor + Rollout 融合
 - `"actor_rollout_ref"`: 完整三合一融合
 
-**init_model() 初始化流程** (第500行):
+**init_model() 初始化流程** (第533行):
 
 ```
 init_model()
@@ -123,12 +125,12 @@ init_model()
 
 | 方法 | 行号 | 职责 |
 |------|------|------|
-| `compute_ref_log_prob()` | 634 | 调用 `self.ref.infer_batch()`, mesh="ref" |
-| `compute_log_prob()` | 641 | 调用 `self.actor.infer_batch()`, mesh="actor" |
-| `update_actor()` | 649 | 调用 `self.actor.train_mini_batch()`, mesh="actor" |
-| `update_weights()` | 667 | 从 actor 引擎导出权重, 同步到 rollout 推理引擎 |
-| `save_checkpoint()` | 661 | 委托 actor 保存 |
-| `load_checkpoint()` | 657 | 委托 actor 加载 |
+| `compute_ref_log_prob()` | 690 | 调用 `self.ref.infer_batch()`, mesh="ref" |
+| `compute_log_prob()` | 697 | 调用 `self.actor.infer_batch()`, mesh="actor" |
+| `update_actor()` | 705 | 调用 `self.actor.train_mini_batch()`, mesh="actor" |
+| `update_weights()` | 720 | 从 actor 引擎导出权重, 同步到 rollout 推理引擎 |
+| `save_checkpoint()` | 715 | 委托 actor 保存 |
+| `load_checkpoint()` | 710 | 委托 actor 加载 |
 
 ### 3.3 Router Replay 装饰器 (engine_workers.py:61-73)
 
@@ -140,18 +142,20 @@ init_model()
 
 ## 4. 关键流程
 
-### 4.1 update_weights() 权重同步流程 (engine_workers.py:667-746)
+### 4.1 update_weights() 权重同步流程 (engine_workers.py:720-804)
 
 这是混合引擎架构中最关键的流程, 负责将训练后的模型权重从 Actor Engine 同步到 Rollout 推理引擎:
 
 ```
 update_weights(global_steps, mode="auto")
-  0. 若 mode != "naive" (异步离散化部署):
-     -> engine.get_per_tensor_param()
-     -> checkpoint_engine.send_weights(params)  -- 异步传输
+  0. 解析 effective_mode (engine_workers.py:747): mode=="auto" 时回退到 config.rollout.checkpoint_engine.backend
+     若 effective_mode != "naive" (异步离散化部署, :750):
+     - delta_sharded 分支 (:751): checkpoint_engine.send_weights(self.actor.engine, ...) (:754)
+       (delta 引擎自持同步状态机 seed/steady 与快照 prime, 自行驱动训练引擎)
+     - 其他异步分支 (:756): engine.get_per_tensor_param() -> checkpoint_engine.send_weights(per_tensor_param, ...) (:757)
      -> 返回
 
-  (以下为 mode="naive" 同步协同部署)
+  (以下为 effective_mode=="naive" 同步协同部署)
   1. resume rollout 权重内存 (若 free_cache_engine 已释放)
   2. actor.engine.get_per_tensor_param() -- 导出逐张量参数
   3. LoRA 处理:
@@ -162,7 +166,7 @@ update_weights(global_steps, mode="auto")
   6. resume rollout 的 kv_cache
 ```
 
-### 4.2 train_mini_batch() 训练流程 (engine_workers.py:233-321)
+### 4.2 train_mini_batch() 训练流程 (engine_workers.py:242-333)
 
 多 epoch 多 mini-batch 训练循环:
 
@@ -178,7 +182,7 @@ train_mini_batch(data)
   4. 聚合所有 mini-batch 的 metrics (仅在 mp_src_rank)
 ```
 
-### 4.3 _postprocess_output() 指标后处理 (engine_workers.py:172-231)
+### 4.3 _postprocess_output() 指标后处理 (engine_workers.py:180-239)
 
 将引擎输出转换为最终指标:
 1. `loss`: `torch.sum()` + `all_reduce(AVG)` 跨 DP 组平均
@@ -188,9 +192,9 @@ train_mini_batch(data)
 
 ---
 
-## 5. 工具模块: verl/workers/utils/ (430行)
+## 5. 工具模块: verl/workers/utils/ (449行)
 
-### 5.1 losses.py (186行)
+### 5.1 losses.py (205行)
 
 三个损失函数实现:
 

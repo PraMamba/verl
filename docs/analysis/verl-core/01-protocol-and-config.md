@@ -2,13 +2,13 @@
 
 > 源码位置：`verl/protocol.py`, `verl/base_config.py`, `verl/__init__.py`
 > 文件数：3 个 | 总行数：1,555 行
-> 最后更新：2026-06-13
+> 最后更新：2026-08-02（基准源码版本：上游 verl `e3573545`）
 
 ## 1. 模块职责概述
 
 本模块定义了 verl 框架的两个基础设施：`DataProto`（数据交换协议）和 `BaseConfig`（冻结配置基类）。
 
-`DataProto` 是所有跨 Worker 数据传输的载体。框架中每一次从驱动进程到 Worker、Worker 到驱动进程的数据交换都通过 `DataProto` 完成。它封装了 PyTorch TensorDict（用于 tensor 数据）、numpy 字典（用于非 tensor 数据如字符串和对象）、以及 meta_info 字典（用于元信息如配置参数）。
+`DataProto` 是 legacy 控制器分发路径和许多公开 Worker API 的主要数据协议，但不是所有跨 Worker 数据面的唯一载体。V1 PPO 的 `TransferQueue`/`ReplayBuffer` 路径还使用 `TensorDict`、`KVBatchMeta` 等批元数据类型，训练后端内部则直接使用各自的张量集体通信。`DataProto` 自身封装了 PyTorch TensorDict（用于 tensor 数据）、numpy 字典（用于非 tensor 数据如字符串和对象）、以及 meta_info 字典（用于元信息如配置参数）。
 
 `BaseConfig` 是所有配置 dataclass 的基类，提供 dict-like 接口并默认冻结所有字段，防止训练过程中意外修改配置。
 
@@ -93,9 +93,9 @@
 ### BaseConfig
 
 - **类型**：dataclass，继承 `collections.abc.Mapping`
-- **字段数**：2 个
+- **dataclass 字段数**：1 个（`_target_`）
 - **关键字段**：
-  - `_mutable_fields`: `set` — 可变字段白名单（类级别）
+  - `_mutable_fields`: `set` — 可变字段白名单（类级别变量，不是 dataclass 字段）
   - `_target_`: `str` — Hydra 实例化目标类
 - **关键方法**：
   - `__setattr__()` — 冻结非 `_mutable_fields` 中的字段
@@ -117,7 +117,7 @@
 1. **触发条件** (`protocol.py:840`): `is_padding_enabled()` 检查 per-DataProto 标志或全局 `DataProtoConfig.auto_padding`
 2. **Dispatch 层使用** (`decorator.py:91`): `_split_args_kwargs_data_proto_with_auto_padding()` 在将数据分发到 Worker 前自动 padding
 3. **padding 逻辑** (`protocol.py:849`): 复制首个或末尾样本填充到整除 chunks 的大小
-4. **unpadding** (`decorator.py:53`): `func_generator()` 在收集结果后自动去除 padding
+4. **unpadding** (`single_controller/ray/base.py:49 (def func_generator)`): `func_generator` 在收集结果后去除 padding——`kwargs.pop(_padding_size_key)`（`:53`）+ `select_idxs`（`:61`）裁掉补齐样本。（原文误记为 `decorator.py:53`，该处实为 `class Execute` 文档串，`func_generator` 不在 decorator.py 中）
 
 ### 关键常量与阈值
 
@@ -180,7 +180,7 @@
 
 | 测试文件 | 测试函数数 | 测试焦点 |
 |---------|----------|---------|
-| `tests/utils/test_protocol.py` | — | DataProto 基本操作（如存在） |
+| `tests/single_controller/test_auto_padding_on_cpu.py` | 1 | `test_auto_padding`：CPU 上 chunk 补齐与 `func_generator` 去填充路径 |
 
 ### 间接测试
 

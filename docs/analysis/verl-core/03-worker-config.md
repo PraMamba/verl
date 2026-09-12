@@ -1,8 +1,8 @@
 # verl Worker 配置子模块架构文档
 
 > 源码路径: `verl/workers/config/`  
-> 总计: 12 个源文件, 2,822 行代码  
-> 最后验证: 2026-06-13 (通过 `wc -l` 确认行数, `grep -n` 确认行号)
+> 总计: 12 个源文件, 2,987 行代码
+> 最后更新: 2026-08-02 (基准源码: 上游 `e3573545`; 通过 `wc -l` 确认行数, `grep -n` 确认行号)
 
 ---
 
@@ -44,21 +44,23 @@ BaseConfig (冻结 dataclass, 类字典接口)
 | 文件 | 行数 | 职责 |
 |------|------|------|
 | `__init__.py` | 38 | 汇聚导出所有配置类 |
-| `actor.py` | 417 | Actor 配置: `ActorConfig` 及 5 种后端变体 |
+| `actor.py` | 420 | Actor 配置: `ActorConfig` 及 5 种后端变体 |
 | `checkpoint.py` | 60 | 后端特化 checkpoint 配置: `McoreCheckpointConfig`, `MindSpeedCheckpointConfig` |
-| `critic.py` | 338 | Critic 配置: `CriticConfig` 及 6 种后端变体 |
-| `disaggregation.py` | 54 | SGLang Prefill-Decode 分离配置: `DisaggregationConfig` |
-| `distillation.py` | 308 | 在线蒸馏配置: `DistillationConfig`, 多教师模型支持 |
-| `engine.py` | 612 | 训练引擎配置: `EngineConfig` 及 6 种后端变体, `TrainingWorkerConfig` |
+| `critic.py` | 340 | Critic 配置: `CriticConfig` 及 5 种后端变体 + `FSDPCriticModelCfg` |
+| `disaggregation.py` | 60 | Prefill-Decode (PD) 分离配置 (sglang/vllm): `DisaggregationConfig` |
+| `distillation.py` | 320 | 在线蒸馏配置: `DistillationConfig`, 多教师模型支持 |
+| `engine.py` | 650 | 训练引擎配置: `EngineConfig` 及 6 种后端变体, `QATEngineConfig`, `TrainingWorkerConfig` |
 | `megatron_peft.py` | 40 | Megatron LoRA/PEFT 工厂函数 |
-| `model.py` | 247 | HuggingFace 模型配置: `HFModelConfig`, `MtpConfig` |
-| `optimizer.py` | 271 | 优化器配置: `OptimizerConfig` 及 5 种后端变体, `build_optimizer()` |
+| `model.py` | 261 | HuggingFace 模型配置: `HFModelConfig`, `MtpConfig` |
+| `optimizer.py` | 351 | 优化器配置: `OptimizerConfig` 及 5 种后端变体, `build_optimizer()` |
 | `reward.py` | 105 | 奖励配置: `RewardConfig`, `RewardModelConfig`, `SandboxFusionConfig` |
-| `rollout.py` | 332 | 推理引擎配置: `RolloutConfig` 及 9 个子配置 |
+| `rollout.py` | 342 | 推理引擎配置: `RolloutConfig` 及 9 个子配置 |
 
 ---
 
 ## 3. 核心数据结构
+
+> 字段覆盖口径：下列代码块是架构导读中的代表性字段，不是逐字段复制。完整字段以对应 dataclass 源码和本节文件清单为准；为避免把示例误读为 API 全集，特别列出紧凑示例中容易遗漏的字段：`PolicyLossConfig` 还包括 `kl_cov_ratio`、`ppo_kl_coef`、`rollout_correction`（`actor.py:98-100`）；`OptimizerConfig` 还包括 `lr_warmup_steps`（`optimizer.py:51`）；`ActorConfig` 还包括 `ppo_infer_micro_batch_size_per_gpu`、`ppo_infer_max_token_len_per_gpu`、`freeze_vision_tower`、`calculate_entropy`、`calculate_sum_pi_squared`、`use_prefix_grouper`、`profiler`、`global_batch_info`、`qat` 等（`actor.py:154-194`）。
 
 ### 3.1 BaseConfig --- 冻结 dataclass 基类 (base_config.py 第 22 行)
 
@@ -101,11 +103,13 @@ class EngineConfig(BaseConfig):
     router_replay: EngineRouterReplayConfig  # MoE 路由回放
 ```
 
-`_mutable_fields` 包含 8 个运行时可修改字段 (第 78-88 行): `use_dynamic_bsz`, `max_token_len_per_gpu`, `micro_batch_size_per_gpu`, `infer_max_token_len_per_gpu`, `infer_micro_batch_size_per_gpu`, `use_fused_kernels`, `use_remove_padding`, `forward_only`, `param_offload`。
+`_mutable_fields` 包含 9 个运行时可修改字段 (第 78-88 行): `use_dynamic_bsz`, `max_token_len_per_gpu`, `micro_batch_size_per_gpu`, `infer_max_token_len_per_gpu`, `infer_micro_batch_size_per_gpu`, `use_fused_kernels`, `use_remove_padding`, `forward_only`, `param_offload`。
 
 ### 3.3 六种 EngineConfig 变体
 
-#### FSDPEngineConfig (engine.py 第 220 行)
+> 基准 `e3573545` 新增共享字段 `entropy_from_logits_chunk_size` (默认 2048), 现见于全部 5 个含分块熵计算的变体 (Mcore 第 194 行 / FSDP 第 269 行 / VeOmni 第 364 行 / Torchtitan 第 460 行 / Automodel 第 601 行)。此外 engine.py 还定义了 `QATEngineConfig` (第 129 行, 量化感知训练配置), 通过 `qat` 字段嵌入 `McoreEngineConfig` (第 211 行) 与 `FSDPEngineConfig` (第 273 行)。
+
+#### FSDPEngineConfig (engine.py 第 231 行)
 
 ```python
 @dataclass
@@ -120,7 +124,7 @@ class FSDPEngineConfig(EngineConfig):
     strategy: str = "fsdp"                  # 支持 "fsdp" 和 "fsdp2"
 ```
 
-`__post_init__` 校验: `strategy` 必须为 `"fsdp"` 或 `"fsdp2"` (第 265 行)。
+`__post_init__` 校验: `strategy` 必须为 `"fsdp"` 或 `"fsdp2"` (第 277 行, strategy 断言)。
 
 #### McoreEngineConfig (engine.py 第 150 行)
 
@@ -140,9 +144,11 @@ use_mbridge: bool = True
 use_megatron_fsdp: bool = False
 ```
 
-`__post_init__` 自动修正: 当 `tensor_model_parallel_size == 1` 时, 强制关闭 `sequence_parallel` (第 214-216 行)。
+`__post_init__` 自动修正: 当 `tensor_model_parallel_size == 1` 时, 强制关闭 `sequence_parallel` (第 225-227 行, Mcore TP=1 关闭 SP)。
 
-#### VeOmniEngineConfig (engine.py 第 269 行)
+行为变更 (基准 `e3573545`): `vanilla_mbridge` 默认值由 `True` 改为 `False` (第 208 行); 显式设为 `True` 时 `__post_init__` 发出 `FutureWarning` (第 218-224 行), 提示 legacy mbridge 后端已弃用, 应改用 Megatron-Bridge。另新增 `pad_bshd_to_minibatch_max` (第 198 行, 默认 `True`)。
+
+#### VeOmniEngineConfig (engine.py 第 281 行)
 
 VeOmni 引擎配置, 特色在于丰富的算子实现选择:
 
@@ -155,9 +161,11 @@ swiglu_mlp_implementation: str = "eager"
 rotary_pos_emb_implementation: str = "eager"     # "triton" 用于 bitwise 对齐
 ```
 
-`__post_init__` 自动替换 attention 实现名 (第 384-392 行): 如 `"flash_attention_2"` -> `"veomni_flash_attention_2_with_sp"`。
+`__post_init__` 自动替换 attention 实现名 (第 398 行, attn 实现替换): 如 `"flash_attention_2"` -> `"veomni_flash_attention_2_with_sp"`。
 
-#### TorchtitanEngineConfig (engine.py 第 396 行)
+字段变更 (基准 `e3573545`): 删除 `wrap_policy` / `offload_policy` / `reshard_after_forward` / `use_orig_params` / `moe_load_balance_monitor_interval`; 新增 Qwen3.5 GatedDeltaNet 算子选择 `rms_norm_gated_implementation` / `causal_conv1d_implementation` / `chunk_gated_delta_rule_implementation` (第 391-393 行, 默认 `"eager"`)。
+
+#### TorchtitanEngineConfig (engine.py 第 414 行)
 
 支持多维并行:
 
@@ -169,10 +177,12 @@ tensor_parallel_size: int = 1
 expert_parallel_size: int = 1
 pipeline_parallel_size: int = 1
 context_parallel_size: int = 1
-attn_type: str = "flex"                  # flex/sdpa/varlen
+    attn_type: str = "flex"                  # flex/flex_flash/varlen
 ```
 
-#### AutomodelEngineConfig (engine.py 第 456 行)
+Torchtitan 字段变更 (基准 `e3573545`): 新增 `spmd_backend` (默认 `"spmd_types"`) 与 `activation_checkpoint` (默认 `"selective"`); `__post_init__` (第 480-489 行) 对 `attn_type` / `spmd_backend` / `activation_checkpoint` 各加一条合法值断言。
+
+#### AutomodelEngineConfig (engine.py 第 493 行)
 
 NeMo Automodel 后端, 支持 FSDP2/MegatronFSDP/DDP 三种分布式策略:
 
@@ -183,9 +193,9 @@ moe_config: dict = field(...)           # MoE 并行化参数
 mp_param_dtype: str = "bf16"            # FSDP2 混合精度策略
 ```
 
-`__post_init__` 校验: `pp_size` 必须为 1 (第 573 行)。
+`__post_init__` 校验: `pp_size` 必须为 1 (第 611 行, pp_size 断言)。
 
-#### MindSpeedEngineConfig (engine.py 第 577 行)
+#### MindSpeedEngineConfig (engine.py 第 615 行)
 
 继承 `McoreEngineConfig`, 添加 MindSpeed 专用参数:
 
@@ -196,9 +206,9 @@ class MindSpeedEngineConfig(McoreEngineConfig):
     fsdp_kwargs: dict = field(...)           # mindspeed_fsdp 引擎参数
 ```
 
-注意: `__post_init__` 不调用 `super().__post_init__()` (第 591 行), 因为 strategy 值不同于父类的 `"megatron"` 断言。
+注意: `__post_init__` 不调用 `super().__post_init__()` (第 629 行), 因为 strategy 值不同于父类的 `"megatron"` 断言。
 
-### 3.4 TrainingWorkerConfig (engine.py 第 601 行)
+### 3.4 TrainingWorkerConfig (engine.py 第 639 行)
 
 组合配置: 将模型、引擎、优化器、检查点、Profiler 合为一体:
 
@@ -216,6 +226,11 @@ class TrainingWorkerConfig(BaseConfig):
 ```
 
 `auto_select_engine_optim_fn` 是一个高阶函数, 接收 `(HFModelConfig, device_name)`, 返回 `(EngineConfig, OptimizerConfig)`, 用于根据模型类型和设备自动选择最优引擎配置。
+
+### 3.4.1 Checkpoint 与 Router Replay 配置
+
+- `McoreCheckpointConfig`（`checkpoint.py:34`）在通用 `CheckpointConfig` 上增加 Megatron-Core 的 `mbridge_config`；`MindSpeedCheckpointConfig`（`checkpoint.py:53`）继承它，供 MindSpeed 的 checkpoint 目标配置使用。
+- `EngineRouterReplayConfig`（`engine.py:48`）是引擎层的 Router Replay 配置；`RouterReplayConfig`（`actor.py:50`）是 Actor 层的对应配置。二者均校验 `disabled`/`R2`/`R3` 模式，字段为 `mode`、`record_file`、`replay_file`；引擎类上的 TODO 表明 legacy 命名尚待统一。
 
 ### 3.5 ActorConfig (actor.py 第 104 行)
 
@@ -258,11 +273,11 @@ class ActorConfig(BaseConfig):
 
 | 类 | strategy | 引擎类型 | 行号 |
 |----|----------|----------|------|
-| `FSDPActorConfig` | `"fsdp"` | `FSDPEngineConfig` | 第 287 行 |
+| `FSDPActorConfig` | `"fsdp"` | `FSDPEngineConfig` | 第 289 行 |
 | `McoreActorConfig` | `"megatron"` | `McoreEngineConfig` | 第 261 行 |
-| `VeOmniActorConfig` | `"veomni"` | `VeOmniEngineConfig` | 第 339 行 |
-| `TorchTitanActorConfig` | `"torchtitan"` | `TorchtitanEngineConfig` | 第 370 行 |
-| `MindSpeedActorConfig` | `"mindspeed"` | `MindSpeedEngineConfig` | 第 394 行 |
+| `VeOmniActorConfig` | `"veomni"` | `VeOmniEngineConfig` | 第 342 行 |
+| `TorchTitanActorConfig` | `"torchtitan"` | `TorchtitanEngineConfig` | 第 373 行 |
+| `MindSpeedActorConfig` | `"mindspeed"` | `MindSpeedEngineConfig` | 第 397 行 |
 
 每种变体的 `__post_init__` 都执行 `self.engine = self.xxx_config`, 将特化引擎配置赋值到通用 `engine` 字段。
 
@@ -286,20 +301,21 @@ Critic 模型训练配置, 结构与 ActorConfig 类似, 核心区别:
 cliprange_value: float = 0.5       # 值函数裁剪范围 (Actor 没有)
 forward_max_token_len_per_gpu: int = 32768  # 前向推理最大 token 长度
 enable: Optional[bool] = None      # 是否启用 Critic (GRPO 等算法不需要)
+loss_scale_factor: Optional[int] = None  # 第 97 行, 'seq-mean-token-sum-norm' 损失缩放 (基准 e3573545 新增)
 ```
 
-6 种后端变体:
+5 个 `CriticConfig` 后端变体, 外加 1 个模型层配置 `FSDPCriticModelCfg` (继承 `BaseModelConfig`, 不属于 `CriticConfig` 家族):
 
 | 类 | strategy | 行号 |
 |----|----------|------|
-| `FSDPCriticConfig` | `"fsdp"` | 第 188 行 |
-| `McoreCriticConfig` | `"megatron"` | 第 160 行 |
-| `TorchTitanCriticConfig` | `"torchtitan"` | 第 236 行 |
-| `MindSpeedCriticConfig` | `"mindspeed"` | 第 284 行 |
-| `VeOmniCriticConfig` | `"veomni"` | 第 307 行 |
-| `FSDPCriticModelCfg` | -- | 第 256 行 (继承 `BaseModelConfig`, 非 `CriticConfig`) |
+| `FSDPCriticConfig` | `"fsdp"` | 第 190 行 |
+| `McoreCriticConfig` | `"megatron"` | 第 162 行 |
+| `TorchTitanCriticConfig` | `"torchtitan"` | 第 238 行 |
+| `MindSpeedCriticConfig` | `"mindspeed"` | 第 286 行 |
+| `VeOmniCriticConfig` | `"veomni"` | 第 309 行 |
+| `FSDPCriticModelCfg` | -- | 第 258 行 (继承 `BaseModelConfig`, 非 `CriticConfig`) |
 
-`FSDPCriticModelCfg` (第 256 行) 是特殊的: 它继承 `BaseModelConfig` 而非 `CriticConfig`, 是面向模型本身的配置 (含 LoRA、activation offload 等), 而非训练循环配置。
+`FSDPCriticModelCfg` (第 258 行) 是特殊的: 它继承 `BaseModelConfig` 而非 `CriticConfig`, 是面向模型本身的配置 (含 LoRA、activation offload 等), 而非训练循环配置。
 
 ### 3.8 HFModelConfig (model.py 第 71 行)
 
@@ -335,6 +351,8 @@ class HFModelConfig(BaseConfig):
 6. 应用 `override_config` 覆盖
 7. 处理 MTP: 当 `mtp.enable=False` 时, 将 `num_nextn_predict_layers` 等字段清零
 8. 验证 `target_modules` 类型
+
+变更 (基准 `e3573545`): `external_lib` 类型由 `Optional[str]` 放宽为 `Any` (第 113 行); `__post_init__` 加载 `hf_config` 时新增 deepseek_v4 回退 (第 186-202 行) —— 当 `AutoConfig.from_pretrained` 因 `KeyError("deepseek_v4")` 失败时, 改用 vLLM 的 `get_config()`。
 
 ### 3.9 MtpConfig (model.py 第 30 行)
 
@@ -377,15 +395,17 @@ grad_clip: Optional[float] = None   # 已废弃, 使用 clip_grad
 | `FSDPOptimizerConfig` | 动态导入优化器 (`optimizer_impl` + `optimizer`), 支持 cosine LR | 第 88 行 |
 | `McoreOptimizerConfig` | Megatron 风格: `lr_decay_style`, `min_lr`, `weight_decay_incr_style` | 第 128 行 |
 | `VeOmniOptimizerConfig` | VeOmni 风格: `lr_scheduler_type`, `lr_min`, `lr_start` | 第 65 行 |
-| `TorchtitanOptimizerConfig` | TorchTitan 风格: `decay_type`, `min_lr_factor` | 第 158 行 |
-| `AutomodelOptimizerConfig` | Automodel 风格: `init_lr_ratio`, `min_lr_ratio`, FP8 优化器 | 第 175 行 |
+| `TorchtitanOptimizerConfig` | TorchTitan 风格: `decay_type`, `min_lr_factor` | 第 238 行 |
+| `AutomodelOptimizerConfig` | Automodel 风格: `init_lr_ratio`, `min_lr_ratio`, FP8 优化器 | 第 255 行 |
 
-`build_optimizer()` (第 218 行): 通用优化器构建函数, 通过 `importlib.import_module(config.optimizer_impl)` 动态导入优化器类。支持:
+`build_optimizer()` (第 298 行): 通用优化器构建函数, 通过 `importlib.import_module(config.optimizer_impl)` 动态导入优化器类。支持:
 - `torch.optim.AdamW`
 - `torchao.optim._AdamW` (bf16 随机舍入)
 - `bitsandbytes.optim.AdamW8bit`
 
-### 3.11 RolloutConfig (rollout.py 第 143 行)
+`McoreOptimizerConfig` 新增精度感知 / Muon 字段 (基准 `e3573545`): `use_precision_aware_optimizer` 及 `main_grads_dtype` / `exp_avg_dtype` / `exp_avg_sq_dtype` (第 201-204 行), 以及一组 `muon_*` 与 layer-wise 优化器字段 (第 205-224 行); `__post_init__` (第 227 行) 校验三个 dtype 字段取值合法 (`fp32` / `bf16` 等)。
+
+### 3.11 RolloutConfig (rollout.py 第 145 行)
 
 推理引擎配置, 是配置最复杂的类之一:
 
@@ -409,6 +429,8 @@ enable_sleep_mode: bool = True         # vLLM sleep/wake 机制
 sglang_engine_mode: str = "local"      # "local" 或 "server"
 ```
 
+基准 `e3573545` 新增公开字段: `full_determinism` (第 171 行) / `seed` (第 175 行) / `standalone_gpu_memory_utilization` (第 186 行) / `moe_load_balance_metrics_interval` (第 266 行); `_mutable_fields` 新增 `full_determinism` 与 `max_num_seqs` (第 146-156 行)。
+
 嵌入 9 个子配置:
 
 | 子配置 | 类 | 行号 | 说明 |
@@ -423,15 +445,17 @@ sglang_engine_mode: str = "local"      # "local" 或 "server"
 | `mtp` | `MtpConfig` | -- | 推测解码 |
 | `disaggregation` | `DisaggregationConfig` | -- | Prefill-Decode 分离 |
 
-`__post_init__` 校验 (第 263 行):
+> 注: `AgentLoopConfig` 内部还嵌套二级子配置 `CustomAsyncServerConfig` (第 66 行, 经 `custom_async_server` 字段接入)。
+
+`__post_init__` 校验 (第 276 行):
 - `sync` 模式已移除, 会抛出 `ValueError`
-- 非 trtllm 时, `expert_parallel_size` 必须等于 `tp_size * dp_size`
+- 当 `expert_parallel_size > 1` 且非 trtllm 时, `expert_parallel_size` 必须等于 `tensor_model_parallel_size * data_parallel_size`；`expert_parallel_size == 1` 不触发该等式校验
 - `pipeline_model_parallel_size > 1` 对 vllm/sglang/trtllm 均未实现
-- `disaggregation.enabled=True` 仅支持 sglang
+- `disaggregation.enabled=True` 仅支持 sglang 和 vllm (第 339 行, `name not in ("sglang", "vllm")`)
 
-### 3.12 DisaggregationConfig (disaggregation.py 第 25 行)
+### 3.12 DisaggregationConfig (disaggregation.py 第 26 行)
 
-SGLang Prefill-Decode 分离 (PD 分离) 配置:
+Prefill-Decode 分离 (PD 分离) 配置 (支持 sglang 和 vllm):
 
 ```python
 enabled: bool = False
@@ -441,11 +465,12 @@ decode_tensor_model_parallel_size: Optional[int] = None
 transfer_backend: str = "nixl"    # 允许值: ("nixl", "mooncake", "ascend", "mori", "fake")
 bootstrap_port: Optional[int] = None
 ib_device: Optional[str] = None
+mooncake_protocol: str = "nvlink" # 允许值: ("nvlink", "local", "rdma", "tcp"), 仅 mooncake 后端校验
 ```
 
-常量 `_ALLOWED_BACKENDS = ("nixl", "mooncake", "ascend", "mori", "fake")` (第 21 行)。
+常量 `_ALLOWED_BACKENDS = ("nixl", "mooncake", "ascend", "mori", "fake")` (第 21 行); `_ALLOWED_MOONCAKE_PROTOCOLS = ("nvlink", "local", "rdma", "tcp")` (第 22 行)。`__post_init__` (第 50 行) 仅在 `transfer_backend == "mooncake"` 时校验 `mooncake_protocol`。
 
-### 3.13 DistillationConfig (distillation.py 第 210 行)
+### 3.13 DistillationConfig (distillation.py 第 222 行)
 
 在线蒸馏 (On-Policy Distillation) 配置:
 
@@ -467,11 +492,13 @@ use_task_rewards: bool = True     # 是否混合任务奖励
 use_policy_gradient: bool = True  # True: 作为奖励信号; False: 直接反向传播
 ```
 
-校验约束 (第 88 行):
+校验约束 (第 100 行, `DistillationLossConfig.__post_init__`):
 - `use_policy_gradient=False` 且 `loss_mode="k1"` 时报错 (k1 梯度不依赖教师 log-prob)
 - `use_policy_gradient=True` 且 `loss_mode="forward_kl_topk"` 时发出警告
 
-`DistillationTeacherModelConfig` (第 116 行) 支持多教师:
+基准 `e3573545` 新增 top-k 分块字段 `use_chunked_topk` (第 77 行, 默认 `False`) 与 `chunked_topk_chunk_size` (第 82 行, 默认 4096), 控制 (B*T) 维度上的分块大小。
+
+`DistillationTeacherModelConfig` (第 128 行) 支持多教师:
 
 ```python
 key: Optional[str] = None           # 路由键值
@@ -501,6 +528,8 @@ update_weights_bucket_megabytes: int = 2048     # 批量传输大小 (MB)
 custom_backend_module: Optional[str] = None     # 自定义后端模块路径
 ```
 
+`_mutable_fields = {"backend"}` (第 130 行): 仅 `backend` 允许运行时改写。
+
 ---
 
 ## 4. 算法详解
@@ -526,7 +555,7 @@ class ActorConfig(BaseConfig):
     _mutable_fields = BaseConfig._mutable_fields | {"ppo_mini_batch_size", "engine", ...}
 ```
 
-特殊绕过: 当引擎初始化需要修改冻结字段时, 使用 `object.__setattr__(self.engine, "strategy", self.strategy)` (如 actor.py 第 319 行)。
+特殊绕过: 当引擎初始化需要修改冻结字段时, 使用 `object.__setattr__(self.engine, "strategy", self.strategy)` (如 actor.py 第 322 行)。
 
 ### 4.2 ActorConfig/CriticConfig 到 TrainingWorkerConfig 的转换路径
 
@@ -556,13 +585,13 @@ TrainingWorkerConfig
 
 这两个参数是历史遗留问题。旧版本使用全局 `ppo_micro_batch_size`, 新版本改为 `ppo_micro_batch_size_per_gpu`。
 
-`_check_mutually_exclusive()` (actor.py 第 244 行, critic.py 第 131 行) 确保:
+`_check_mutually_exclusive()` (actor.py 第 245 行, critic.py 第 134 行) 确保:
 - 至少设置一个
 - 不能同时设置两个
 
 ### 4.4 多教师蒸馏的资源分配
 
-`DistillationConfig._resolve_teacher_models()` (第 277 行):
+`DistillationConfig._resolve_teacher_models()` (第 289 行):
 
 1. 单教师模式: `teacher_models` 字典只有默认 `"teacher_model"` 键
    - 自动计算 `num_replicas = pool_size / per_replica_world_size`
@@ -575,14 +604,14 @@ TrainingWorkerConfig
 
 ### 4.5 build_optimizer 的动态导入
 
-`build_optimizer()` (optimizer.py 第 218 行) 通过 `importlib.import_module()` 动态加载优化器:
+`build_optimizer()` (optimizer.py 第 298 行) 通过 `importlib.import_module()` 动态加载优化器:
 
 ```python
 module = importlib.import_module(config.optimizer_impl)  # 如 "torch.optim"
 optimizer_cls = getattr(module, config.optimizer)          # 如 "AdamW"
 ```
 
-对 Adam 类优化器自动传入 `betas` 参数 (第 252 行)。支持 `override_optimizer_config` 字典透传额外参数。
+对 Adam 类优化器自动传入 `betas` 参数 (第 333 行, betas 注入)。支持 `override_optimizer_config` 字典透传额外参数。
 
 ---
 
@@ -680,7 +709,7 @@ TrainerConfig (顶层)
 
 ### 6.6 MindSpeedEngineConfig 跳过父类 __post_init__
 
-`MindSpeedEngineConfig.__post_init__()` (第 591 行) 没有调用 `super().__post_init__()`, 而是复制了父类 `McoreEngineConfig` 的校验逻辑。原因是父类的 `assert self.strategy == "megatron"` 会失败 (MindSpeed 的 strategy 是 `"mindspeed_megatron"` 或 `"mindspeed_fsdp"`)。
+`MindSpeedEngineConfig.__post_init__()` (第 629 行) 没有调用 `super().__post_init__()`, 而是复制了父类 `McoreEngineConfig` 的校验逻辑。原因是父类的 `assert self.strategy == "megatron"` 会失败 (MindSpeed 的 strategy 是 `"mindspeed_megatron"` 或 `"mindspeed_fsdp"`)。
 
 ---
 
@@ -690,17 +719,17 @@ TrainerConfig (顶层)
 
 `__init__.py` (第 16-25 行) 使用 `from .actor import *` 等 wildcard import, 虽然每个模块都定义了 `__all__`, 但这与项目 CLAUDE.md 中 "Never Do: Use wildcard imports" 的规则不一致。
 
-### 7.2 配置类之间的循环依赖
+### 7.2 配置类之间的潜在耦合风险
 
-`distillation.py` 导入 `RolloutConfig` (第 23 行), `reward.py` 也导入 `RolloutConfig` (第 23 行)。如果 `RolloutConfig` 需要引用 distillation 相关类型, 会形成循环依赖。目前通过模块级导入避免, 但增加了架构复杂度。
+`distillation.py` 导入 `RolloutConfig` (第 23 行), `reward.py` 也导入 `RolloutConfig` (第 23 行)。当前是 `distillation/reward -> rollout` 的单向依赖，并未形成已发生的循环；如果未来 `RolloutConfig` 反向引用这些类型，才会形成循环风险。现状仍增加了配置层的耦合复杂度。
 
 ### 7.3 DistillationLossConfig 中的 print 使用
 
-distillation.py 第 101-106 行使用了 `print("WARNING: ...")` 而不是 `logger.warning()`, 违反了项目日志规范。
+distillation.py 第 113-118 行使用了 `print("WARNING: ...")` 而不是 `logger.warning()`, 违反了项目日志规范。
 
 ### 7.4 FSDPCriticModelCfg 的命名不一致
 
-`FSDPCriticModelCfg` (critic.py 第 256 行) 继承 `BaseModelConfig` 而非 `CriticConfig`, 但放在 critic.py 文件中且名字以 "Critic" 开头, 容易造成混淆。它实际上是模型层面的配置 (含 LoRA, activation offload), 与训练循环配置 (`CriticConfig`) 是不同层面。
+`FSDPCriticModelCfg` (critic.py 第 258 行) 继承 `BaseModelConfig` 而非 `CriticConfig`, 但放在 critic.py 文件中且名字以 "Critic" 开头, 容易造成混淆。它实际上是模型层面的配置 (含 LoRA, activation offload), 与训练循环配置 (`CriticConfig`) 是不同层面。
 
 ### 7.5 EngineRouterReplayConfig 与 RouterReplayConfig 的重复
 
@@ -712,7 +741,7 @@ distillation.py 第 101-106 行使用了 `print("WARNING: ...")` 而不是 `logg
 
 ### 7.7 RolloutConfig.mode 的废弃状态
 
-`mode` 字段默认值为 `"async"`, `sync` 模式已被移除并抛出 `ValueError` (第 266 行)。其他值会发出 `DeprecationWarning`。该字段应在未来版本中完全移除。
+`mode` 字段默认值为 `"async"`, `sync` 模式已被移除并抛出 `ValueError` (第 280 行)。其他值会发出 `DeprecationWarning`。该字段应在未来版本中完全移除。
 
 ---
 

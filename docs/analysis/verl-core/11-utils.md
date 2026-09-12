@@ -1,14 +1,16 @@
 # 11 - verl/utils/ 工具库子模块架构文档
 
-> **源码位置**: `verl/utils/` | **文件数**: 122 | **总行数**: 32,426
+> **源码位置**: `verl/utils/` | **文件数**: 128 | **总行数**: 35,745
 >
-> 这是 verl 中最大的模块，为整个框架提供跨切面基础设施。按功能域分为根级别核心工具（约 19,000 行）和 19 个子目录（约 13,400 行）。
+> 版本基线: 上游 e3573545 | 最后更新: 2026-08-02
+>
+> 这是 verl 中最大的模块，为整个框架提供跨切面基础设施。按功能域分为根级别核心工具（13,529 行）和 19 个子目录（22,216 行）。
 
 ---
 
 ## 1. 模块定位
 
-`verl/utils/` 是 verl 的横切关注点（cross-cutting concerns）集合。它不包含任何业务逻辑，而是为 workers、trainer、protocol 等核心模块提供底层能力：
+`verl/utils/` 是 verl 的横切关注点（cross-cutting concerns）集合。它同时包含共享基础设施与跨模块领域逻辑，不是完全无业务语义的底层工具层；`reward_score/`、`dataset/`、tokenizer 等区域直接参与 RL/RM/SFT 数据与评分契约，而 device、分布式和张量工具提供通用能力：
 
 - **配置转换**：Hydra OmegaConf 与 dataclass 的桥梁
 - **设备抽象**：CUDA/NPU/CPU 统一接口
@@ -29,15 +31,15 @@
 |------|------|------|
 | `config.py` | 202 | `omega_conf_to_dataclass()`：OmegaConf -> dataclass 转换；`validate_config()`：全局配置校验 |
 | `device.py` | 366 | 跨平台设备抽象，委托 `verl.plugin.platform`；向后兼容 80+ 导入站点 |
-| `distributed.py` | 169 | 进程组初始化（全局/Ray），NUMA 亲和性，`stateless_init_process_group` 用于 vLLM 权重同步 |
-| `import_utils.py` | - | 动态模块加载工具，`load_class_from_fqn()` |
+| `distributed.py` | 216 | 进程组初始化（全局/Ray），NUMA 亲和性，`stateless_init_process_group` 用于 vLLM 权重同步 |
+| `import_utils.py` | 244 | 动态模块加载工具，`load_class_from_fqn()` |
 
 ### 2.2 FSDP / Megatron 分布式训练
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| `fsdp_utils.py` | 1,141 | FSDP1/FSDP2 全套工具：`apply_fsdp2()`（L559）、模型 CPU 卸载/加载、LoRA 合并/提取、分片保存/恢复 |
-| `megatron_utils.py` | 1,834 | Megatron-Core 初始化、模型构建、前向传播、损失计算、DDP 包装 |
+| `fsdp_utils.py` | 1,190 | FSDP1/FSDP2 全套工具：`apply_fsdp2()`（L561）、模型 CPU 卸载/加载、LoRA 合并/提取、分片保存/恢复 |
+| `megatron_utils.py` | 2,000 | Megatron-Core 初始化、模型构建、前向传播、损失计算、DDP 包装 |
 
 ### 2.3 张量运算与序列处理
 
@@ -53,7 +55,7 @@
 |------|------|------|
 | `py_functional.py` | 368 | `DynamicEnum`（可序列化动态枚举，L259）、`timeout_limit` 装饰器（多进程超时）、`NestedNamespace`、字典合并/重命名 |
 | `model.py` | 843 | HuggingFace 模型创建、`LambdaLayer`、LoRA 配置解析、`compute_position_id_with_mask()`、多模态键处理 |
-| `tracking.py` | 591 | 统一日志追踪接口 `Tracking`，支持 W&B/MLflow/SwanLab/TensorBoard/ClearML/TrackIO/File 9 种后端 |
+| `tracking.py` | 789 | 统一日志追踪接口 `Tracking`，支持 W&B/MLflow/SwanLab/vemlp_wandb/TensorBoard/Console/ClearML/TrackIO/File/rl_insight 10 种后端 |
 
 ### 2.5 其他根级别文件
 
@@ -63,8 +65,6 @@
 | `fp8_utils.py` | FP8 量化工具 |
 | `activation_offload.py` | 激活卸载到 CPU |
 | `memory_utils.py` | GPU 内存管理 |
-| `chat_template.py` | 聊天模板应用 |
-| `tokenizer.py` | tokenizer 加载和多模态处理 |
 | `flops_counter.py` | FLOP 计数器 |
 | `hdfs_io.py` | HDFS 文件 I/O |
 | `fs.py` | 本地文件系统工具 |
@@ -78,18 +78,19 @@
 
 ## 3. 子目录职责概述
 
-共 19 个子目录，约 13,400 行。按重要程度排列：
+共 19 个子目录，22,216 行。按重要程度排列：
 
-### 3.1 reward_score/（3,743 行，16 文件）
+### 3.1 reward_score/（3,756 行，17 文件）
 奖励评分函数集合，支持多种评估场景：
-- `math_reward.py` / `math_verify.py` / `math_dapo.py` — 数学推理奖励
+- `math_reward.py` / `math_verify.py` / `math_dapo.py` / `math_batch.py` — 数学推理奖励（`math_batch.py` 为并行批量封装 `compute_score_batched`）
 - `gsm8k.py` / `geo3k.py` — 特定数据集奖励
 - `prime_code/` — 代码执行评估（`testing_util.py`）
 - `prime_math/` — 数学归一化和评分
 - `sandbox_fusion/` — 沙箱代码执行
 - `search_r1_like_qa_em.py` — 搜索/QA 精确匹配
+- `rlla.py` — RLLA 奖励（基于元素频率的相似度匹配）
 
-### 3.2 checkpoint/（2,220 行，5 文件）
+### 3.2 checkpoint/（2,277 行，5 文件）
 检查点管理器，支持 FSDP 和 Megatron 两种后端：
 - `checkpoint_manager.py` — 基础检查点管理器，控制保存时机
 - `fsdp_checkpoint_manager.py` — FSDP 分片检查点保存/加载
@@ -102,7 +103,7 @@
 - `kernels.py` — 通用 kernel
 - `linear_cross_entropy.py` — 线性交叉熵优化实现
 
-### 3.4 profiler/（1,879 行，10 文件）
+### 3.4 profiler/（2,150 行，10 文件）
 多后端性能分析框架：
 - `profile.py` / `config.py` — 分析配置和入口
 - `torch_profile.py` — PyTorch Profiler 集成
@@ -119,7 +120,7 @@
 - `linear.py` — 量化线性层
 - `vllm_patch.py` — vLLM QAT 补丁
 
-### 3.6 megatron/（1,580 行，9 文件）
+### 3.6 megatron/（1,833 行，9 文件）
 Megatron-Core 扩展工具：
 - `tensor_parallel.py` — 张量并行工具
 - `pipeline_parallel.py` — 流水线并行工具
@@ -128,7 +129,7 @@ Megatron-Core 扩展工具：
 - `memory.py` — 内存管理
 - `router_replay_utils.py` / `router_replay_patch.py` — MoE 路由重放
 
-### 3.7 dataset/（1,414 行，6 文件）
+### 3.7 dataset/（1,443 行，6 文件）
 数据集加载器：
 - `rl_dataset.py` — `RLHFDataset`（RL 训练数据集）
 - `rm_dataset.py` — 奖励模型数据集
@@ -136,20 +137,28 @@ Megatron-Core 扩展工具：
 - `vision_utils.py` — 视觉数据处理
 - `dataset_utils.py` — 数据集通用工具
 
-### 3.8 其他子目录
+### 3.8 tokenizer/（1,726 行，6 文件）
+Tokenizer 加载与多模态处理（`chat_template.py`、`tokenizer.py` 由根目录迁入）：
+- `tokenizer.py` — tokenizer 加载和多模态处理
+- `chat_template.py` — 聊天模板应用
+- `continuous_token.py` — 连续 Token 构建器实现
+- `continuous_token_wiring.py` — 连续 Token 构建器工厂与模型族解析
+- `deepseek.py` — DeepSeek-V4 系列 prompt 编码与连续 Token 支持
+
+### 3.9 其他子目录
 
 | 子目录 | 行数 | 职责 |
 |--------|------|------|
-| `vllm/` | 1,276 | vLLM 集成补丁和工具 |
+| `vllm/` | 1,440 | vLLM 集成补丁和工具（含 `vllm_fp4_utils` / `vllm_quant_utils`） |
 | `modelopt/` | 1,055 | NVIDIA ModelOpt 量化工具 |
 | `veomni/` | 535 | VeOmni 路由重放 |
-| `skip/` | 480 | 跳步管理器（Skip Manager） |
+| `skip/` | 873 | 跳步管理器（Skip Manager） |
 | `debug/` | 264 | 调试工具（性能、轨迹追踪、指标） |
-| `experimental/` | 242 | 实验性 torch_functional 扩展 |
+| `experimental/` | 244 | 实验性 torch_functional 扩展 |
 | `metric/` | 180 | 指标聚合工具 |
 | `logger/` | 172 | 聚合日志器 |
 | `rendezvous/` | 101 | Ray 后端会合（rendezvous） |
-| `sglang/` | 35 | SGLang FP8 工具 |
+| `sglang/` | 141 | SGLang FP8 工具（含 `sglang_fp8_utils`） |
 | `trtllm/` | 35 | TensorRT-LLM FP8 工具 |
 
 ---
@@ -182,7 +191,7 @@ def validate_config(
 ### 4.2 FSDP2 应用（fsdp_utils.py）
 
 ```python
-# L559
+# L561
 def apply_fsdp2(model, fsdp_kwargs, config)
 ```
 
@@ -270,22 +279,24 @@ manual_seed(seed)                -> platform.manual_seed(seed)
 set_expandable_segments(enable)  -> platform.set_allocator_settings(...)
 ```
 
-向后兼容 80+ 导入站点，同时将实际逻辑集中到 plugin 层。
+向后兼容多个导入站点，同时将实际逻辑集中到 plugin 层。
 
 ### 6.2 日志追踪
 
-`tracking.py` 的 `Tracking` 类（L35）提供统一的 `log()` 接口，支持 9 种后端：
+`tracking.py` 的 `Tracking` 类（L37）提供统一的 `log()` 接口，支持 10 种后端：
 
 | 后端 | 集成方式 |
 |------|----------|
 | wandb | `wandb.init()` + `wandb.log()` |
 | mlflow | `mlflow.log_metrics()` |
 | swanlab | SwanLab API |
+| vemlp_wandb | 火山引擎 ML 平台 W&B（`volcengine_ml_platform.wandb`） |
 | tensorboard | `SummaryWriter` |
 | clearml | ClearML Logger |
 | trackio | TrackIO API |
 | file | JSON 文件输出 |
 | console | 控制台打印 |
+| rl_insight | rl-insight 标量指标与运行时信号（`RLInsightLogger`） |
 
 ### 6.3 性能分析
 

@@ -1,7 +1,8 @@
 # 04 - Engine Backends 子模块架构文档
 
 > verl/workers/engine/ -- 训练引擎后端抽象与六大实现
-> 21 个 Python 文件, 6,897 行 (wc -l 验证)
+> 23 个 Python 文件, 8,427 行 (wc -l 验证)
+> 最后更新: 2026-08-02 | 基准源码版本: 上游 e3573545
 
 ---
 
@@ -20,7 +21,7 @@ Engine Backends 子模块是 verl 训练侧的核心抽象层。它将"如何在
 ## 2. 架构总览
 
 ```
-                      EngineRegistry (base.py:268)
+                      EngineRegistry (base.py:337)
                            |
                       BaseEngine (base.py:30)
                            |
@@ -50,7 +51,7 @@ Engine Backends 子模块是 verl 训练侧的核心抽象层。它将"如何在
 
 ## 3. 核心数据结构
 
-### 3.1 BaseEngine (base.py:30-228)
+### 3.1 BaseEngine (base.py:30-295)
 
 抽象基类, 定义了训练引擎的完整生命周期接口:
 
@@ -62,11 +63,15 @@ Engine Backends 子模块是 verl 训练侧的核心抽象层。它将"如何在
 | `train_batch()` | 113 | 封装 zero_grad + forward_backward + optimizer_step |
 | `infer_batch()` | 134 | 封装 torch.no_grad + forward_backward(forward_only=True) |
 | `optimizer_step()` | 84 | 执行一步优化器更新 |
-| `save_checkpoint()` / `load_checkpoint()` | 183 / 203 | 保存/加载检查点 |
+| `save_checkpoint()` / `load_checkpoint()` | 251 / 271 | 保存/加载检查点 |
 | `get_per_tensor_param()` | 151 | 导出逐张量参数用于权重同步到推理引擎 |
-| `to()` | 170 | 在 CPU/GPU 之间移动模型和优化器 |
+| `get_per_tensor_param_shard()` | 161 | 导出本 rank 本地参数分片 (不 all-gather), 附 `ShardSpec` 放置元数据, 供 delta_sharded 引擎逐分片差分 |
+| `delta_pin_snapshots` (属性) | 185 | 控制 delta 差分基准快照是否使用 pinned host 内存 (MegatronEngine 覆盖为 False) |
+| `prime_delta_snapshots()` | 187 | seed 同步后将当前分片快照为 delta 差分基准 |
+| `get_per_tensor_param_delta_shard()` | 205 | 导出 HF 坐标下自上次导出以来变化的增量元素, 供 delta 引擎批量收集传输 |
+| `to()` | 238 | 在 CPU/GPU 之间移动模型和优化器 |
 
-`train_batch()` 的默认实现 (base.py:113-132) 展示了标准训练步骤:
+`train_batch()` 的默认实现 (base.py:113-132) 展示了标准训练步骤 (下方代码已简化, 省略了开头的 `maybe_fix_3d_position_ids()` (base.py:124) 与写入 grad_norm 前的 `is_mp_src_rank_with_outputs()` 守卫 (base.py:129-131)):
 
 ```python
 def train_batch(self, data, loss_function):
@@ -77,17 +82,17 @@ def train_batch(self, data, loss_function):
     return outputs
 ```
 
-### 3.2 BaseEngineCtx (base.py:230-266)
+### 3.2 BaseEngineCtx (base.py:298-334)
 
 引擎上下文管理器基类, 负责 `__enter__` 时将模型/优化器从 CPU 加载到 GPU, `__exit__` 时卸载回 CPU。通过 `_context_switch()` 方法根据 `is_param_offload_enabled` 和 `is_optimizer_offload_enabled` 属性判断是否需要移动。
 
-### 3.3 EngineRegistry (base.py:268-374)
+### 3.3 EngineRegistry (base.py:337-443)
 
 注册表模式的工厂类:
 
-- `register()` (base.py:279): 类装饰器, 接受 `model_type`, `backend`, `device`, `vendor` 四个维度的注册键。支持 list 形式同时注册多个 backend/device 组合。
-- `get_engine_cls()` (base.py:327): 查找逻辑优先匹配 `(device, vendor)` 精确键, 回退到 `device` 仅设备键, 再回退到 `(cuda, nvidia)` 默认键。支持 `VERL_ENGINE_DEVICE` 和 `VERL_ENGINE_VENDOR` 环境变量覆盖。
-- `new()` (base.py:361): 查找并实例化引擎。
+- `register()` (base.py:349): 类装饰器, 接受 `model_type`, `backend`, `device`, `vendor` 四个维度的注册键。支持 list 形式同时注册多个 backend/device 组合。
+- `get_engine_cls()` (base.py:397): 查找逻辑优先匹配 `(device, vendor)` 精确键, 回退到 `device` 仅设备键, 再回退到 `(cuda, nvidia)` 默认键。支持 `VERL_ENGINE_DEVICE` 和 `VERL_ENGINE_VENDOR` 环境变量覆盖。
+- `new()` (base.py:430): 查找并实例化引擎。
 
 ---
 
@@ -96,7 +101,7 @@ def train_batch(self, data, loss_function):
 ### 4.1 引擎实例化流程
 
 ```
-TrainingWorker.__init__() (engine_workers.py:127)
+TrainingWorker.__init__() (engine_workers.py:135, EngineRegistry.new 调用处)
   -> EngineRegistry.new(model_type, backend, ...)
     -> get_engine_cls(model_type, backend)
       -> 按 (device, vendor) 查找 _engines[model_type][backend]
@@ -107,7 +112,7 @@ TrainingWorker.__init__() (engine_workers.py:127)
 ### 4.2 前向-反向批处理流程 (以 FSDP 为例)
 
 ```
-FSDPEngine.forward_backward_batch() (fsdp/transformer_impl.py:617)
+FSDPEngine.forward_backward_batch() (fsdp/transformer_impl.py:671)
   1. 计算全局 batch_num_tokens, all_reduce 跨 DP 组
   2. prepare_micro_batches() -- 动态 BSZ 或固定 micro_batch 拆分
   3. 遍历 micro_batches:
@@ -118,7 +123,7 @@ FSDPEngine.forward_backward_batch() (fsdp/transformer_impl.py:617)
 
 ### 4.3 Megatron Pipeline 并行流程
 
-MegatronEngine 的 `forward_backward_batch()` (megatron/transformer_impl.py:604) 与 FSDP 有本质区别:
+MegatronEngine 的 `forward_backward_batch()` (megatron/transformer_impl.py:693) 与 FSDP 有本质区别:
 
 1. 调用 Megatron 的 `get_forward_backward_func()` 获取 pipeline schedule 函数
 2. 通过 `make_batch_generator()` 将 micro_batches 包装为 VPP 感知的迭代器
@@ -129,24 +134,24 @@ MegatronEngine 的 `forward_backward_batch()` (megatron/transformer_impl.py:604)
 
 ## 5. 六大引擎实现对比
 
-### 5.1 FSDPEngine (fsdp/transformer_impl.py, 1351行)
+### 5.1 FSDPEngine (fsdp/transformer_impl.py, 1583行)
 
 **注册键**: `(language_model/value_model, fsdp/fsdp2, cuda/npu)`
 
 **核心特性**:
-- 支持 FSDP1 和 FSDP2 两种策略 (base.py:378-430), 通过 `engine_config.strategy` 选择
+- 支持 FSDP1 和 FSDP2 两种策略 (fsdp/transformer_impl.py:400-452, strategy=="fsdp"@400 / "fsdp2"@427), 通过 `engine_config.strategy` 选择
 - FSDP2 使用 `fully_shard()` API + `MixedPrecisionPolicy` + 可选 `CPUOffloadPolicy`
-- 内置 LoRA 支持: `_build_lora_module()` (第307行) 通过 PEFT 库集成
+- 内置 LoRA 支持: `_build_lora_module()` (第316行) 通过 PEFT 库集成
 - 支持 Ulysses 序列并行: `ulysses_sequence_parallel_size > 1` 时创建 `(dp, sp)` 二维 device mesh
-- 混合精度: fp16 时自动启用 `ShardedGradScaler` (第363行)
-- QAT (量化感知训练): `_apply_qat()` (第491行) 在 FSDP 包裹前对模型应用量化变换
+- 混合精度: fp16 时自动启用 `ShardedGradScaler` (第384行)
+- QAT (量化感知训练): `_apply_qat()` (第513行) 在 FSDP 包裹前对模型应用量化变换
 - Liger Kernel 集成: 可选启用 SwigLU 等融合算子
 
 **子类结构**:
-- `FSDPEngineWithLMHead` (第924行): 语言模型头, `prepare_model_inputs()` 处理 remove_padding / Ulysses SP 切片, `prepare_model_outputs()` 计算 log_probs、entropy、sum_pi_squared
-- `FSDPEngineWithValueHead` (第1300行): 值模型头, `prepare_model_outputs()` 提取 per-token values
+- `FSDPEngineWithLMHead` (第1087行): 语言模型头, `prepare_model_inputs()` 处理 remove_padding / Ulysses SP 切片, `prepare_model_outputs()` 计算 log_probs、entropy、sum_pi_squared
+- `FSDPEngineWithValueHead` (第1532行): 值模型头, `prepare_model_outputs()` 提取 per-token values
 
-### 5.2 MegatronEngine (megatron/transformer_impl.py, 1046行)
+### 5.2 MegatronEngine (megatron/transformer_impl.py, 1313行)
 
 **注册键**: `(language_model/value_model, megatron, cuda)`
 
@@ -154,13 +159,13 @@ MegatronEngine 的 `forward_backward_batch()` (megatron/transformer_impl.py:604)
 - 通过 `megatron.core.parallel_state` 初始化 TP/PP/CP/EP 并行维度
 - 使用 Megatron-Bridge (`AutoBridge`) 将 HF 权重转换为 Megatron 格式
 - Pipeline 并行: 使用 Megatron 的 `forward_backward_func` pipeline schedule
-- Router Replay (R2/R3): 为 MoE 模型记录和重放路由决策, 消除浮点非确定性 (第119行起)
-- 支持 MTP (Multi-Token Prediction) 训练: `patch_engine_mtp()` (第380行)
+- Router Replay (R2/R3): 为 MoE 模型记录和重放路由决策, 消除浮点非确定性 (初始化在 megatron/transformer_impl.py:134, 调用 `apply_router_replay_patch()`@137)
+- 支持 MTP (Multi-Token Prediction) 训练: `patch_engine_mtp()` (megatron/transformer_impl.py:453 调用处)
 - VPP (Virtual Pipeline Parallelism): `virtual_pipeline_model_parallel_size` 支持
 
-**权重导出**: `get_per_tensor_param()` (第720行) 通过 `bridge.export_hf_weights()` 将 Megatron 格式参数转回 HF 格式, 供推理引擎使用。
+**权重导出**: `get_per_tensor_param()` (第832行) 通过 `bridge.export_hf_weights()` (:846) 将 Megatron 格式参数转回 HF 格式, 供推理引擎使用。
 
-### 5.3 TorchTitanEngine (torchtitan/transformer_impl.py, 735行)
+### 5.3 TorchTitanEngine (torchtitan/transformer_impl.py, 766行)
 
 **注册键**: `(language_model, torchtitan, cuda/npu)`
 
@@ -169,21 +174,20 @@ MegatronEngine 的 `forward_backward_batch()` (megatron/transformer_impl.py:604)
 - 支持 DP_Shard + DP_Replicate + TP + PP + CP + EP 六维并行
 - 使用 TorchTitan 的 `CheckpointManager` 和 `LRSchedulersContainer`
 - Context Parallel: 通过 `prepare_context_parallel_input()` 准备 CP 输入
-- 权重导出: `sd_adapter.to_hf()` (第501行) 将 TorchTitan 命名空间转回 HF 格式; EP 模式下使用 `all_gather` 收集跨 EP 组的 expert 参数
+- 权重导出: `sd_adapter.to_hf()` (第525行) 将 TorchTitan 命名空间转回 HF 格式; EP 模式下使用 `all_gather` 收集跨 EP 组的 expert 参数
 
-### 5.4 VeOmniEngine (veomni/transformer_impl.py, 1063行)
+### 5.4 VeOmniEngine (veomni/transformer_impl.py, 1049行)
 
 **注册键**: `(language_model/value_model, veomni, cuda/npu)`
 
 **核心特性**:
 - 继承 `FSDPEngine` 但完全重写初始化流程, 使用 `veomni.distributed.parallel_state` 管理并行
-- 序列并行: 通过 `OmniSequenceShardCollator` (第730行) 在序列维度上分片
+- 序列并行: 通过 `OmniSequenceShardCollator` (第717行) 在序列维度上分片
 - Activation Offloading: `build_activation_offloading_context()` 提供独立的前向/反向上下文
-- MoE 监控: `MoERouterMonitor` 可定期汇报 expert 负载均衡指标到 wandb (第333行起)
-- Router Replay: 使用 `VeOmniRouterReplay` (第206行) 实现 R2/R3 路由重放, 包含严格的状态机管理
+- Router Replay: 使用 `VeOmniRouterReplay` (第208行) 实现 R2/R3 路由重放, 包含严格的状态机管理
 - VLM 支持: `_apply_veomni_input_transforms()` 处理图像/视频 mask 和 SP 切片
 
-### 5.5 AutomodelEngine (automodel/transformer_impl.py, 713行)
+### 5.5 AutomodelEngine (automodel/transformer_impl.py, 720行)
 
 **注册键**: `(language_model, automodel, cuda)`
 
@@ -191,10 +195,10 @@ MegatronEngine 的 `forward_backward_batch()` (megatron/transformer_impl.py:604)
 - 基于 NVIDIA NeMo Automodel 基础设施
 - 使用 `nemo_automodel` 的 `build_optimizer`, `OptimizerParamScheduler`, `Checkpointer`
 - MoE 支持: `prepare_for_grad_accumulation()` 和 `prepare_for_final_backward()` 处理 MoE aux loss 缩放
-- TE (Transformer Engine) 注意力后端: `attn_implementation == "te"` 时传入 `cu_seqlens` (第527行)
+- TE (Transformer Engine) 注意力后端: `attn_implementation == "te"` 时传入 `cu_seqlens` (第529行)
 - 梯度裁剪: 通过 `scale_grads_and_clip_grad_norm()` 统一处理, 支持 EP/PP 维度归约
 
-### 5.6 MindSpeed 变体 (mindspeed/transformer_impl.py, 166行)
+### 5.6 MindSpeed 变体 (mindspeed/transformer_impl.py, 173行)
 
 **注册键**: `(language_model/value_model, megatron, npu)` 和 `(language_model, mindspeed_megatron, npu)`
 
@@ -206,7 +210,7 @@ MegatronEngine 的 `forward_backward_batch()` (megatron/transformer_impl.py:604)
 
 ---
 
-## 6. 公共工具函数 (utils.py, 159行)
+## 6. 公共工具函数与 Delta 权重同步基础设施 (utils.py 242行 + spec.py 262行 + megatron/delta_export.py 307行)
 
 ### 6.1 prepare_micro_batches() (utils.py:57)
 
@@ -224,6 +228,29 @@ MegatronEngine 的 `forward_backward_batch()` (megatron/transformer_impl.py:604)
 ### 6.3 enable_full_determinism() (utils.py:31)
 
 设置完全确定性模式: `CUBLAS_WORKSPACE_CONFIG`, `FLASH_ATTENTION_DETERMINISTIC`, NPU 的 `HCCL_DETERMINISTIC` 等。
+
+### 6.4 Delta 导出辅助函数 (utils.py 新增)
+
+支撑 `delta_sharded` 检查点后端的分片差分导出 (仅 DTensor-generic 部分, EP/converter 机制在各后端自己的 utils):
+- `_prodshape()` (utils.py:171): 计算张量形状各维乘积 (元素总数)
+- `_hf_entry_identity()` (utils.py:178): identity 情形 (weight 名即 HF 名, 参数是自身唯一 slot) 下将分片本地 delta 平移到参数内坐标, 构建 HF 坐标 entry
+- `hf_delta_export()` (utils.py:190): STEADY 导出, 对比 host 快照差分并刷新快照, 再将分片本地 delta 交给 `entry_fn` 构建逐参数 entry (需先做 seed pass)
+- `prime_delta_snapshots()` (utils.py:226): 在 seed 全权重同步后, 将各 rank 当前分片快照到 CPU 作为 steady 差分基准; `pin` 选择 pinned/pageable host 内存
+
+### 6.5 Shard-Export 契约 (spec.py, 262行)
+
+训练引擎与分片 delta 引擎之间的声明式契约 (`get_per_tensor_param_shard()` 产出 `(name, local_shard, ShardSpec)`, 各 rank 顺序一致):
+- `ShardSpec` (spec.py:59): dataclass, 用 torch 原生词汇 (`DeviceMesh` + 每 mesh 维 `Placement`) 声明式描述一个导出本地参数分片的分布; `mesh=None` 表示未分片 (本地张量即完整参数)
+- `BlockPlacement` (spec.py:116): 表示本 rank 的本地分片是 full tensor 的一个超矩形块 (`local_shape` + `global_offset`); FSDP2 的 `Shard(0)` 是 flat-contiguous 块, 走单加法快路径
+- `derive_dtensor_placement()` (spec.py:176): 从 `ShardSpec` 推导本 rank 的 `(place, contributes, gather_group)` 三元组, 纯数学无集合通信 (携带显式 override 的 spec 不经此函数)
+
+### 6.6 Megatron Delta 导出 (megatron/delta_export.py, 307行)
+
+Megatron 侧基于 Megatron-Bridge 参数映射的 delta 导出机制 (作用域: TP + EP, PP=1, VPP=1, 无 LoRA):
+- `make_probe()` (delta_export.py:120): 递归复制 Bridge 参数映射树, 将 `megatron_to_hf` 转为无通信的本地变换, 仍执行真实 TP>1 代码路径 (groups 换成 size-faithful 的 `_ProbeGroup`, comm helper 用本地合成打桩)
+- `McoreParamExport` (delta_export.py:178): dataclass, 一个 mcore 参数的导出记录 (geometry + probe + module handle)
+- `build_export_index()` (delta_export.py:188): 枚举每个本地 mcore 参数并预计算 probe 与 wire 路由, 构建一次后复用于分片导出与 delta hook (顺序遵循 bridge 任务枚举, 各 rank 一致)
+- `mcore_hf_delta_entry()` (delta_export.py:251): 将一个 mcore 参数的分片本地 delta 探测为最终 HF 坐标 entry `(slots, dtype_str, counts, hf_idx, hf_val)`
 
 ---
 
